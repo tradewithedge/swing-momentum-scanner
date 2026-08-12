@@ -47,6 +47,10 @@ if "scan_timestamp" not in st.session_state:
     st.session_state.scan_timestamp = None
 if "scan_errors" not in st.session_state:
     st.session_state.scan_errors = []
+if "show_a_plus" not in st.session_state:
+    st.session_state.show_a_plus = False
+if "a_plus_selected_ticker" not in st.session_state:
+    st.session_state.a_plus_selected_ticker = None
 
 # ---------------------------
 # Helpers
@@ -942,11 +946,129 @@ with scanner_tab:
             f"{len(ranked):,} stocks analyzed • {when}"
         )
 
+        a_plus_mask = ranked["Setup"].isin(["A+ Long", "A+ Short"])
+        a_plus_count = int(a_plus_mask.sum())
+
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Stocks analyzed", f"{len(ranked):,}")
         k2.metric("Passing filters", f"{int(ranked['Passes Filters'].sum()):,}")
         k3.metric("Regime-aligned", f"{int(ranked['Regime Aligned'].sum()):,}")
-        k4.metric("A+ setups", f"{int(ranked['Setup'].isin(['A+ Long', 'A+ Short']).sum()):,}")
+
+        with k4:
+            st.caption("A+ setups")
+            if st.button(
+                f"{a_plus_count:,}",
+                key="a_plus_count_button",
+                use_container_width=True,
+                help="Tap to show the exact A+ setup list.",
+            ):
+                st.session_state.show_a_plus = not st.session_state.show_a_plus
+
+        # A+ setup drilldown
+        if st.session_state.show_a_plus:
+            st.markdown("### ⭐ A+ Setups")
+            aplus = ranked[a_plus_mask].copy().sort_values(
+                ["Adjusted Score", "Volume Ratio"],
+                ascending=[False, False],
+            )
+
+            if aplus.empty:
+                st.info("There are currently no A+ setups in this scan.")
+            else:
+                st.caption(
+                    f"Exact A+ count: **{len(aplus):,}**. "
+                    "Select a ticker below to open its chart."
+                )
+
+                aplus_cols = [
+                    "Ticker", "Company", "Sector", "Setup",
+                    "Adjusted Score", "Composite", "RSI14",
+                    "Volume Ratio", "1D %", "1W %", "1M %",
+                ]
+                aplus_cols = [c for c in aplus_cols if c in aplus.columns]
+
+                st.dataframe(
+                    aplus[aplus_cols],
+                    hide_index=True,
+                    use_container_width=True,
+                    height=min(420, 45 + 36 * len(aplus)),
+                    column_config={
+                        "Adjusted Score": st.column_config.NumberColumn(format="%.1f"),
+                        "Composite": st.column_config.NumberColumn(format="%.1f"),
+                        "RSI14": st.column_config.NumberColumn(format="%.1f"),
+                        "Volume Ratio": st.column_config.NumberColumn(format="%.2fx"),
+                        "1D %": st.column_config.NumberColumn(format="%.2%"),
+                        "1W %": st.column_config.NumberColumn(format="%.2%"),
+                        "1M %": st.column_config.NumberColumn(format="%.2%"),
+                    },
+                )
+
+                ticker_options = aplus["Ticker"].tolist()
+                labels = {
+                    row["Ticker"]: (
+                        f"{row['Ticker']} — {row.get('Company', row['Ticker'])} "
+                        f"({row['Setup']})"
+                    )
+                    for _, row in aplus.iterrows()
+                }
+
+                selected_aplus = st.selectbox(
+                    "Open A+ stock chart",
+                    ticker_options,
+                    format_func=lambda t: labels.get(t, t),
+                    key="a_plus_ticker_select",
+                )
+                st.session_state.a_plus_selected_ticker = selected_aplus
+
+                selected_row = aplus.loc[aplus["Ticker"] == selected_aplus].iloc[0]
+
+                with st.spinner(f"Loading {selected_aplus} chart..."):
+                    detail_df = download_one(selected_aplus, "1y")
+
+                if detail_df.empty:
+                    st.warning(f"No chart data is available for {selected_aplus} right now.")
+                else:
+                    d = detail_df.tail(120).copy()
+                    d["EMA20"] = d["Close"].ewm(span=20, adjust=False).mean()
+                    d["EMA50"] = d["Close"].ewm(span=50, adjust=False).mean()
+                    d["EMA200"] = d["Close"].ewm(span=200, adjust=False).mean()
+
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Setup", selected_row["Setup"])
+                    c2.metric("Composite", f"{selected_row['Composite']:.1f}")
+                    c3.metric("RSI(14)", f"{selected_row['RSI14']:.1f}")
+                    c4.metric(
+                        "Volume",
+                        f"{selected_row['Volume Ratio']:.2f}x"
+                        if pd.notna(selected_row["Volume Ratio"]) else "N/A"
+                    )
+                    c5.metric("1-Month", f"{selected_row['1M %']:.2%}")
+
+                    fig_aplus = go.Figure()
+                    fig_aplus.add_trace(go.Candlestick(
+                        x=d["Date"],
+                        open=d["Open"],
+                        high=d["High"],
+                        low=d["Low"],
+                        close=d["Close"],
+                        name="Price",
+                    ))
+                    fig_aplus.add_trace(go.Scatter(
+                        x=d["Date"], y=d["EMA20"], name="EMA20"
+                    ))
+                    fig_aplus.add_trace(go.Scatter(
+                        x=d["Date"], y=d["EMA50"], name="EMA50"
+                    ))
+                    fig_aplus.add_trace(go.Scatter(
+                        x=d["Date"], y=d["EMA200"], name="EMA200"
+                    ))
+                    fig_aplus.update_layout(
+                        title=f"{selected_aplus} — A+ Setup Chart",
+                        height=480,
+                        xaxis_rangeslider_visible=False,
+                        margin=dict(l=5, r=5, t=45, b=5),
+                    )
+                    st.plotly_chart(fig_aplus, use_container_width=True)
 
         view_mode = st.segmented_control(
             "View",
