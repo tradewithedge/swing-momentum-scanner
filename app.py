@@ -492,6 +492,26 @@ def compute_record(symbol, company, sector, df):
     x["3M %"] = x["Close"].pct_change(60)
     x["6M %"] = x["Close"].pct_change(126)
 
+    # Professional screening metrics.
+    prev_close = x["Close"].shift(1)
+    true_range = pd.concat(
+        [
+            x["High"] - x["Low"],
+            (x["High"] - prev_close).abs(),
+            (x["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    x["ATR14"] = true_range.rolling(14).mean()
+    x["ATR50"] = true_range.rolling(50).mean()
+    x["Dollar Volume"] = x["Close"] * x["Volume"]
+    x["Avg Dollar Volume 20"] = x["Dollar Volume"].rolling(20).mean()
+    x["High20"] = x["High"].rolling(20).max()
+    x["High252"] = x["High"].rolling(252, min_periods=126).max()
+    x["Low20"] = x["Low"].rolling(20).min()
+    x["Low252"] = x["Low"].rolling(252, min_periods=126).min()
+    x["Volatility20"] = x["Close"].pct_change().rolling(20).std() * np.sqrt(252)
+
     row = x.iloc[-1]
     record = {
         "Ticker": symbol,
@@ -508,6 +528,15 @@ def compute_record(symbol, company, sector, df):
         "1M %": float(row["1M %"]) if pd.notna(row["1M %"]) else np.nan,
         "3M %": float(row["3M %"]) if pd.notna(row["3M %"]) else np.nan,
         "6M %": float(row["6M %"]) if pd.notna(row["6M %"]) else np.nan,
+        "ATR14": float(row["ATR14"]) if pd.notna(row["ATR14"]) else np.nan,
+        "ATR50": float(row["ATR50"]) if pd.notna(row["ATR50"]) else np.nan,
+        "Avg Dollar Volume 20": float(row["Avg Dollar Volume 20"]) if pd.notna(row["Avg Dollar Volume 20"]) else np.nan,
+        "High20": float(row["High20"]) if pd.notna(row["High20"]) else np.nan,
+        "High252": float(row["High252"]) if pd.notna(row["High252"]) else np.nan,
+        "Low20": float(row["Low20"]) if pd.notna(row["Low20"]) else np.nan,
+        "Low252": float(row["Low252"]) if pd.notna(row["Low252"]) else np.nan,
+        "Volatility20": float(row["Volatility20"]) if pd.notna(row["Volatility20"]) else np.nan,
+        "History Days": int(len(x)),
     }
     record["Daily"] = momentum_score(record["1D %"], 2500)
     record["Weekly"] = momentum_score(record["1W %"], 700)
@@ -629,45 +658,64 @@ def is_regime_aligned(row):
     return setup not in {"Neutral", "Mixed"}
 
 def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
-    """Add filters/ranking safely even when Yahoo returns partial rows."""
+    """Professional swing-candidate ranking engine.
+
+    Design:
+    1) Tradeability gates remove low-quality / hard-to-trade names.
+    2) Relative strength is measured versus SPY and within the selected universe.
+    3) Quality Score (0-100) ranks trend, momentum, RS, liquidity/volume,
+       volatility/risk, entry location, and market-regime fit.
+    4) Setup Type describes how the stock may be tradable: breakout, pullback,
+       continuation, or watch.
+    """
     if df.empty:
         return df
 
     x = df.copy()
     numeric_cols = [
         "Close", "EMA20", "EMA50", "EMA200", "RSI14", "Volume Ratio",
-        "1D %", "1W %", "1M %", "3M %", "6M %", "Daily", "Weekly", "Monthly", "Momentum Score",
+        "1D %", "1W %", "1M %", "3M %", "6M %",
+        "Daily", "Weekly", "Monthly", "Momentum Score",
+        "ATR14", "ATR50", "Avg Dollar Volume 20", "High20", "High252",
+        "Low20", "Low252", "Volatility20", "History Days",
     ]
     for col in numeric_cols:
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
 
-    x["Regime Aligned"] = x.apply(is_regime_aligned, axis=1)
-
-    # Relative Strength vs SPY.
-    # RS Composite = 20% × 1M excess return + 35% × 3M excess return
-    #              + 45% × 6M excess return (percentage points).
+    # ---------------------------
+    # Relative Strength vs SPY
+    # ---------------------------
     spy_df = download_one("SPY", "1y")
     if not spy_df.empty and len(spy_df) >= 127:
         spy_1m = float(spy_df["Close"].pct_change(20).iloc[-1])
         spy_3m = float(spy_df["Close"].pct_change(60).iloc[-1])
         spy_6m = float(spy_df["Close"].pct_change(126).iloc[-1])
     else:
-        spy_1m = spy_3m = spy_6m = 0.0
+        spy_1m = spy_3m = spy_6m = np.nan
 
     x["RS 1M vs SPY"] = (x["1M %"] - spy_1m) * 100.0
     x["RS 3M vs SPY"] = (x["3M %"] - spy_3m) * 100.0
     x["RS 6M vs SPY"] = (x["6M %"] - spy_6m) * 100.0
-    x["RS Composite"] = (
-        x["RS 1M vs SPY"].fillna(0.0) * 0.20
-        + x["RS 3M vs SPY"].fillna(0.0) * 0.35
-        + x["RS 6M vs SPY"].fillna(0.0) * 0.45
-    )
 
-    # 1-100 percentile rank inside the selected universe.
+    # Dynamic weighting prevents newer stocks with missing 6M history from
+    # being falsely treated as neutral. Available periods are reweighted.
+    def rs_composite(row):
+        values = [
+            (row.get("RS 1M vs SPY"), 0.20),
+            (row.get("RS 3M vs SPY"), 0.35),
+            (row.get("RS 6M vs SPY"), 0.45),
+        ]
+        valid = [(v, w) for v, w in values if pd.notna(v)]
+        if not valid:
+            return np.nan
+        total_w = sum(w for _, w in valid)
+        return sum(v * w for v, w in valid) / total_w
+
+    x["RS Composite"] = x.apply(rs_composite, axis=1)
     x["RS Rating"] = (
         x["RS Composite"]
-        .rank(pct=True, method="average")
+        .rank(pct=True, method="average", na_option="bottom")
         .mul(99)
         .add(1)
         .round()
@@ -676,171 +724,271 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     )
 
     # ---------------------------
-    # v5 Quality Engine
+    # Derived tradeability / location metrics
     # ---------------------------
-    # Distance from EMA20 measures extension/chase risk.
+    x["ATR %"] = np.where(
+        x["Close"].gt(0) & x["ATR14"].notna(),
+        x["ATR14"] / x["Close"] * 100.0,
+        np.nan,
+    )
     x["EMA20 Distance %"] = np.where(
-        x["EMA20"].notna() & x["EMA20"].ne(0),
+        x["EMA20"].gt(0),
         (x["Close"] / x["EMA20"] - 1.0) * 100.0,
         np.nan,
     )
+    x["20D High Distance %"] = np.where(
+        x["High20"].gt(0),
+        (x["Close"] / x["High20"] - 1.0) * 100.0,
+        np.nan,
+    )
+    x["52W High Distance %"] = np.where(
+        x["High252"].gt(0),
+        (x["Close"] / x["High252"] - 1.0) * 100.0,
+        np.nan,
+    )
+
+    # ---------------------------
+    # Hard tradeability gates
+    # ---------------------------
+    price_ok = x["Close"].fillna(0) >= 10.0
+    liquidity_ok = x["Avg Dollar Volume 20"].fillna(0) >= 20_000_000
+    history_ok = x["History Days"].fillna(0) >= 126
+    atr_ok = x["ATR %"].between(1.0, 8.0, inclusive="both")
+    data_ok = x[["Close", "EMA20", "EMA50", "RSI14", "Momentum Score"]].notna().all(axis=1)
+
+    x["Tradeable"] = price_ok & liquidity_ok & history_ok & atr_ok & data_ok
+
+    def gate_reason(row):
+        reasons = []
+        if pd.isna(row.get("Close")) or row["Close"] < 10:
+            reasons.append("price < $10")
+        if pd.isna(row.get("Avg Dollar Volume 20")) or row["Avg Dollar Volume 20"] < 20_000_000:
+            reasons.append("20D dollar volume < $20M")
+        if pd.isna(row.get("History Days")) or row["History Days"] < 126:
+            reasons.append("insufficient price history")
+        if pd.isna(row.get("ATR %")):
+            reasons.append("ATR unavailable")
+        elif not (1.0 <= row["ATR %"] <= 8.0):
+            reasons.append("ATR% outside 1-8%")
+        return "; ".join(reasons)
+
+    x["Gate Note"] = x.apply(gate_reason, axis=1)
+
+    # ---------------------------
+    # Direction / market regime
+    # ---------------------------
+    long_direction = x["Momentum Score"] >= 15
+    short_direction = x["Momentum Score"] <= -15
 
     long_trend = (
         (x["Close"] > x["EMA20"])
         & (x["EMA20"] > x["EMA50"])
+        & (x["EMA50"] > x["EMA200"])
         & (x["Close"] > x["EMA200"])
     )
     short_trend = (
         (x["Close"] < x["EMA20"])
         & (x["EMA20"] < x["EMA50"])
+        & (x["EMA50"] < x["EMA200"])
         & (x["Close"] < x["EMA200"])
     )
-
-    long_momentum = x["Momentum Score"] >= 25
-    short_momentum = x["Momentum Score"] <= -25
-    volume_confirm = x["Volume Ratio"].fillna(0) >= 1.2
-    long_rsi = x["RSI14"].between(50, 75, inclusive="both")
-    short_rsi = x["RSI14"].between(25, 50, inclusive="both")
 
     long_rs = (x["RS Rating"] >= 70) & (x["RS Composite"] > 0)
     short_rs = (x["RS Rating"] <= 31) & (x["RS Composite"] < 0)
 
-    not_long_extended = (
-        x["EMA20 Distance %"].fillna(999) <= 8.0
-    ) & (x["RSI14"].fillna(999) < 75)
-    not_short_extended = (
-        x["EMA20 Distance %"].fillna(-999) >= -8.0
-    ) & (x["RSI14"].fillna(-999) > 25)
-
-    # Quality points: 6 checks. A+ requires all 6.
-    x["Trend Check"] = np.where(long_trend | short_trend, "✅", "❌")
-    x["Momentum Check"] = np.where(long_momentum | short_momentum, "✅", "❌")
-    x["RS Check"] = np.where(long_rs | short_rs, "✅", "❌")
-    x["Volume Check"] = np.where(volume_confirm, "✅", "❌")
-    x["RSI Check"] = np.where(long_rsi | short_rsi, "✅", "❌")
-    x["Extension Check"] = np.where(not_long_extended | not_short_extended, "✅", "❌")
-
-    long_points = (
-        long_trend.astype(int)
-        + long_momentum.astype(int)
-        + long_rs.astype(int)
-        + volume_confirm.astype(int)
-        + long_rsi.astype(int)
-        + not_long_extended.astype(int)
+    long_location = (
+        x["EMA20 Distance %"].between(-2.5, 8.0, inclusive="both")
+        & (x["RSI14"] < 75)
     )
-    short_points = (
-        short_trend.astype(int)
-        + short_momentum.astype(int)
-        + short_rs.astype(int)
-        + volume_confirm.astype(int)
-        + short_rsi.astype(int)
-        + not_short_extended.astype(int)
+    short_location = (
+        x["EMA20 Distance %"].between(-8.0, 2.5, inclusive="both")
+        & (x["RSI14"] > 25)
     )
 
-    long_candidate = x["Momentum Score"] >= 15
-    short_candidate = x["Momentum Score"] <= -15
+    # Volume confirmation: allow ordinary volume for pullbacks, stronger volume
+    # is rewarded separately rather than required for every good setup.
+    volume_healthy = x["Volume Ratio"].fillna(0) >= 0.75
+    volume_strong = x["Volume Ratio"].fillna(0) >= 1.20
 
-    x["Quality Score"] = np.where(long_candidate, long_points, np.where(short_candidate, short_points, 0))
+    # Momentum persistence across 1M/3M/6M.
+    long_persistence = (
+        (x["1M %"].fillna(-999) > 0)
+        & (x["3M %"].fillna(-999) > 0)
+        & (x["6M %"].fillna(-999) > 0)
+    )
+    short_persistence = (
+        (x["1M %"].fillna(999) < 0)
+        & (x["3M %"].fillna(999) < 0)
+        & (x["6M %"].fillna(999) < 0)
+    )
 
-    # Grade hierarchy:
-    # A+ = all 6 checks.
-    # A  = 5/6 checks.
-    # B+ = 4/6 checks.
-    # Watch = directional but <4 checks.
-    x["Setup"] = "Mixed"
+    if regime["label"] in {"RISK-ON", "BULLISH"}:
+        long_regime = pd.Series(True, index=x.index)
+        short_regime = pd.Series(False, index=x.index)
+    elif regime["label"] in {"RISK-OFF", "BEARISH"}:
+        long_regime = pd.Series(False, index=x.index)
+        short_regime = pd.Series(True, index=x.index)
+    else:
+        long_regime = pd.Series(True, index=x.index)
+        short_regime = pd.Series(True, index=x.index)
 
-    x.loc[long_candidate & (long_points >= 6), "Setup"] = "A+ Long"
-    x.loc[long_candidate & (long_points == 5), "Setup"] = "A Long"
-    x.loc[long_candidate & (long_points == 4), "Setup"] = "B+ Long"
-    x.loc[long_candidate & (long_points < 4), "Setup"] = "Long Watch"
+    # ---------------------------
+    # 100-point Professional Quality Score
+    # ---------------------------
+    # Trend 25, RS 20, momentum 15, liquidity 10, volume 10,
+    # entry location 10, risk/ATR 5, regime fit 5.
+    long_score = (
+        np.where(long_trend, 25, np.where((x["Close"] > x["EMA50"]) & (x["Close"] > x["EMA200"]), 15, 0))
+        + np.where(long_rs, 20, np.where((x["RS Rating"] >= 55) & (x["RS Composite"] > 0), 10, 0))
+        + np.where((x["Momentum Score"] >= 40) & long_persistence, 15,
+                   np.where(x["Momentum Score"] >= 25, 10, np.where(x["Momentum Score"] >= 15, 5, 0)))
+        + np.where(liquidity_ok, 10, 0)
+        + np.where(volume_strong, 10, np.where(volume_healthy, 6, 0))
+        + np.where(long_location, 10, 0)
+        + np.where(atr_ok, 5, 0)
+        + np.where(long_regime, 5, 0)
+    )
 
-    x.loc[short_candidate & (short_points >= 6), "Setup"] = "A+ Short"
-    x.loc[short_candidate & (short_points == 5), "Setup"] = "A Short"
-    x.loc[short_candidate & (short_points == 4), "Setup"] = "B+ Short"
-    x.loc[short_candidate & (short_points < 4), "Setup"] = "Short Watch"
+    short_score = (
+        np.where(short_trend, 25, np.where((x["Close"] < x["EMA50"]) & (x["Close"] < x["EMA200"]), 15, 0))
+        + np.where(short_rs, 20, np.where((x["RS Rating"] <= 45) & (x["RS Composite"] < 0), 10, 0))
+        + np.where((x["Momentum Score"] <= -40) & short_persistence, 15,
+                   np.where(x["Momentum Score"] <= -25, 10, np.where(x["Momentum Score"] <= -15, 5, 0)))
+        + np.where(liquidity_ok, 10, 0)
+        + np.where(volume_strong, 10, np.where(volume_healthy, 6, 0))
+        + np.where(short_location, 10, 0)
+        + np.where(atr_ok, 5, 0)
+        + np.where(short_regime, 5, 0)
+    )
+
+    x["Quality Score"] = np.where(
+        long_direction,
+        long_score,
+        np.where(short_direction, short_score, 0),
+    ).astype(float)
+
+    # Hard-gate failures cannot be quality candidates.
+    x.loc[~x["Tradeable"], "Quality Score"] = np.minimum(
+        x.loc[~x["Tradeable"], "Quality Score"], 49
+    )
+
+    # ---------------------------
+    # Setup classification
+    # ---------------------------
+    near_20d_high = x["20D High Distance %"].between(-3.0, 0.5, inclusive="both")
+    near_52w_high = x["52W High Distance %"].between(-8.0, 0.5, inclusive="both")
+    long_pullback = (
+        long_trend
+        & x["EMA20 Distance %"].between(-2.0, 3.0, inclusive="both")
+        & x["RSI14"].between(45, 65, inclusive="both")
+    )
+    short_pullback = (
+        short_trend
+        & x["EMA20 Distance %"].between(-3.0, 2.0, inclusive="both")
+        & x["RSI14"].between(35, 55, inclusive="both")
+    )
+    long_breakout = long_trend & near_20d_high & near_52w_high & volume_strong & long_rs
+    short_breakdown = short_trend & (x["Close"] <= x["Low20"] * 1.03) & volume_strong & short_rs
+
+    x["Setup Type"] = "Watch"
+    x.loc[long_direction & long_trend, "Setup Type"] = "Trend Continuation"
+    x.loc[short_direction & short_trend, "Setup Type"] = "Trend Continuation Short"
+    x.loc[long_pullback, "Setup Type"] = "Pullback to Trend"
+    x.loc[short_pullback, "Setup Type"] = "Rally into Resistance"
+    x.loc[long_breakout, "Setup Type"] = "Breakout"
+    x.loc[short_breakdown, "Setup Type"] = "Breakdown"
+
+    # ---------------------------
+    # Professional grade
+    # ---------------------------
+    x["Setup"] = "Avoid"
+    x.loc[x["Tradeable"] & long_direction & (x["Quality Score"] >= 90), "Setup"] = "A+ Long"
+    x.loc[x["Tradeable"] & long_direction & x["Quality Score"].between(82, 89.999), "Setup"] = "A Long"
+    x.loc[x["Tradeable"] & long_direction & x["Quality Score"].between(74, 81.999), "Setup"] = "B+ Long"
+    x.loc[x["Tradeable"] & long_direction & x["Quality Score"].between(65, 73.999), "Setup"] = "Long Watch"
+
+    x.loc[x["Tradeable"] & short_direction & (x["Quality Score"] >= 90), "Setup"] = "A+ Short"
+    x.loc[x["Tradeable"] & short_direction & x["Quality Score"].between(82, 89.999), "Setup"] = "A Short"
+    x.loc[x["Tradeable"] & short_direction & x["Quality Score"].between(74, 81.999), "Setup"] = "B+ Short"
+    x.loc[x["Tradeable"] & short_direction & x["Quality Score"].between(65, 73.999), "Setup"] = "Short Watch"
 
     x.loc[x["Momentum Score"].abs() < 15, "Setup"] = "Neutral"
 
+    # Explainability columns.
+    x["Trend Check"] = np.where(long_trend | short_trend, "✅", "❌")
+    x["Momentum Check"] = np.where(
+        ((long_direction & (x["Momentum Score"] >= 25)) | (short_direction & (x["Momentum Score"] <= -25))),
+        "✅", "❌"
+    )
+    x["RS Check"] = np.where(long_rs | short_rs, "✅", "❌")
+    x["Volume Check"] = np.where(volume_healthy, "✅", "❌")
+    x["Extension Check"] = np.where(long_location | short_location, "✅", "❌")
+    x["Liquidity Check"] = np.where(liquidity_ok, "✅", "❌")
+    x["Regime Check"] = np.where(
+        (long_direction & long_regime) | (short_direction & short_regime), "✅", "❌"
+    )
+
     def quality_note(row):
-        direction = "Long" if row["Momentum Score"] >= 15 else "Short" if row["Momentum Score"] <= -15 else "Neutral"
-        if direction == "Neutral":
-            return "Momentum Score is inside the neutral zone (-15 to +15)."
-
-        failed = []
-        if row["Trend Check"] != "✅":
-            failed.append("trend")
-        if row["Momentum Check"] != "✅":
-            failed.append("momentum")
-        if row["RS Check"] != "✅":
-            failed.append("relative strength")
-        if row["Volume Check"] != "✅":
-            failed.append("volume")
-        if row["RSI Check"] != "✅":
-            failed.append("RSI")
-        if row["Extension Check"] != "✅":
-            failed.append("extension")
-
-        if not failed:
-            return "A+ confirmed: all six quality checks passed."
-        return f"{int(row['Quality Score'])}/6 quality checks passed; missing: " + ", ".join(failed) + "."
+        if not bool(row.get("Tradeable", False)):
+            return "Fails tradeability gate: " + (row.get("Gate Note") or "data/liquidity requirement")
+        if abs(row.get("Momentum Score", 0)) < 15:
+            return "Neutral momentum; no directional edge."
+        strengths = []
+        weaknesses = []
+        checks = [
+            ("trend", row.get("Trend Check")),
+            ("relative strength", row.get("RS Check")),
+            ("volume", row.get("Volume Check")),
+            ("entry location", row.get("Extension Check")),
+            ("liquidity", row.get("Liquidity Check")),
+            ("regime", row.get("Regime Check")),
+        ]
+        for name, check in checks:
+            (strengths if check == "✅" else weaknesses).append(name)
+        note = f"{int(row['Quality Score'])}/100 quality score."
+        if strengths:
+            note += " Strengths: " + ", ".join(strengths) + "."
+        if weaknesses:
+            note += " Improve/monitor: " + ", ".join(weaknesses) + "."
+        return note
 
     x["Setup Note"] = x.apply(quality_note, axis=1)
 
-    # Re-evaluate regime alignment after Quality Grade is assigned.
+    # Regime alignment.
     x["Regime Aligned"] = x.apply(is_regime_aligned, axis=1)
 
+    # User filter reasons remain separate from the professional grade.
     def reasons(row):
         out = []
-        if pd.isna(row.get("Momentum Score")):
-            out.append("Incomplete momentum data")
+        if not bool(row.get("Tradeable", False)):
+            out.append(row.get("Gate Note") or "tradeability gate failed")
         if pd.isna(row.get("Volume Ratio")) or row["Volume Ratio"] < min_volume:
             out.append(f"Vol<{min_volume:.1f}x")
         if pd.isna(row.get("RSI14")):
             out.append("RSI unavailable")
         elif row["RSI14"] < rsi_low or row["RSI14"] > rsi_high:
             out.append(f"RSI outside {rsi_low}-{rsi_high}")
-
-        if pd.notna(row.get("Momentum Score")):
-            if regime["label"] in {"RISK-OFF", "BEARISH"}:
-                if row["Momentum Score"] > -abs(min_composite):
-                    out.append("Short momentum weak")
-            elif row["Momentum Score"] < min_composite:
-                out.append("Momentum weak")
-
-        if not row["Regime Aligned"]:
-            out.append("Not regime-aligned")
-        return "; ".join(dict.fromkeys(out))
+        if regime["label"] in {"RISK-OFF", "BEARISH"}:
+            if pd.notna(row.get("Momentum Score")) and row["Momentum Score"] > -abs(min_composite):
+                out.append("short momentum below user threshold")
+        else:
+            if pd.notna(row.get("Momentum Score")) and row["Momentum Score"] < min_composite:
+                out.append("momentum below user threshold")
+        if not row.get("Regime Aligned", False):
+            out.append("not regime-aligned")
+        return "; ".join(dict.fromkeys([v for v in out if v]))
 
     x["Filter Reasons"] = x.apply(reasons, axis=1)
     x["Passes Filters"] = x["Filter Reasons"].eq("")
 
-    trend_bonus = np.zeros(len(x), dtype=float)
-    if regime["label"] in {"RISK-ON", "BULLISH"}:
-        trend_bonus = np.where(
-            (x["Close"] > x["EMA20"]) & (x["EMA20"] > x["EMA50"]), 10.0, 0.0
-        )
-    elif regime["label"] in {"RISK-OFF", "BEARISH"}:
-        trend_bonus = np.where(
-            (x["Close"] < x["EMA20"]) & (x["EMA20"] < x["EMA50"]), 10.0, 0.0
-        )
-
-    vol_bonus = ((x["Volume Ratio"].fillna(1.0) - 1.0) * 10.0).clip(-5.0, 10.0)
-    align_bonus = np.where(x["Regime Aligned"], 15.0, -10.0)
-
-    composite_safe = x["Momentum Score"].fillna(0.0)
-    raw_momentum = -composite_safe if regime["label"] in {"RISK-OFF", "BEARISH"} else composite_safe
-
-    rs_bonus = x["RS Composite"].fillna(0.0).clip(-20.0, 20.0) * 0.50
-
+    # Ranking is now dominated by the professional Quality Score.
+    # RS and volume are tie-breakers only.
     x["Adjusted Score"] = (
-        pd.Series(raw_momentum, index=x.index, dtype="float64")
-        + pd.Series(align_bonus, index=x.index, dtype="float64")
-        + pd.Series(trend_bonus, index=x.index, dtype="float64")
-        + pd.Series(vol_bonus, index=x.index, dtype="float64")
-        + pd.Series(rs_bonus, index=x.index, dtype="float64")
+        x["Quality Score"]
+        + x["RS Composite"].fillna(0).clip(-10, 10) * 0.20
+        + (x["Volume Ratio"].fillna(1) - 1).clip(-0.5, 1.5) * 2.0
     )
     x["Adjusted Score"] = x["Adjusted Score"].replace([np.inf, -np.inf], np.nan).fillna(-9999.0)
-
     ranks = x["Adjusted Score"].rank(method="min", ascending=False, na_option="bottom")
     x["Rank"] = ranks.fillna(len(x) + 1).round().astype("Int64")
     return x
@@ -1346,9 +1494,15 @@ with scanner_tab:
         st.caption(f"Universe contains **{len(universe_df):,}** unique symbols.")
 
     st.info(
-        "**v5 Quality Engine:** A+ requires all 6 checks: "
-        "Trend + Momentum + Relative Strength + Volume + RSI + Not Extended. "
-        "A = 5/6, B+ = 4/6, Watch = fewer than 4."
+        "**Professional Quality Engine:** first applies hard tradeability gates "
+        "(price, liquidity, history, ATR), then scores each stock from **0–100**. "
+        "A+ ≥90, A ≥82, B+ ≥74. Ranking emphasizes trend quality, relative strength, "
+        "persistent momentum, liquidity/volume, entry location, volatility, and market-regime fit."
+    )
+
+    st.caption(
+        "Hard tradeability gates: price ≥ $10 • 20-day average dollar volume ≥ $20M "
+        "• at least 126 trading days of history • ATR% between 1% and 8%."
     )
 
     with st.expander("Scanner filters", expanded=False):
@@ -1420,10 +1574,10 @@ with scanner_tab:
 
         a_plus_mask = ranked["Setup"].isin(["A+ Long", "A+ Short"])
         a_plus_count = int(a_plus_mask.sum())
-        st.caption("A+ Quality Engine: all 6 checks must pass — Trend, Momentum, Relative Strength, Volume, RSI, and Extension.")
+        st.caption("A+ = professional Quality Score ≥90 after tradeability gates. High score alone is not enough if liquidity/history/ATR gates fail.")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Stocks analyzed", f"{len(ranked):,}")
-        k2.metric("Passing filters", f"{int(ranked['Passes Filters'].sum()):,}")
+        k2.metric("Quality candidates", f"{int(ranked['Setup'].isin(['A+ Long','A Long','B+ Long','A+ Short','A Short','B+ Short']).sum()):,}")
         k3.metric("Regime-aligned", f"{int(ranked['Regime Aligned'].sum()):,}")
 
         with k4:
@@ -1453,10 +1607,10 @@ with scanner_tab:
                 )
 
                 aplus_cols = [
-                    "Ticker", "Company", "Sector", "Setup", "Quality Score",
-                    "RS Rating", "RS Composite",
-                    "Adjusted Score", "Momentum Score", "RSI14",
-                    "Volume Ratio", "1D %", "1W %", "1M %",
+                    "Ticker", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
+                    "RS Rating", "RS Composite", "Momentum Score", "RSI14",
+                    "Volume Ratio", "ATR %", "EMA20 Distance %", "20D High Distance %",
+                    "Avg Dollar Volume 20", "Setup Note",
                 ]
                 aplus_cols = [c for c in aplus_cols if c in aplus.columns]
 
@@ -1466,10 +1620,14 @@ with scanner_tab:
                     use_container_width=True,
                     height=min(420, 45 + 36 * len(aplus)),
                     column_config={
+                        "Quality Score": st.column_config.NumberColumn(format="%.0f"),
                         "RS Rating": st.column_config.NumberColumn(format="%d"),
                         "RS Composite": st.column_config.NumberColumn(format="%+.1f"),
-                        "Adjusted Score": st.column_config.NumberColumn(format="%.1f"),
                         "Momentum Score": st.column_config.NumberColumn(format="%.1f"),
+                        "ATR %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "EMA20 Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
+                        "20D High Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
+                        "Avg Dollar Volume 20": st.column_config.NumberColumn(format="$%.0f"),
                         "RSI14": st.column_config.NumberColumn(format="%.1f"),
                         "Volume Ratio": st.column_config.NumberColumn(format="%.2fx"),
                         "1D %": st.column_config.NumberColumn(format="%.2%"),
@@ -1509,21 +1667,22 @@ with scanner_tab:
                     d["EMA200"] = d["Close"].ewm(span=200, adjust=False).mean()
 
                     c1, c2, c3, c4, c5 = st.columns(5)
-                    c1.metric("Quality Grade", selected_row["Setup"])
-                    c2.metric("Quality Score", f"{int(selected_row['Quality Score'])}/6")
-                    c3.metric("Momentum Score", f"{selected_row['Momentum Score']:.1f}")
+                    c1.metric("Grade", selected_row["Setup"])
+                    c2.metric("Quality Score", f"{selected_row['Quality Score']:.0f}/100")
+                    c3.metric("Setup Type", selected_row.get("Setup Type", "N/A"))
                     c4.metric("RS Rating", f"{int(selected_row['RS Rating'])}" if pd.notna(selected_row.get("RS Rating")) else "N/A")
-                    c5.metric("RSI(14)", f"{selected_row['RSI14']:.1f}")
+                    c5.metric("Momentum Score", f"{selected_row['Momentum Score']:.1f}")
 
                     st.caption(selected_row.get("Setup Note", ""))
                     st.markdown(
-                        f"**Quality Checklist:** "
+                        f"**Professional Checklist:** "
                         f"Trend {selected_row.get('Trend Check','')}  •  "
                         f"Momentum {selected_row.get('Momentum Check','')}  •  "
                         f"RS {selected_row.get('RS Check','')}  •  "
                         f"Volume {selected_row.get('Volume Check','')}  •  "
-                        f"RSI {selected_row.get('RSI Check','')}  •  "
-                        f"Extension {selected_row.get('Extension Check','')}"
+                        f"Entry {selected_row.get('Extension Check','')}  •  "
+                        f"Liquidity {selected_row.get('Liquidity Check','')}  •  "
+                        f"Regime {selected_row.get('Regime Check','')}"
                     )
 
                     timeframe = st.segmented_control(
@@ -1606,10 +1765,15 @@ with scanner_tab:
 
         view_mode = st.segmented_control(
             "View",
-            ["Passing Filters", "Regime-Aligned", "All"],
-            default="Passing Filters",
+            ["Quality Candidates", "Passing Filters", "Regime-Aligned", "All"],
+            default="Quality Candidates",
         )
-        if view_mode == "Passing Filters":
+        if view_mode == "Quality Candidates":
+            shown = ranked[
+                ranked["Tradeable"]
+                & ranked["Setup"].isin(["A+ Long", "A Long", "B+ Long", "A+ Short", "A Short", "B+ Short"])
+            ].copy()
+        elif view_mode == "Passing Filters":
             shown = ranked[ranked["Passes Filters"]].copy()
         elif view_mode == "Regime-Aligned":
             shown = ranked[ranked["Regime Aligned"]].copy()
@@ -1622,10 +1786,11 @@ with scanner_tab:
         shown = shown.head(top_n)
 
         display_cols = [
-            "Rank", "Ticker", "Company", "Sector", "Setup", "Quality Score", "Regime Aligned",
-            "RS Rating", "RS Composite",
-            "Adjusted Score", "Momentum Score", "RSI14", "Volume Ratio",
-            "1D %", "1W %", "1M %", "Setup Note", "Filter Reasons",
+            "Rank", "Ticker", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
+            "Tradeable", "Regime Aligned", "RS Rating", "RS Composite",
+            "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
+            "EMA20 Distance %", "20D High Distance %", "Avg Dollar Volume 20",
+            "Setup Note", "Filter Reasons",
         ]
         existing_cols = [c for c in display_cols if c in shown.columns]
 
@@ -1635,10 +1800,14 @@ with scanner_tab:
             use_container_width=True,
             height=520,
             column_config={
+                "Quality Score": st.column_config.NumberColumn(format="%.0f"),
                 "RS Rating": st.column_config.NumberColumn(format="%d"),
                 "RS Composite": st.column_config.NumberColumn(format="%+.1f"),
-                "Adjusted Score": st.column_config.NumberColumn(format="%.1f"),
                 "Momentum Score": st.column_config.NumberColumn(format="%.1f"),
+                "ATR %": st.column_config.NumberColumn(format="%.1f%%"),
+                "EMA20 Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
+                "20D High Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
+                "Avg Dollar Volume 20": st.column_config.NumberColumn(format="$%.0f"),
                 "RSI14": st.column_config.NumberColumn(format="%.1f"),
                 "Volume Ratio": st.column_config.NumberColumn(format="%.2fx"),
                 "1D %": st.column_config.NumberColumn(format="%.2%"),
