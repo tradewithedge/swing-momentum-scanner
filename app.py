@@ -148,17 +148,48 @@ def load_company_directory():
 # ---------------------------
 @st.cache_data(ttl=UNIVERSE_CACHE_TTL, show_spinner=False)
 def load_sp500():
+    """Load S&P 500 constituents with multiple fallbacks."""
     try:
-        tables = pd.read_html(SP500_URL)
-        table = next(t for t in tables if "Symbol" in t.columns and "Security" in t.columns)
-        out = pd.DataFrame({
-            "Ticker": table["Symbol"].map(clean_symbol),
-            "Company": table["Security"].astype(str),
-            "Sector": table["GICS Sector"].astype(str) if "GICS Sector" in table.columns else "",
-        })
-        return out[out["Ticker"] != ""].drop_duplicates("Ticker")
+        response = requests.get(
+            SP500_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        response.raise_for_status()
+        tables = pd.read_html(io.StringIO(response.text))
+        for table in tables:
+            table.columns = [str(c).strip() for c in table.columns]
+            if "Symbol" in table.columns and "Security" in table.columns and len(table) >= 450:
+                out = pd.DataFrame({
+                    "Ticker": table["Symbol"].map(clean_symbol),
+                    "Company": table["Security"].astype(str),
+                    "Sector": table["GICS Sector"].astype(str) if "GICS Sector" in table.columns else "",
+                })
+                out = out[out["Ticker"] != ""].drop_duplicates("Ticker")
+                if len(out) >= 450:
+                    return out.reset_index(drop=True)
     except Exception:
-        return pd.DataFrame(columns=["Ticker", "Company", "Sector"])
+        pass
+
+    try:
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        response.raise_for_status()
+        table = pd.read_csv(io.StringIO(response.text))
+        if "Symbol" in table.columns and len(table) >= 450:
+            company_col = "Security" if "Security" in table.columns else ("Name" if "Name" in table.columns else "Symbol")
+            sector_col = "GICS Sector" if "GICS Sector" in table.columns else ("Sector" if "Sector" in table.columns else None)
+            out = pd.DataFrame({
+                "Ticker": table["Symbol"].map(clean_symbol),
+                "Company": table[company_col].astype(str),
+                "Sector": table[sector_col].astype(str) if sector_col else "",
+            })
+            out = out[out["Ticker"] != ""].drop_duplicates("Ticker")
+            if len(out) >= 450:
+                return out.reset_index(drop=True)
+    except Exception:
+        pass
+
+    return pd.DataFrame(columns=["Ticker", "Company", "Sector"])
+
 
 @st.cache_data(ttl=UNIVERSE_CACHE_TTL, show_spinner=False)
 def load_nasdaq100():
@@ -590,263 +621,73 @@ def is_regime_aligned(row):
     return row["Setup"] not in {"Neutral", "Mixed"}
 
 def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
+    """Add filters/ranking safely even when Yahoo returns partial rows."""
     if df.empty:
         return df
 
     x = df.copy()
+    numeric_cols = [
+        "Close", "EMA20", "EMA50", "EMA200", "RSI14", "Volume Ratio",
+        "1D %", "1W %", "1M %", "3M %", "Daily", "Weekly", "Monthly", "Composite",
+    ]
+    for col in numeric_cols:
+        if col in x.columns:
+            x[col] = pd.to_numeric(x[col], errors="coerce")
+
     x["Regime Aligned"] = x.apply(is_regime_aligned, axis=1)
 
     def reasons(row):
         out = []
-        if pd.isna(row["Volume Ratio"]) or row["Volume Ratio"] < min_volume:
+        if pd.isna(row.get("Composite")):
+            out.append("Incomplete momentum data")
+        if pd.isna(row.get("Volume Ratio")) or row["Volume Ratio"] < min_volume:
             out.append(f"Vol<{min_volume:.1f}x")
-        if row["RSI14"] < rsi_low or row["RSI14"] > rsi_high:
+        if pd.isna(row.get("RSI14")):
+            out.append("RSI unavailable")
+        elif row["RSI14"] < rsi_low or row["RSI14"] > rsi_high:
             out.append(f"RSI outside {rsi_low}-{rsi_high}")
 
-        if regime["label"] in {"RISK-OFF", "BEARISH"}:
-            if row["Composite"] > -abs(min_composite):
-                out.append("Short momentum weak")
-        else:
-            if row["Composite"] < min_composite:
+        if pd.notna(row.get("Composite")):
+            if regime["label"] in {"RISK-OFF", "BEARISH"}:
+                if row["Composite"] > -abs(min_composite):
+                    out.append("Short momentum weak")
+            elif row["Composite"] < min_composite:
                 out.append("Composite weak")
 
         if not row["Regime Aligned"]:
             out.append("Not regime-aligned")
-        return "; ".join(out)
+        return "; ".join(dict.fromkeys(out))
 
     x["Filter Reasons"] = x.apply(reasons, axis=1)
     x["Passes Filters"] = x["Filter Reasons"].eq("")
 
-    trend_bonus = np.zeros(len(x))
+    trend_bonus = np.zeros(len(x), dtype=float)
     if regime["label"] in {"RISK-ON", "BULLISH"}:
-        trend_bonus = np.where((x["Close"] > x["EMA20"]) & (x["EMA20"] > x["EMA50"]), 10, 0)
+        trend_bonus = np.where(
+            (x["Close"] > x["EMA20"]) & (x["EMA20"] > x["EMA50"]), 10.0, 0.0
+        )
     elif regime["label"] in {"RISK-OFF", "BEARISH"}:
-        trend_bonus = np.where((x["Close"] < x["EMA20"]) & (x["EMA20"] < x["EMA50"]), 10, 0)
+        trend_bonus = np.where(
+            (x["Close"] < x["EMA20"]) & (x["EMA20"] < x["EMA50"]), 10.0, 0.0
+        )
 
-    vol_bonus = ((x["Volume Ratio"].fillna(1) - 1) * 10).clip(-5, 10)
-    align_bonus = np.where(x["Regime Aligned"], 15, -10)
+    vol_bonus = ((x["Volume Ratio"].fillna(1.0) - 1.0) * 10.0).clip(-5.0, 10.0)
+    align_bonus = np.where(x["Regime Aligned"], 15.0, -10.0)
 
-    # In bearish regimes invert raw composite so stronger negative momentum ranks higher.
-    raw_momentum = -x["Composite"] if regime["label"] in {"RISK-OFF", "BEARISH"} else x["Composite"]
-    x["Adjusted Score"] = raw_momentum + align_bonus + trend_bonus + vol_bonus
-    x["Rank"] = x["Adjusted Score"].rank(method="min", ascending=False).astype(int)
-    return x
+    composite_safe = x["Composite"].fillna(0.0)
+    raw_momentum = -composite_safe if regime["label"] in {"RISK-OFF", "BEARISH"} else composite_safe
 
-
-def compute_search_diagnostic(symbol, company, df, metadata):
-    """Convert price history into an actionable but heuristic swing-trade diagnostic."""
-    if df.empty or len(df) < 80:
-        return None
-
-    x = df.copy()
-    x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
-    x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
-    x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
-    x["ATR14"] = (pd.concat([
-        x["High"] - x["Low"],
-        (x["High"] - x["Close"].shift(1)).abs(),
-        (x["Low"] - x["Close"].shift(1)).abs(),
-    ], axis=1).max(axis=1)).rolling(14).mean()
-    x["RSI14"] = rsi(x["Close"], 14)
-    x["Vol20"] = x["Volume"].rolling(20).mean()
-    x["Volume Ratio"] = x["Volume"] / x["Vol20"]
-
-    for n, label in [(1, "1D"), (5, "1W"), (20, "1M"), (60, "3M")]:
-        x[f"{label} %"] = x["Close"].pct_change(n)
-
-    latest = x.iloc[-1]
-    prev5 = x.iloc[-6] if len(x) >= 6 else latest
-
-    daily = momentum_score(latest["1D %"], 2500)
-    weekly = momentum_score(latest["1W %"], 700)
-    monthly = momentum_score(latest["1M %"], 350)
-    composite = daily * 0.40 + weekly * 0.35 + monthly * 0.25
-
-    prev_daily = momentum_score(prev5["1D %"], 2500) if pd.notna(prev5["1D %"]) else np.nan
-    prev_weekly = momentum_score(prev5["1W %"], 700) if pd.notna(prev5["1W %"]) else np.nan
-    prev_monthly = momentum_score(prev5["1M %"], 350) if pd.notna(prev5["1M %"]) else np.nan
-    prev_composite = (
-        prev_daily * 0.40 + prev_weekly * 0.35 + prev_monthly * 0.25
-        if all(pd.notna(v) for v in [prev_daily, prev_weekly, prev_monthly]) else np.nan
+    x["Adjusted Score"] = (
+        pd.Series(raw_momentum, index=x.index, dtype="float64")
+        + pd.Series(align_bonus, index=x.index, dtype="float64")
+        + pd.Series(trend_bonus, index=x.index, dtype="float64")
+        + pd.Series(vol_bonus, index=x.index, dtype="float64")
     )
+    x["Adjusted Score"] = x["Adjusted Score"].replace([np.inf, -np.inf], np.nan).fillna(-9999.0)
 
-    if pd.isna(prev_composite):
-        acceleration = "N/A"
-    elif composite - prev_composite >= 10:
-        acceleration = "Accelerating ↑"
-    elif composite - prev_composite <= -10:
-        acceleration = "Weakening ↓"
-    else:
-        acceleration = "Stable →"
-
-    close = float(latest["Close"])
-    ema20 = float(latest["EMA20"])
-    ema50 = float(latest["EMA50"])
-    ema200 = float(latest["EMA200"])
-    atr = float(latest["ATR14"]) if pd.notna(latest["ATR14"]) else close * 0.025
-    rsi14 = float(latest["RSI14"])
-    vol_ratio = float(latest["Volume Ratio"]) if pd.notna(latest["Volume Ratio"]) else np.nan
-
-    bull_stack = close > ema20 > ema50 > ema200
-    bull_mid = close > ema20 > ema50
-    bear_stack = close < ema20 < ema50 < ema200
-    bear_mid = close < ema20 < ema50
-
-    if bull_stack:
-        trend = "Strong bullish"
-    elif bull_mid:
-        trend = "Bullish"
-    elif bear_stack:
-        trend = "Strong bearish"
-    elif bear_mid:
-        trend = "Bearish"
-    else:
-        trend = "Mixed"
-
-    dist_ema20 = close / ema20 - 1 if ema20 else np.nan
-    if dist_ema20 > 0.08 or rsi14 >= 75:
-        extension = "Extended"
-    elif dist_ema20 < -0.08 or rsi14 <= 25:
-        extension = "Oversold"
-    else:
-        extension = "Normal"
-
-    # Relative strength vs SPY using 1M + 3M returns.
-    spy = download_one("SPY", "1y")
-    rs_text = "N/A"
-    rs_score = 0.0
-    if not spy.empty and len(spy) >= 61:
-        spy_1m = float(spy["Close"].pct_change(20).iloc[-1])
-        spy_3m = float(spy["Close"].pct_change(60).iloc[-1])
-        stock_1m = float(latest["1M %"])
-        stock_3m = float(latest["3M %"])
-        rs_score = (stock_1m - spy_1m) * 100 + (stock_3m - spy_3m) * 50
-        if rs_score >= 5:
-            rs_text = "Strongly outperforming SPY"
-        elif rs_score >= 1:
-            rs_text = "Outperforming SPY"
-        elif rs_score <= -5:
-            rs_text = "Strongly underperforming SPY"
-        elif rs_score <= -1:
-            rs_text = "Underperforming SPY"
-        else:
-            rs_text = "In line with SPY"
-
-    sector = metadata.get("sector", "") or "N/A"
-    industry = metadata.get("industry", "") or ""
-
-    # Earnings risk.
-    earnings_date = metadata.get("earnings_date")
-    earnings_text = "No date available"
-    earnings_risk = False
-    if earnings_date is not None and not pd.isna(earnings_date):
-        days = (pd.Timestamp(earnings_date).normalize() - pd.Timestamp.today().normalize()).days
-        if days >= 0:
-            earnings_risk = days <= 14
-            earnings_text = f"{days} days away" if days > 0 else "Today"
-        else:
-            earnings_text = "Recently reported"
-
-    # Heuristic long/short trade plans.
-    high20 = float(x["High"].iloc[-21:-1].max()) if len(x) >= 21 else close
-    low20 = float(x["Low"].iloc[-21:-1].min()) if len(x) >= 21 else close
-
-    long_bias = composite >= 15 and close > ema20
-    short_bias = composite <= -15 and close < ema20
-
-    if long_bias:
-        entry_low = max(ema20, close - 0.50 * atr)
-        entry_high = close + 0.15 * atr
-        stop = min(ema50, entry_low - 1.35 * atr)
-        risk = max(entry_low - stop, atr * 0.6)
-        target1 = max(high20, entry_high + 1.5 * risk)
-        target2 = entry_high + 2.5 * risk
-        rr = (target2 - entry_high) / max(entry_high - stop, 0.01)
-        bias = "LONG"
-    elif short_bias:
-        entry_high = min(ema20, close + 0.50 * atr)
-        entry_low = close - 0.15 * atr
-        stop = max(ema50, entry_high + 1.35 * atr)
-        risk = max(stop - entry_high, atr * 0.6)
-        target1 = min(low20, entry_low - 1.5 * risk)
-        target2 = entry_low - 2.5 * risk
-        rr = (entry_low - target2) / max(stop - entry_low, 0.01)
-        bias = "SHORT"
-    else:
-        entry_low = entry_high = stop = target1 = target2 = rr = np.nan
-        bias = "WAIT"
-
-    # Unified verdict score.
-    verdict_points = 0
-    verdict_points += 2 if bull_stack else 1 if bull_mid else -2 if bear_stack else -1 if bear_mid else 0
-    verdict_points += 2 if composite >= 40 else 1 if composite >= 20 else -2 if composite <= -40 else -1 if composite <= -20 else 0
-    verdict_points += 1 if rs_score >= 1 else -1 if rs_score <= -1 else 0
-    verdict_points += 1 if pd.notna(vol_ratio) and vol_ratio >= 1.2 else 0
-    verdict_points += 1 if 50 <= rsi14 <= 72 and long_bias else 1 if 28 <= rsi14 <= 50 and short_bias else 0
-    verdict_points -= 1 if extension == "Extended" else 0
-    verdict_points -= 2 if earnings_risk else 0
-
-    if bias == "LONG":
-        if verdict_points >= 5:
-            verdict = "A — ACTIONABLE LONG"
-        elif verdict_points >= 3:
-            verdict = "B+ — LONG WATCH"
-        elif verdict_points >= 1:
-            verdict = "B — CONDITIONAL LONG"
-        else:
-            verdict = "C — WAIT"
-    elif bias == "SHORT":
-        if verdict_points <= -5:
-            verdict = "A — ACTIONABLE SHORT"
-        elif verdict_points <= -3:
-            verdict = "B+ — SHORT WATCH"
-        elif verdict_points <= -1:
-            verdict = "B — CONDITIONAL SHORT"
-        else:
-            verdict = "C — WAIT"
-    else:
-        verdict = "C — WAIT / MIXED"
-
-    return {
-        "Ticker": symbol,
-        "Company": company,
-        "Close": close,
-        "Daily": daily,
-        "Weekly": weekly,
-        "Monthly": monthly,
-        "Composite": composite,
-        "Acceleration": acceleration,
-        "Trend": trend,
-        "RSI14": rsi14,
-        "Volume Ratio": vol_ratio,
-        "Extension": extension,
-        "RS vs SPY": rs_text,
-        "Sector": sector,
-        "Industry": industry,
-        "Earnings": earnings_text,
-        "Earnings Risk": earnings_risk,
-        "Bias": bias,
-        "Verdict": verdict,
-        "Entry Low": entry_low,
-        "Entry High": entry_high,
-        "Stop": stop,
-        "Target 1": target1,
-        "Target 2": target2,
-        "RR": rr,
-        "EMA20": ema20,
-        "EMA50": ema50,
-        "EMA200": ema200,
-        "Market Cap": metadata.get("market_cap", np.nan),
-        "Trailing PE": metadata.get("trailing_pe", np.nan),
-        "Forward PE": metadata.get("forward_pe", np.nan),
-    }
-
-
-def fmt_price(v):
-    return "N/A" if pd.isna(v) else f"${v:,.2f}"
-
-def fmt_ratio(v):
-    return "N/A" if pd.isna(v) else f"{v:.1f}R"
+    ranks = x["Adjusted Score"].rank(method="min", ascending=False, na_option="bottom")
+    x["Rank"] = ranks.fillna(len(x) + 1).round().astype("Int64")
+    return x
 
 
 # ---------------------------
