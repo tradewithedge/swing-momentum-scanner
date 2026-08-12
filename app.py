@@ -1044,26 +1044,52 @@ with scanner_tab:
                     )
                     c5.metric("1-Month", f"{selected_row['1M %']:.2%}")
 
+                    timeframe = st.segmented_control(
+                        "Chart timeframe",
+                        ["Daily", "Weekly", "Monthly", "YTD", "All"],
+                        default="Daily",
+                        key=f"aplus_timeframe_{selected_aplus}",
+                    )
+
+                    chart_df = detail_df.copy()
+                    if timeframe == "Daily":
+                        chart_df = chart_df.tail(60).copy()
+                    elif timeframe == "Weekly":
+                        chart_df = chart_df.tail(120).copy()
+                    elif timeframe == "Monthly":
+                        chart_df = chart_df.tail(252).copy()
+                    elif timeframe == "YTD":
+                        current_year = pd.Timestamp.today().year
+                        chart_df = chart_df[
+                            pd.to_datetime(chart_df["Date"]).dt.year == current_year
+                        ].copy()
+                    else:
+                        chart_df = detail_df.copy()
+
+                    chart_df["EMA20"] = chart_df["Close"].ewm(span=20, adjust=False).mean()
+                    chart_df["EMA50"] = chart_df["Close"].ewm(span=50, adjust=False).mean()
+                    chart_df["EMA200"] = chart_df["Close"].ewm(span=200, adjust=False).mean()
+
                     fig_aplus = go.Figure()
                     fig_aplus.add_trace(go.Candlestick(
-                        x=d["Date"],
-                        open=d["Open"],
-                        high=d["High"],
-                        low=d["Low"],
-                        close=d["Close"],
+                        x=chart_df["Date"],
+                        open=chart_df["Open"],
+                        high=chart_df["High"],
+                        low=chart_df["Low"],
+                        close=chart_df["Close"],
                         name="Price",
                     ))
                     fig_aplus.add_trace(go.Scatter(
-                        x=d["Date"], y=d["EMA20"], name="EMA20"
+                        x=chart_df["Date"], y=chart_df["EMA20"], name="EMA20"
                     ))
                     fig_aplus.add_trace(go.Scatter(
-                        x=d["Date"], y=d["EMA50"], name="EMA50"
+                        x=chart_df["Date"], y=chart_df["EMA50"], name="EMA50"
                     ))
                     fig_aplus.add_trace(go.Scatter(
-                        x=d["Date"], y=d["EMA200"], name="EMA200"
+                        x=chart_df["Date"], y=chart_df["EMA200"], name="EMA200"
                     ))
                     fig_aplus.update_layout(
-                        title=f"{selected_aplus} — A+ Setup Chart",
+                        title=f"{selected_aplus} — A+ Setup Chart ({timeframe})",
                         height=480,
                         xaxis_rangeslider_visible=False,
                         margin=dict(l=5, r=5, t=45, b=5),
