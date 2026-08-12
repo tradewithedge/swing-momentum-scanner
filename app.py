@@ -694,6 +694,192 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     return x
 
 
+
+def compute_search_diagnostic(symbol, company, df, metadata):
+    """Decision-oriented swing diagnostic from cached daily price history."""
+    if df.empty or len(df) < 80:
+        return None
+
+    x = df.copy()
+    x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
+    x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
+    x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
+
+    true_range = pd.concat(
+        [
+            x["High"] - x["Low"],
+            (x["High"] - x["Close"].shift(1)).abs(),
+            (x["Low"] - x["Close"].shift(1)).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    x["ATR14"] = true_range.rolling(14).mean()
+    x["RSI14"] = rsi(x["Close"], 14)
+    x["Vol20"] = x["Volume"].rolling(20).mean()
+    x["Volume Ratio"] = x["Volume"] / x["Vol20"]
+
+    x["1D %"] = x["Close"].pct_change(1)
+    x["1W %"] = x["Close"].pct_change(5)
+    x["1M %"] = x["Close"].pct_change(20)
+    x["3M %"] = x["Close"].pct_change(60)
+
+    latest = x.iloc[-1]
+    prev = x.iloc[-6] if len(x) >= 6 else latest
+
+    daily = momentum_score(latest["1D %"], 2500)
+    weekly = momentum_score(latest["1W %"], 700)
+    monthly = momentum_score(latest["1M %"], 350)
+    composite = daily * 0.40 + weekly * 0.35 + monthly * 0.25
+
+    prev_daily = momentum_score(prev["1D %"], 2500) if pd.notna(prev["1D %"]) else np.nan
+    prev_weekly = momentum_score(prev["1W %"], 700) if pd.notna(prev["1W %"]) else np.nan
+    prev_monthly = momentum_score(prev["1M %"], 350) if pd.notna(prev["1M %"]) else np.nan
+
+    if all(pd.notna(v) for v in [prev_daily, prev_weekly, prev_monthly]):
+        prev_composite = prev_daily * 0.40 + prev_weekly * 0.35 + prev_monthly * 0.25
+        delta = composite - prev_composite
+        if delta >= 10:
+            acceleration = "Accelerating ↑"
+        elif delta <= -10:
+            acceleration = "Weakening ↓"
+        else:
+            acceleration = "Stable →"
+    else:
+        acceleration = "N/A"
+
+    close = float(latest["Close"])
+    ema20 = float(latest["EMA20"])
+    ema50 = float(latest["EMA50"])
+    ema200 = float(latest["EMA200"])
+    atr = float(latest["ATR14"]) if pd.notna(latest["ATR14"]) else close * 0.025
+    rsi14 = float(latest["RSI14"])
+    vol_ratio = float(latest["Volume Ratio"]) if pd.notna(latest["Volume Ratio"]) else np.nan
+
+    bull_stack = close > ema20 > ema50 > ema200
+    bull_mid = close > ema20 > ema50
+    bear_stack = close < ema20 < ema50 < ema200
+    bear_mid = close < ema20 < ema50
+
+    if bull_stack:
+        trend = "Strong bullish"
+    elif bull_mid:
+        trend = "Bullish"
+    elif bear_stack:
+        trend = "Strong bearish"
+    elif bear_mid:
+        trend = "Bearish"
+    else:
+        trend = "Mixed"
+
+    dist_ema20 = close / ema20 - 1 if ema20 else np.nan
+    if dist_ema20 > 0.08 or rsi14 >= 75:
+        extension = "Extended"
+    elif dist_ema20 < -0.08 or rsi14 <= 25:
+        extension = "Oversold"
+    else:
+        extension = "Normal"
+
+    rs_text = "N/A"
+    rs_score = 0.0
+    spy = download_one("SPY", "1y")
+    if not spy.empty and len(spy) >= 61:
+        spy_1m = float(spy["Close"].pct_change(20).iloc[-1])
+        spy_3m = float(spy["Close"].pct_change(60).iloc[-1])
+        stock_1m = float(latest["1M %"])
+        stock_3m = float(latest["3M %"])
+        rs_score = (stock_1m - spy_1m) * 100 + (stock_3m - spy_3m) * 50
+        if rs_score >= 5:
+            rs_text = "Strongly outperforming SPY"
+        elif rs_score >= 1:
+            rs_text = "Outperforming SPY"
+        elif rs_score <= -5:
+            rs_text = "Strongly underperforming SPY"
+        elif rs_score <= -1:
+            rs_text = "Underperforming SPY"
+        else:
+            rs_text = "In line with SPY"
+
+    sector = metadata.get("sector", "") or "N/A"
+    industry = metadata.get("industry", "") or ""
+
+    earnings_date = metadata.get("earnings_date")
+    earnings_text = "No date available"
+    earnings_risk = False
+    if earnings_date is not None and not pd.isna(earnings_date):
+        days = (pd.Timestamp(earnings_date).normalize() - pd.Timestamp.today().normalize()).days
+        if days >= 0:
+            earnings_risk = days <= 14
+            earnings_text = f"{days} days away" if days > 0 else "Today"
+        else:
+            earnings_text = "Recently reported"
+
+    high20 = float(x["High"].iloc[-21:-1].max()) if len(x) >= 21 else close
+    low20 = float(x["Low"].iloc[-21:-1].min()) if len(x) >= 21 else close
+
+    long_bias = composite >= 15 and close > ema20
+    short_bias = composite <= -15 and close < ema20
+
+    if long_bias:
+        entry_low = max(ema20, close - 0.50 * atr)
+        entry_high = close + 0.15 * atr
+        stop = min(ema50, entry_low - 1.35 * atr)
+        risk = max(entry_low - stop, atr * 0.6)
+        target1 = max(high20, entry_high + 1.5 * risk)
+        target2 = entry_high + 2.5 * risk
+        rr = (target2 - entry_high) / max(entry_high - stop, 0.01)
+        bias = "LONG"
+    elif short_bias:
+        entry_high = min(ema20, close + 0.50 * atr)
+        entry_low = close - 0.15 * atr
+        stop = max(ema50, entry_high + 1.35 * atr)
+        risk = max(stop - entry_high, atr * 0.6)
+        target1 = min(low20, entry_low - 1.5 * risk)
+        target2 = entry_low - 2.5 * risk
+        rr = (entry_low - target2) / max(stop - entry_low, 0.01)
+        bias = "SHORT"
+    else:
+        entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        bias = "WAIT"
+
+    points = 0
+    points += 2 if bull_stack else 1 if bull_mid else -2 if bear_stack else -1 if bear_mid else 0
+    points += 2 if composite >= 40 else 1 if composite >= 20 else -2 if composite <= -40 else -1 if composite <= -20 else 0
+    points += 1 if rs_score >= 1 else -1 if rs_score <= -1 else 0
+    points += 1 if pd.notna(vol_ratio) and vol_ratio >= 1.2 else 0
+    points -= 1 if extension == "Extended" else 0
+    points -= 2 if earnings_risk else 0
+
+    if bias == "LONG":
+        verdict = "A — ACTIONABLE LONG" if points >= 5 else "B+ — LONG WATCH" if points >= 3 else "B — CONDITIONAL LONG" if points >= 1 else "C — WAIT"
+    elif bias == "SHORT":
+        verdict = "A — ACTIONABLE SHORT" if points <= -5 else "B+ — SHORT WATCH" if points <= -3 else "B — CONDITIONAL SHORT" if points <= -1 else "C — WAIT"
+    else:
+        verdict = "C — WAIT / MIXED"
+
+    return {
+        "Ticker": symbol, "Company": company, "Close": close,
+        "Daily": daily, "Weekly": weekly, "Monthly": monthly, "Composite": composite,
+        "Acceleration": acceleration, "Trend": trend, "RSI14": rsi14,
+        "Volume Ratio": vol_ratio, "Extension": extension, "RS vs SPY": rs_text,
+        "Sector": sector, "Industry": industry, "Earnings": earnings_text,
+        "Earnings Risk": earnings_risk, "Bias": bias, "Verdict": verdict,
+        "Entry Low": entry_low, "Entry High": entry_high, "Stop": stop,
+        "Target 1": target1, "Target 2": target2, "RR": rr,
+        "EMA20": ema20, "EMA50": ema50, "EMA200": ema200,
+        "Market Cap": metadata.get("market_cap", np.nan),
+        "Trailing PE": metadata.get("trailing_pe", np.nan),
+        "Forward PE": metadata.get("forward_pe", np.nan),
+    }
+
+
+def fmt_price(value):
+    return "N/A" if pd.isna(value) else f"${value:,.2f}"
+
+
+def fmt_ratio(value):
+    return "N/A" if pd.isna(value) else f"{value:.1f}R"
+
+
 # ---------------------------
 # Compact market-regime header
 # ---------------------------
