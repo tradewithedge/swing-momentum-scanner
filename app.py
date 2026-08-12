@@ -735,12 +735,13 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     prev_weekly = momentum_score(prev["1W %"], 700) if pd.notna(prev["1W %"]) else np.nan
     prev_monthly = momentum_score(prev["1M %"], 350) if pd.notna(prev["1M %"]) else np.nan
 
+    acceleration_delta = np.nan
     if all(pd.notna(v) for v in [prev_daily, prev_weekly, prev_monthly]):
         prev_composite = prev_daily * 0.40 + prev_weekly * 0.35 + prev_monthly * 0.25
-        delta = composite - prev_composite
-        if delta >= 10:
+        acceleration_delta = composite - prev_composite
+        if acceleration_delta >= 10:
             acceleration = "Accelerating ↑"
-        elif delta <= -10:
+        elif acceleration_delta <= -10:
             acceleration = "Weakening ↓"
         else:
             acceleration = "Stable →"
@@ -856,11 +857,54 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     else:
         verdict = "C — WAIT / MIXED"
 
+    # Plain-English interpretation for the UI.
+    if composite >= 70:
+        momentum_grade = "Very strong"
+    elif composite >= 40:
+        momentum_grade = "Strong"
+    elif composite >= 15:
+        momentum_grade = "Moderate bullish"
+    elif composite <= -70:
+        momentum_grade = "Very weak"
+    elif composite <= -40:
+        momentum_grade = "Weak"
+    elif composite <= -15:
+        momentum_grade = "Moderate bearish"
+    else:
+        momentum_grade = "Neutral"
+
+    chase_risk = "Normal"
+    trade_comment = ""
+    if long_bias and extension == "Extended":
+        chase_risk = "Elevated"
+        trade_comment = (
+            "Strong momentum, but chase risk is elevated. "
+            "Prefer a pullback toward EMA20 / support or fresh confirmation rather than chasing."
+        )
+    elif short_bias and extension == "Oversold":
+        chase_risk = "Elevated"
+        trade_comment = (
+            "Bearish momentum is strong, but the stock is stretched lower. "
+            "Prefer a bounce/rejection setup rather than chasing weakness."
+        )
+    elif bias == "LONG":
+        trade_comment = "Momentum and trend are constructive; focus on entry quality and risk/reward."
+    elif bias == "SHORT":
+        trade_comment = "Bearish momentum and trend are constructive for shorts; focus on entry quality."
+    else:
+        trade_comment = "Momentum/trend alignment is mixed. Waiting for confirmation is preferable."
+
     return {
         "Ticker": symbol, "Company": company, "Close": close,
         "Daily": daily, "Weekly": weekly, "Monthly": monthly, "Composite": composite,
-        "Acceleration": acceleration, "Trend": trend, "RSI14": rsi14,
-        "Volume Ratio": vol_ratio, "Extension": extension, "RS vs SPY": rs_text,
+        "Momentum Grade": momentum_grade,
+        "Acceleration": acceleration, "Acceleration Delta": acceleration_delta,
+        "Trend": trend, "RSI14": rsi14,
+        "Volume Ratio": vol_ratio, "Extension": extension,
+        "Distance EMA20": dist_ema20,
+        "RS vs SPY": rs_text,
+        "Chase Risk": chase_risk,
+        "Trade Comment": trade_comment,
         "Sector": sector, "Industry": industry, "Earnings": earnings_text,
         "Earnings Risk": earnings_risk, "Bias": bias, "Verdict": verdict,
         "Entry Low": entry_low, "Entry High": entry_high, "Stop": stop,
@@ -907,7 +951,7 @@ ticker_tab, scanner_tab = st.tabs(["🔎 Ticker Search", "📊 Market Scanner"])
 # ---------------------------
 with ticker_tab:
     st.subheader("Instant Swing-Trade Diagnostic")
-    st.caption("Choose any ticker/company and get a fast decision-oriented readout.")
+    st.caption("Choose any ticker/company and get a fast decision-oriented readout with the calculation logic shown.")
 
     company_dir = load_company_directory()
     labels = company_dir["Label"].tolist()
@@ -941,10 +985,32 @@ with ticker_tab:
             v3.metric("Trend", diag["Trend"])
             v4.metric("RS vs SPY", diag["RS vs SPY"])
 
+            # Explicit calculation note directly under headline metrics.
+            st.info(
+                "**Momentum formula:** Composite score = 40% Daily + 35% Weekly + 25% Monthly. "
+                "Daily uses 1 trading day, Weekly 5 trading days, Monthly 20 trading days. "
+                "Each component is scaled/capped to a -100 to +100 score, so the composite is a momentum score, not a % return."
+            )
+
             m1, m2, m3 = st.columns(3)
-            m1.metric("Daily", f"{diag['Daily']:.1f}")
-            m2.metric("Weekly", f"{diag['Weekly']:.1f}")
-            m3.metric("Monthly", f"{diag['Monthly']:.1f}")
+            m1.metric("Daily score", f"{diag['Daily']:.1f}")
+            m2.metric("Weekly score", f"{diag['Weekly']:.1f}")
+            m3.metric("Monthly score", f"{diag['Monthly']:.1f}")
+
+            accel_delta = diag["Acceleration Delta"]
+            if pd.notna(accel_delta):
+                if accel_delta >= 10:
+                    accel_rule = "Accelerating because composite improved by at least +10 points vs 5 trading days ago."
+                elif accel_delta <= -10:
+                    accel_rule = "Weakening because composite fell by at least -10 points vs 5 trading days ago."
+                else:
+                    accel_rule = "Stable because the composite changed by less than 10 points vs 5 trading days ago."
+                st.caption(
+                    f"Momentum quality: **{diag['Momentum Grade']}** • "
+                    f"5-day composite change: **{accel_delta:+.1f} pts** • {accel_rule}"
+                )
+            else:
+                st.caption(f"Momentum quality: **{diag['Momentum Grade']}** • 5-day acceleration comparison unavailable.")
 
             q1, q2, q3, q4 = st.columns(4)
             q1.metric("RSI(14)", f"{diag['RSI14']:.1f}")
@@ -955,10 +1021,43 @@ with ticker_tab:
             q3.metric("Extension", diag["Extension"])
             q4.metric("Sector", diag["Sector"])
 
+            ema20_dist = diag["Distance EMA20"]
+            extension_note = (
+                f"Price vs EMA20: **{ema20_dist:+.1%}** • RSI(14): **{diag['RSI14']:.1f}**. "
+                "Rule: **Extended** if price is >8% above EMA20 OR RSI ≥75. "
+                "**Oversold** if price is >8% below EMA20 OR RSI ≤25."
+                if pd.notna(ema20_dist)
+                else "Extension rule: Extended if >8% above EMA20 or RSI ≥75; Oversold if >8% below EMA20 or RSI ≤25."
+            )
+            st.caption(extension_note)
+
             if diag["Industry"]:
                 st.caption(f"Industry: {diag['Industry']}")
 
-            # Earnings event risk is surfaced before the trade plan.
+            if diag["Chase Risk"] == "Elevated":
+                st.warning(f"⚠️ **Chase risk: Elevated.** {diag['Trade Comment']}")
+            else:
+                st.success(f"**Trade interpretation:** {diag['Trade Comment']}")
+
+            # Explain missing metadata rather than implying N/A is a company characteristic.
+            missing_meta = []
+            if diag["Sector"] == "N/A":
+                missing_meta.append("sector")
+            if pd.isna(diag["Market Cap"]):
+                missing_meta.append("market cap")
+            if pd.isna(diag["Trailing PE"]):
+                missing_meta.append("trailing P/E")
+            if pd.isna(diag["Forward PE"]):
+                missing_meta.append("forward P/E")
+            if diag["Earnings"] == "No date available":
+                missing_meta.append("earnings date")
+            if missing_meta:
+                st.warning(
+                    "Some fundamental metadata could not be retrieved from the current data provider: "
+                    + ", ".join(missing_meta)
+                    + ". This is a data-availability issue, not an indication that the company has no such data."
+                )
+
             if diag["Earnings Risk"]:
                 st.warning(f"⚠️ Earnings risk: {diag['Earnings']}. Consider reducing size or waiting.")
             else:
@@ -989,18 +1088,18 @@ with ticker_tab:
                 elif pd.notna(diag["RR"]):
                     st.warning("Risk/reward is below 2R. Entry quality may need improvement.")
 
-            with st.expander("Why this verdict?", expanded=False):
+            with st.expander("How each signal is calculated", expanded=False):
                 rows = [
-                    ("Momentum", f"D {diag['Daily']:.1f} / W {diag['Weekly']:.1f} / M {diag['Monthly']:.1f}"),
-                    ("Momentum trend", diag["Acceleration"]),
-                    ("Trend structure", diag["Trend"]),
-                    ("Relative strength", diag["RS vs SPY"]),
-                    ("Volume confirmation", f"{diag['Volume Ratio']:.2f}x" if pd.notna(diag["Volume Ratio"]) else "N/A"),
-                    ("Extension", diag["Extension"]),
-                    ("Earnings", diag["Earnings"]),
-                    ("EMA20 / EMA50 / EMA200", f"{fmt_price(diag['EMA20'])} / {fmt_price(diag['EMA50'])} / {fmt_price(diag['EMA200'])}"),
+                    ("Composite Momentum", "40% Daily + 35% Weekly + 25% Monthly; each component scaled to -100…+100"),
+                    ("Daily / Weekly / Monthly", "1D / 5D / 20D price change, normalized to score"),
+                    ("Acceleration", "Current composite vs composite 5 trading days ago; ±10 points triggers Accelerating/Weakening"),
+                    ("Trend", "Price/EMA20/EMA50/EMA200 stacking"),
+                    ("RS vs SPY", "Stock relative return vs SPY over 1M and 3M"),
+                    ("Volume Ratio", "Current volume ÷ 20-day average volume"),
+                    ("Extension", ">8% above EMA20 or RSI≥75 = Extended; >8% below EMA20 or RSI≤25 = Oversold"),
+                    ("Trade Plan", "ATR(14), EMA structure and recent 20-day highs/lows"),
                 ]
-                st.dataframe(pd.DataFrame(rows, columns=["Factor", "Reading"]), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(rows, columns=["Signal", "Rule"]), hide_index=True, use_container_width=True)
 
             with st.expander("Fundamental snapshot", expanded=False):
                 f1, f2, f3 = st.columns(3)
