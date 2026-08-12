@@ -216,6 +216,48 @@ def assess_market_regime():
         "proxies": proxies,
     }
 
+
+def regime_aligned_for(row, market_regime):
+    if market_regime in ["RISK-ON", "BULLISH"]:
+        return row["Setup"] in ["A+ Long", "Long Watch"]
+    if market_regime in ["RISK-OFF", "BEARISH"]:
+        return row["Setup"] in ["A+ Short", "Short Watch"]
+    return row["Setup"] not in ["Neutral", "Mixed"]
+
+def exclusion_reasons(row, market_regime, min_composite, min_volume_ratio, rsi_min, rsi_max):
+    reasons = []
+    if pd.isna(row["Volume Ratio"]) or row["Volume Ratio"] < min_volume_ratio:
+        reasons.append(f"Volume ratio below {min_volume_ratio:.1f}x")
+    if row["RSI14"] < rsi_min or row["RSI14"] > rsi_max:
+        reasons.append(f"RSI outside {rsi_min}-{rsi_max}")
+    if market_regime in ["RISK-OFF", "BEARISH"]:
+        if row["Composite"] > -abs(min_composite):
+            reasons.append("Short momentum below threshold")
+    else:
+        if row["Composite"] < min_composite:
+            reasons.append("Composite below threshold")
+    if not regime_aligned_for(row, market_regime):
+        reasons.append("Not regime-aligned")
+    return reasons
+
+def render_price_chart(df, symbol, height=460):
+    chart_df = df.tail(120)
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(
+        x=chart_df["Date"], open=chart_df["Open"], high=chart_df["High"],
+        low=chart_df["Low"], close=chart_df["Close"], name="Price"
+    ))
+    fig.add_trace(go.Scatter(x=chart_df["Date"], y=chart_df["EMA20"], name="EMA20"))
+    fig.add_trace(go.Scatter(x=chart_df["Date"], y=chart_df["EMA50"], name="EMA50"))
+    fig.add_trace(go.Scatter(x=chart_df["Date"], y=chart_df["EMA200"], name="EMA200"))
+    fig.update_layout(
+        title=f"{symbol} Price + Trend",
+        height=height,
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=10, r=10, t=45, b=10)
+    )
+    return fig
+
 # =========================================================
 # Sidebar
 # =========================================================
@@ -234,6 +276,7 @@ with st.sidebar:
     min_volume_ratio = st.slider("Minimum volume ratio", 0.0, 3.0, 0.8, 0.1)
     rsi_min, rsi_max = st.slider("RSI range", 0, 100, (30, 80), 1)
     regime_aligned_only = st.checkbox("Regime-aligned only", value=True)
+    view_mode = st.radio("Scanner view", ["Passing Filters", "Regime-Aligned", "All"], index=0)
 
     st.subheader("Display")
     show_top = st.slider("Rows to show", 5, 50, 20, 5)
@@ -266,6 +309,62 @@ r4.metric("Trading Bias", regime["bias"])
 
 detail_df = pd.DataFrame(regime["details"], columns=["Proxy", "Signal", "Contribution"])
 st.dataframe(detail_df, hide_index=True, use_container_width=True)
+
+# =========================================================
+# Direct ticker search — always display analysis
+# =========================================================
+st.subheader("Search Any Ticker")
+search_col, button_col = st.columns([4, 1])
+with search_col:
+    direct_ticker = st.text_input(
+        "Ticker symbol",
+        placeholder="e.g. CRDO, CSCO, NVDA",
+        label_visibility="collapsed",
+    ).strip().upper()
+with button_col:
+    analyze_clicked = st.button("Analyze", type="primary", use_container_width=True)
+
+if direct_ticker:
+    try:
+        direct_rec, direct_hist = analyze_symbol(direct_ticker, period)
+        if direct_rec is None:
+            st.error(f"No usable market data returned for {direct_ticker}. Check the symbol or try again later.")
+        else:
+            aligned = regime_aligned_for(direct_rec, regime["regime"])
+            direct_rec["Regime Aligned"] = aligned
+            reasons = exclusion_reasons(
+                direct_rec, regime["regime"], min_composite,
+                min_volume_ratio, rsi_min, rsi_max
+            )
+
+            st.markdown(f"### {direct_ticker} — Direct Analysis")
+            q1, q2, q3, q4, q5 = st.columns(5)
+            q1.metric("Close", f"${direct_rec['Close']:,.2f}")
+            q2.metric("Composite", f"{direct_rec['Composite']:.1f}", direct_rec["Regime"])
+            q3.metric("RSI(14)", f"{direct_rec['RSI14']:.1f}")
+            q4.metric(
+                "Volume Ratio",
+                f"{direct_rec['Volume Ratio']:.2f}x"
+                if pd.notna(direct_rec["Volume Ratio"]) else "N/A"
+            )
+            q5.metric("Setup", direct_rec["Setup"])
+
+            if reasons:
+                st.warning(
+                    "Ticker analyzed successfully. It would be excluded from the current "
+                    "scanner filters because: " + "; ".join(reasons)
+                )
+            else:
+                st.success("This ticker passes the current scanner filters and is regime-aligned.")
+
+            st.plotly_chart(
+                render_price_chart(direct_hist, direct_ticker),
+                use_container_width=True
+            )
+    except Exception as ex:
+        st.error(f"Could not analyze {direct_ticker}: {ex}")
+
+st.divider()
 
 # =========================================================
 # Scan watchlist
@@ -312,11 +411,7 @@ b3.metric("Watchlist > EMA200", f"{breadth_200:.0%}")
 
 # Regime alignment
 def is_regime_aligned(row):
-    if regime["regime"] in ["RISK-ON", "BULLISH"]:
-        return row["Setup"] in ["A+ Long", "Long Watch"]
-    if regime["regime"] in ["RISK-OFF", "BEARISH"]:
-        return row["Setup"] in ["A+ Short", "Short Watch"]
-    return row["Setup"] not in ["Neutral", "Mixed"]
+    return regime_aligned_for(row, regime["regime"])
 
 scan["Regime Aligned"] = scan.apply(is_regime_aligned, axis=1)
 
@@ -336,21 +431,33 @@ def adjusted_score(row):
 
 scan["Adjusted Score"] = scan.apply(adjusted_score, axis=1)
 scan["Rank"] = scan["Adjusted Score"].rank(method="min", ascending=False).astype(int)
+scan["Filter Reasons"] = scan.apply(
+    lambda r: "; ".join(exclusion_reasons(
+        r, regime["regime"], min_composite, min_volume_ratio, rsi_min, rsi_max
+    )),
+    axis=1
+)
+scan["Passes Filters"] = scan.apply(
+    lambda r: (
+        (pd.notna(r["Volume Ratio"]) and r["Volume Ratio"] >= min_volume_ratio)
+        and (r["RSI14"] >= rsi_min and r["RSI14"] <= rsi_max)
+        and (
+            r["Composite"] <= -abs(min_composite)
+            if regime["regime"] in ["RISK-OFF", "BEARISH"]
+            else r["Composite"] >= min_composite
+        )
+    ),
+    axis=1
+)
 
-filtered = scan[
-    (scan["Volume Ratio"].fillna(0) >= min_volume_ratio) &
-    (scan["RSI14"] >= rsi_min) &
-    (scan["RSI14"] <= rsi_max)
-].copy()
+passing = scan[scan["Passes Filters"]].copy()
 
-# In bearish regimes, allow negative composite as viable short candidates.
-if regime["regime"] in ["RISK-OFF", "BEARISH"]:
-    filtered = filtered[filtered["Composite"] <= -abs(min_composite)]
+if view_mode == "All":
+    filtered = scan.copy()
+elif view_mode == "Regime-Aligned":
+    filtered = scan[scan["Regime Aligned"]].copy()
 else:
-    filtered = filtered[filtered["Composite"] >= min_composite]
-
-if regime_aligned_only:
-    filtered = filtered[filtered["Regime Aligned"]]
+    filtered = passing[passing["Regime Aligned"]].copy()
 
 filtered = filtered.sort_values(
     ["Adjusted Score", "Volume Ratio"],
@@ -359,18 +466,18 @@ filtered = filtered.sort_values(
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Stocks Scanned", len(scan))
-k2.metric("Passing Filters", len(filtered))
+k2.metric("Passing Filters", len(passing))
 k3.metric("Regime-Aligned", int(scan["Regime Aligned"].sum()))
 k4.metric("A+ Setups", int(scan["Setup"].isin(["A+ Long", "A+ Short"]).sum()))
 
 display_cols = [
     "Rank", "Ticker", "Setup", "Regime Aligned", "Adjusted Score", "Composite",
     "Daily", "Weekly", "Monthly", "RSI14", "Volume Ratio",
-    "1D %", "1W %", "1M %", "20D High Dist", "20D Low Dist"
+    "1D %", "1W %", "1M %", "20D High Dist", "20D Low Dist", "Filter Reasons"
 ]
 
 if filtered.empty:
-    st.info("No stocks currently match the regime-aware filters.")
+    st.info("No stocks match this view. Switch Scanner view to All to see every ticker and its exclusion reason.")
 else:
     st.dataframe(
         filtered[display_cols],
@@ -399,6 +506,8 @@ else:
         mime="text/csv"
     )
 
+st.caption("Tip: choose Scanner view = All to see every watchlist symbol and the exact reason it fails the current filters.")
+
 # =========================================================
 # Detail view
 # =========================================================
@@ -416,6 +525,11 @@ selected = st.selectbox("Select ticker", ticker_list, index=ticker_list.index(de
 
 row = scan.loc[scan["Ticker"] == selected].iloc[0]
 hist = history_map[selected].copy()
+
+if row["Filter Reasons"]:
+    st.warning("Scanner diagnostics: " + row["Filter Reasons"])
+else:
+    st.success("This ticker passes the current numeric filters.")
 
 d1, d2, d3, d4, d5, d6 = st.columns(6)
 d1.metric("Adjusted Score", f"{row['Adjusted Score']:.1f}")
