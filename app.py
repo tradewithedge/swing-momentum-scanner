@@ -558,37 +558,111 @@ def finite_or_nan(value):
         return np.nan
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def download_one(symbol, period="1y"):
-    """Download and validate a single ticker; retry once if Yahoo returns a bad frame."""
-    for attempt in range(2):
+
+def period_start_date(period):
+    today = pd.Timestamp.today().normalize()
+    mapping = {
+        "1mo": pd.DateOffset(months=2),
+        "3mo": pd.DateOffset(months=4),
+        "6mo": pd.DateOffset(months=7),
+        "1y": pd.DateOffset(years=1, months=1),
+        "2y": pd.DateOffset(years=2, months=1),
+        "5y": pd.DateOffset(years=5, months=1),
+        "10y": pd.DateOffset(years=10, months=1),
+        "max": pd.DateOffset(years=20),
+    }
+    if period == "ytd":
+        return pd.Timestamp(year=today.year, month=1, day=1)
+    return today - mapping.get(period, pd.DateOffset(years=5, months=1))
+
+
+def normalize_single_history(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x = df.copy()
+    if isinstance(x.columns, pd.MultiIndex):
+        x.columns = [c[0] for c in x.columns]
+    if "Date" not in x.columns:
+        x = x.reset_index()
+    if "Datetime" in x.columns and "Date" not in x.columns:
+        x = x.rename(columns={"Datetime": "Date"})
+    if "Date" in x.columns:
+        x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
         try:
-            df = yf.download(
-                symbol,
-                period=period,
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-                timeout=12,
-            )
-            if df.empty:
-                continue
-
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
-
-            df = df.reset_index()
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-
-            clean = sanitize_ohlcv(df)
-            if not clean.empty:
-                return clean
+            if x["Date"].dt.tz is not None:
+                x["Date"] = x["Date"].dt.tz_localize(None)
         except Exception:
             pass
+    return sanitize_ohlcv(x)
 
-    return pd.DataFrame()
+
+def choose_freshest_history(candidates):
+    valid = []
+    for route, df in candidates:
+        clean = normalize_single_history(df)
+        if clean.empty or "Date" not in clean.columns:
+            continue
+        latest = pd.to_datetime(clean["Date"], errors="coerce").max()
+        if pd.isna(latest):
+            continue
+        ts = pd.Timestamp(latest)
+        try:
+            if ts.tzinfo is not None:
+                ts = ts.tz_localize(None)
+        except Exception:
+            pass
+        valid.append((ts, len(clean), route, clean))
+    if not valid:
+        return pd.DataFrame()
+    valid.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    _, _, route, best = valid[0]
+    best = best.copy()
+    best.attrs["download_route"] = route
+    return best
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def download_one(symbol, period="1y"):
+    """Try multiple yfinance paths and return the freshest valid history."""
+    candidates = []
+
+    try:
+        df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, repair=True,
+                         keepna=False, progress=False, threads=False, timeout=12)
+        candidates.append(("yf.download(period)", df))
+    except Exception:
+        pass
+
+    try:
+        start_date = period_start_date(period)
+        end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+        df = yf.download(symbol, start=start_date.strftime("%Y-%m-%d"),
+                         end=end_date.strftime("%Y-%m-%d"), interval="1d", auto_adjust=True,
+                         repair=True, keepna=False, progress=False, threads=False, timeout=12)
+        candidates.append(("yf.download(explicit dates)", df))
+    except Exception:
+        pass
+
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval="1d", auto_adjust=True, repair=True,
+                            keepna=False, timeout=12, raise_errors=False)
+        candidates.append(("Ticker.history(period)", df))
+    except Exception:
+        pass
+
+    try:
+        ticker = yf.Ticker(symbol)
+        start_date = period_start_date(period)
+        end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+        df = ticker.history(start=start_date.strftime("%Y-%m-%d"),
+                            end=end_date.strftime("%Y-%m-%d"), interval="1d", auto_adjust=True,
+                            repair=True, keepna=False, timeout=12, raise_errors=False)
+        candidates.append(("Ticker.history(explicit dates)", df))
+    except Exception:
+        pass
+
+    return choose_freshest_history(candidates)
 
 
 @st.cache_data(ttl=SCAN_CACHE_TTL, show_spinner=False)
@@ -603,6 +677,8 @@ def download_batch_cached(symbols_tuple):
             period="1y",
             interval="1d",
             auto_adjust=True,
+            repair=True,
+            keepna=False,
             group_by="ticker",
             progress=False,
             threads=True,
@@ -1318,7 +1394,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     long_bias = composite >= 15 and close > ema20
     short_bias = composite <= -15 and close < ema20
 
-    # v6.3 Tradeability & Risk Engine
+    # v6.4 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
     extended_long = (dist_ema20 > 0.08) or (rsi14 >= 75)
     extended_short = (dist_ema20 < -0.08) or (rsi14 <= 25)
@@ -1575,12 +1651,17 @@ with ticker_tab:
             st.info("Try the ticker again shortly. The app automatically retries the data download once.")
         else:
             data_fresh, latest_bar, expected_bar, freshness_reason = market_data_freshness(df)
+            download_route = df.attrs.get("download_route", "validated yfinance route")
             if data_fresh:
-                st.success(f"🟢 **Market data CURRENT** — {freshness_reason}")
+                st.success(
+                    f"🟢 **Market data CURRENT** — {freshness_reason} "
+                    f"Retrieval: **{download_route}**."
+                )
             else:
                 st.error(
                     f"🔴 **DATA STALE — DO NOT ACT.** {freshness_reason} "
-                    "Scores may still be displayed for diagnosis, but no actionable trade plan is allowed."
+                    f"Best retrieval route: **{download_route}**. "
+                    "All retrieval paths were checked; no actionable trade plan is allowed."
                 )
                 diag["Trade State"] = "DATA INCOMPLETE"
                 diag["Trade Block Reason"] = (
@@ -1595,7 +1676,7 @@ with ticker_tab:
             st.markdown(f"### {selected_ticker} — {selected_company}")
             st.markdown(f"## {diag['Verdict']}")
 
-            # v6.3: separate stock quality from entry quality and current action.
+            # v6.4: separate stock quality from entry quality and current action.
             candidate_points = 0
             candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
             candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
