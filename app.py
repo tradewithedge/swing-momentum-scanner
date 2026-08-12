@@ -673,6 +673,29 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
         .astype("Int64")
     )
 
+    # A+ quality gate: an A+ momentum setup must also demonstrate
+    # above-average relative strength within the selected scan universe.
+    # Long A+: RS Rating >= 70. Short A+: inverse RS Rating <= 31
+    # (equivalent to being in the weakest ~30% of the universe).
+    original_setup = x["Setup"].copy()
+    long_rs_fail = original_setup.eq("A+ Long") & (x["RS Rating"].isna() | (x["RS Rating"] < 70))
+    short_rs_fail = original_setup.eq("A+ Short") & (x["RS Rating"].isna() | (x["RS Rating"] > 31))
+    x.loc[long_rs_fail, "Setup"] = "Long Watch"
+    x.loc[short_rs_fail, "Setup"] = "Short Watch"
+
+    x["Setup Note"] = ""
+    x.loc[long_rs_fail, "Setup Note"] = (
+        "Technical A+ conditions met, but RS Rating is below the A+ minimum of 70."
+    )
+    x.loc[short_rs_fail, "Setup Note"] = (
+        "Technical A+ short conditions met, but inverse RS is not weak enough for A+ (RS Rating must be 31 or lower)."
+    )
+    x.loc[x["Setup"].eq("A+ Long"), "Setup Note"] = "A+ confirmed: technical conditions met and RS Rating >= 70."
+    x.loc[x["Setup"].eq("A+ Short"), "Setup Note"] = "A+ confirmed: technical conditions met and RS Rating <= 31."
+
+    # Re-evaluate regime alignment after the RS quality gate changes Setup.
+    x["Regime Aligned"] = x.apply(is_regime_aligned, axis=1)
+
     def reasons(row):
         out = []
         if pd.isna(row.get("Composite")):
@@ -1298,6 +1321,10 @@ with scanner_tab:
 
         a_plus_mask = ranked["Setup"].isin(["A+ Long", "A+ Short"])
         a_plus_count = int(a_plus_mask.sum())
+        st.caption(
+            "A+ relative-strength gate: Long setups require RS Rating ≥70; "
+            "Short setups require RS Rating ≤31. Technical A+ candidates that fail the RS gate are downgraded to Watch."
+        )
 
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Stocks analyzed", f"{len(ranked):,}")
