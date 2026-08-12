@@ -406,27 +406,108 @@ def get_company_snapshot(symbol):
     return snapshot
 
 
+
+def sanitize_ohlcv(df):
+    """Return clean OHLCV rows or an empty frame if the structure is unusable."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    x = df.copy()
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in required if c not in x.columns]
+    if missing:
+        return pd.DataFrame()
+
+    for col in required:
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+
+    x[required] = x[required].replace([np.inf, -np.inf], np.nan)
+
+    if "Date" in x.columns:
+        x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
+        x = x.dropna(subset=["Date"])
+
+    # OHLC must be valid; zero/negative prices are unusable.
+    x = x.dropna(subset=["Open", "High", "Low", "Close"])
+    x = x[
+        (x["Open"] > 0)
+        & (x["High"] > 0)
+        & (x["Low"] > 0)
+        & (x["Close"] > 0)
+    ]
+
+    # Volume may occasionally be absent; keep the row but normalize to NaN.
+    x.loc[x["Volume"] < 0, "Volume"] = np.nan
+
+    if x.empty:
+        return pd.DataFrame()
+
+    # Remove obviously corrupt bars.
+    valid_range = (x["High"] >= x[["Open", "Close", "Low"]].max(axis=1)) & (
+        x["Low"] <= x[["Open", "Close", "High"]].min(axis=1)
+    )
+    x = x[valid_range].copy()
+
+    return x.reset_index(drop=True)
+
+
+def price_data_status(df, min_rows=80):
+    """Return (is_valid, reason) for diagnostic/scanner calculations."""
+    x = sanitize_ohlcv(df)
+    if x.empty:
+        return False, "No valid OHLC price rows were returned."
+    if len(x) < min_rows:
+        return False, f"Only {len(x)} valid trading days were returned; at least {min_rows} are required."
+
+    latest = x.iloc[-1]
+    for col in ["Open", "High", "Low", "Close"]:
+        if pd.isna(latest[col]) or not np.isfinite(latest[col]) or latest[col] <= 0:
+            return False, f"Latest {col} value is invalid."
+
+    return True, ""
+
+
+def finite_or_nan(value):
+    """Convert to float only when finite; otherwise return NaN."""
+    try:
+        v = float(value)
+        return v if np.isfinite(v) else np.nan
+    except Exception:
+        return np.nan
+
+
 @st.cache_data(ttl=120, show_spinner=False)
 def download_one(symbol, period="1y"):
-    try:
-        df = yf.download(
-            symbol,
-            period=period,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-            timeout=12,
-        )
-        if df.empty:
-            return pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-        df = df.reset_index()
-        df["Date"] = pd.to_datetime(df["Date"])
-        return df
-    except Exception:
-        return pd.DataFrame()
+    """Download and validate a single ticker; retry once if Yahoo returns a bad frame."""
+    for attempt in range(2):
+        try:
+            df = yf.download(
+                symbol,
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+                timeout=12,
+            )
+            if df.empty:
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [c[0] for c in df.columns]
+
+            df = df.reset_index()
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+
+            clean = sanitize_ohlcv(df)
+            if not clean.empty:
+                return clean
+        except Exception:
+            pass
+
+    return pd.DataFrame()
+
 
 @st.cache_data(ttl=SCAN_CACHE_TTL, show_spinner=False)
 def download_batch_cached(symbols_tuple):
@@ -473,13 +554,18 @@ def split_batch_result(data, symbol):
     df = df.dropna(how="all")
     if df.empty or "Close" not in df.columns:
         return pd.DataFrame()
-    return df
+
+    df = df.reset_index()
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    return sanitize_ohlcv(df)
 
 def compute_record(symbol, company, sector, df):
-    if df.empty or len(df) < 60:
+    valid, _ = price_data_status(df, min_rows=126)
+    if not valid:
         return None
 
-    x = df.copy()
+    x = sanitize_ohlcv(df)
     x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
     x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
     x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
@@ -517,11 +603,11 @@ def compute_record(symbol, company, sector, df):
         "Ticker": symbol,
         "Company": company,
         "Sector": sector,
-        "Close": float(row["Close"]),
-        "EMA20": float(row["EMA20"]),
-        "EMA50": float(row["EMA50"]),
-        "EMA200": float(row["EMA200"]),
-        "RSI14": float(row["RSI14"]),
+        "Close": finite_or_nan(row["Close"]),
+        "EMA20": finite_or_nan(row["EMA20"]),
+        "EMA50": finite_or_nan(row["EMA50"]),
+        "EMA200": finite_or_nan(row["EMA200"]),
+        "RSI14": finite_or_nan(row["RSI14"]),
         "Volume Ratio": float(row["Volume Ratio"]) if pd.notna(row["Volume Ratio"]) else np.nan,
         "1D %": float(row["1D %"]) if pd.notna(row["1D %"]) else np.nan,
         "1W %": float(row["1W %"]) if pd.notna(row["1W %"]) else np.nan,
@@ -598,7 +684,8 @@ def market_regime():
 
     for symbol, weight in [("SPY", 2), ("QQQ", 2), ("IWM", 1)]:
         df = download_one(symbol, "1y")
-        if df.empty or len(df) < 60:
+        valid, _ = price_data_status(df, min_rows=126)
+        if not valid:
             rows.append((symbol, "Unavailable"))
             continue
 
@@ -996,11 +1083,12 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
 
 
 def compute_search_diagnostic(symbol, company, df, metadata):
-    """Decision-oriented swing diagnostic from cached daily price history."""
-    if df.empty or len(df) < 80:
-        return None
+    """Decision-oriented swing diagnostic from validated daily price history."""
+    valid, reason = price_data_status(df, min_rows=126)
+    if not valid:
+        return {"Data Valid": False, "Data Error": reason}
 
-    x = df.copy()
+    x = sanitize_ohlcv(df)
     x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
     x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
     x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
@@ -1032,6 +1120,12 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     monthly = momentum_score(latest["1M %"], 350)
     composite = daily * 0.40 + weekly * 0.35 + monthly * 0.25
 
+    if not all(np.isfinite(v) for v in [daily, weekly, monthly, composite]):
+        return {
+            "Data Valid": False,
+            "Data Error": "Momentum inputs are incomplete or non-finite, so no trading assessment was generated.",
+        }
+
     prev_daily = momentum_score(prev["1D %"], 2500) if pd.notna(prev["1D %"]) else np.nan
     prev_weekly = momentum_score(prev["1W %"], 700) if pd.notna(prev["1W %"]) else np.nan
     prev_monthly = momentum_score(prev["1M %"], 350) if pd.notna(prev["1M %"]) else np.nan
@@ -1049,12 +1143,23 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     else:
         acceleration = "N/A"
 
-    close = float(latest["Close"])
-    ema20 = float(latest["EMA20"])
-    ema50 = float(latest["EMA50"])
-    ema200 = float(latest["EMA200"])
+    close = finite_or_nan(latest["Close"])
+    ema20 = finite_or_nan(latest["EMA20"])
+    ema50 = finite_or_nan(latest["EMA50"])
+    ema200 = finite_or_nan(latest["EMA200"])
+
+    if not all(np.isfinite(v) and v > 0 for v in [close, ema20, ema50, ema200]):
+        return {
+            "Data Valid": False,
+            "Data Error": "Latest price/trend values are incomplete, so no trading assessment was generated.",
+        }
     atr = float(latest["ATR14"]) if pd.notna(latest["ATR14"]) else close * 0.025
-    rsi14 = float(latest["RSI14"])
+    rsi14 = finite_or_nan(latest["RSI14"])
+    if not np.isfinite(rsi14):
+        return {
+            "Data Valid": False,
+            "Data Error": "RSI could not be calculated from the available data.",
+        }
     vol_ratio = float(latest["Volume Ratio"]) if pd.notna(latest["Volume Ratio"]) else np.nan
 
     bull_stack = close > ema20 > ema50 > ema200
@@ -1082,7 +1187,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         extension = "Normal"
 
     rs_text = "N/A"
-    rs_score = 0.0
+    rs_score = np.nan
     rs_1m = rs_3m = rs_6m = np.nan
     spy = download_one("SPY", "1y")
     if not spy.empty and len(spy) >= 127:
@@ -1094,20 +1199,21 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         stock_3m = float(latest["3M %"])
         stock_6m = float(latest["6M %"])
 
-        rs_1m = (stock_1m - spy_1m) * 100.0
-        rs_3m = (stock_3m - spy_3m) * 100.0
-        rs_6m = (stock_6m - spy_6m) * 100.0
-        rs_score = rs_1m * 0.20 + rs_3m * 0.35 + rs_6m * 0.45
+        if all(np.isfinite(v) for v in [stock_1m, stock_3m, stock_6m, spy_1m, spy_3m, spy_6m]):
+            rs_1m = (stock_1m - spy_1m) * 100.0
+            rs_3m = (stock_3m - spy_3m) * 100.0
+            rs_6m = (stock_6m - spy_6m) * 100.0
+            rs_score = rs_1m * 0.20 + rs_3m * 0.35 + rs_6m * 0.45
 
-        if rs_score >= 10:
+        if np.isfinite(rs_score) and rs_score >= 10:
             rs_text = "Strongly outperforming SPY"
-        elif rs_score >= 3:
+        elif np.isfinite(rs_score) and rs_score >= 3:
             rs_text = "Outperforming SPY"
-        elif rs_score <= -10:
+        elif np.isfinite(rs_score) and rs_score <= -10:
             rs_text = "Strongly underperforming SPY"
-        elif rs_score <= -3:
+        elif np.isfinite(rs_score) and rs_score <= -3:
             rs_text = "Underperforming SPY"
-        else:
+        elif np.isfinite(rs_score):
             rs_text = "In line with SPY"
 
     sector = metadata.get("sector", "") or "N/A"
@@ -1155,7 +1261,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     points = 0
     points += 2 if bull_stack else 1 if bull_mid else -2 if bear_stack else -1 if bear_mid else 0
     points += 2 if composite >= 40 else 1 if composite >= 20 else -2 if composite <= -40 else -1 if composite <= -20 else 0
-    points += 1 if rs_score >= 1 else -1 if rs_score <= -1 else 0
+    points += 1 if np.isfinite(rs_score) and rs_score >= 1 else -1 if np.isfinite(rs_score) and rs_score <= -1 else 0
     points += 1 if pd.notna(vol_ratio) and vol_ratio >= 1.2 else 0
     points -= 1 if extension == "Extended" else 0
     points -= 2 if earnings_risk else 0
@@ -1205,6 +1311,8 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         trade_comment = "Momentum/trend alignment is mixed. Waiting for confirmation is preferable."
 
     return {
+        "Data Valid": True,
+        "Data Error": "",
         "Ticker": symbol, "Company": company, "Close": close,
         "Daily": daily, "Weekly": weekly, "Monthly": monthly, "Momentum Score": composite,
         "Momentum Grade": momentum_grade,
@@ -1265,6 +1373,9 @@ ticker_tab, scanner_tab = st.tabs(["🔎 Ticker Search", "📊 Market Scanner"])
 # ---------------------------
 with ticker_tab:
     st.subheader("Instant Swing-Trade Diagnostic")
+    st.caption(
+        "Data Quality Gate: invalid or incomplete market data produces **no score, no grade, and no trade plan**."
+    )
     st.caption("Choose any ticker/company and get a fast decision-oriented readout with the calculation logic shown.")
 
     company_dir = load_company_directory()
@@ -1287,8 +1398,13 @@ with ticker_tab:
             metadata = get_company_snapshot(selected_ticker)
             diag = compute_search_diagnostic(selected_ticker, selected_company, df, metadata)
 
-        if diag is None:
-            st.error(f"No usable market data returned for {selected_ticker}.")
+        if diag is None or not diag.get("Data Valid", False):
+            reason = "No usable market data returned." if diag is None else diag.get("Data Error", "Market data validation failed.")
+            st.error(
+                f"⚠️ **Market data unavailable for {selected_ticker}.** {reason} "
+                "No Momentum Score, Relative Strength, grade, or Trade Plan will be generated from invalid data."
+            )
+            st.info("Try the ticker again shortly. The app automatically retries the data download once.")
         else:
             st.markdown(f"### {selected_ticker} — {selected_company}")
             st.markdown(f"## {diag['Verdict']}")
@@ -1307,7 +1423,7 @@ with ticker_tab:
             rs1.metric("RS 1M", "N/A" if pd.isna(diag["RS 1M vs SPY"]) else f"{diag['RS 1M vs SPY']:+.1f} pp")
             rs2.metric("RS 3M", "N/A" if pd.isna(diag["RS 3M vs SPY"]) else f"{diag['RS 3M vs SPY']:+.1f} pp")
             rs3.metric("RS 6M", "N/A" if pd.isna(diag["RS 6M vs SPY"]) else f"{diag['RS 6M vs SPY']:+.1f} pp")
-            rs4.metric("RS Composite", f"{diag['RS Composite']:+.1f}")
+            rs4.metric("RS Composite", "N/A" if pd.isna(diag["RS Composite"]) else f"{diag['RS Composite']:+.1f}")
 
             st.caption(
                 "RS Composite = 20% × RS 1M + 35% × RS 3M + 45% × RS 6M. "
