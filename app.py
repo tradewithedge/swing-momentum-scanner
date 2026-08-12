@@ -94,19 +94,20 @@ def regime_label(score):
     return "STRONG BEAR"
 
 def setup_label(row):
+    """Technical setup only. Final Quality Grade is assigned after RS is calculated."""
     bull = row["Close"] > row["EMA20"] > row["EMA50"]
     bear = row["Close"] < row["EMA20"] < row["EMA50"]
     volume_ok = pd.notna(row["Volume Ratio"]) and row["Volume Ratio"] >= 1.2
 
-    if bull and row["Composite"] >= 25 and volume_ok and 50 <= row["RSI14"] <= 75:
-        return "A+ Long"
-    if bull and row["Composite"] >= 25:
+    if bull and row["Momentum Score"] >= 25 and volume_ok and 50 <= row["RSI14"] <= 75:
+        return "Technical Long"
+    if bull and row["Momentum Score"] >= 25:
         return "Long Watch"
-    if bear and row["Composite"] <= -25 and volume_ok and 25 <= row["RSI14"] <= 50:
-        return "A+ Short"
-    if bear and row["Composite"] <= -25:
+    if bear and row["Momentum Score"] <= -25 and volume_ok and 25 <= row["RSI14"] <= 50:
+        return "Technical Short"
+    if bear and row["Momentum Score"] <= -25:
         return "Short Watch"
-    if abs(row["Composite"]) < 15:
+    if abs(row["Momentum Score"]) < 15:
         return "Neutral"
     return "Mixed"
 
@@ -412,7 +413,7 @@ def download_one(symbol, period="1y"):
             symbol,
             period=period,
             interval="1d",
-            auto_adjust=False,
+            auto_adjust=True,
             progress=False,
             threads=False,
             timeout=12,
@@ -438,7 +439,7 @@ def download_batch_cached(symbols_tuple):
             tickers=symbols,
             period="1y",
             interval="1d",
-            auto_adjust=False,
+            auto_adjust=True,
             group_by="ticker",
             progress=False,
             threads=True,
@@ -511,12 +512,12 @@ def compute_record(symbol, company, sector, df):
     record["Daily"] = momentum_score(record["1D %"], 2500)
     record["Weekly"] = momentum_score(record["1W %"], 700)
     record["Monthly"] = momentum_score(record["1M %"], 350)
-    record["Composite"] = (
+    record["Momentum Score"] = (
         record["Daily"] * 0.40
         + record["Weekly"] * 0.35
         + record["Monthly"] * 0.25
     )
-    record["Regime"] = regime_label(record["Composite"])
+    record["Regime"] = regime_label(record["Momentum Score"])
     record["Setup"] = setup_label(record)
     return record
 
@@ -620,11 +621,12 @@ def market_regime():
 regime = market_regime()
 
 def is_regime_aligned(row):
+    setup = str(row.get("Setup", ""))
     if regime["label"] in {"RISK-ON", "BULLISH"}:
-        return row["Setup"] in {"A+ Long", "Long Watch"}
+        return setup in {"A+ Long", "A Long", "B+ Long", "Long Watch", "Technical Long"}
     if regime["label"] in {"RISK-OFF", "BEARISH"}:
-        return row["Setup"] in {"A+ Short", "Short Watch"}
-    return row["Setup"] not in {"Neutral", "Mixed"}
+        return setup in {"A+ Short", "A Short", "B+ Short", "Short Watch", "Technical Short"}
+    return setup not in {"Neutral", "Mixed"}
 
 def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     """Add filters/ranking safely even when Yahoo returns partial rows."""
@@ -634,7 +636,7 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     x = df.copy()
     numeric_cols = [
         "Close", "EMA20", "EMA50", "EMA200", "RSI14", "Volume Ratio",
-        "1D %", "1W %", "1M %", "3M %", "6M %", "Daily", "Weekly", "Monthly", "Composite",
+        "1D %", "1W %", "1M %", "3M %", "6M %", "Daily", "Weekly", "Monthly", "Momentum Score",
     ]
     for col in numeric_cols:
         if col in x.columns:
@@ -673,32 +675,123 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
         .astype("Int64")
     )
 
-    # A+ quality gate: an A+ momentum setup must also demonstrate
-    # above-average relative strength within the selected scan universe.
-    # Long A+: RS Rating >= 70. Short A+: inverse RS Rating <= 31
-    # (equivalent to being in the weakest ~30% of the universe).
-    original_setup = x["Setup"].copy()
-    long_rs_fail = original_setup.eq("A+ Long") & (x["RS Rating"].isna() | (x["RS Rating"] < 70))
-    short_rs_fail = original_setup.eq("A+ Short") & (x["RS Rating"].isna() | (x["RS Rating"] > 31))
-    x.loc[long_rs_fail, "Setup"] = "Long Watch"
-    x.loc[short_rs_fail, "Setup"] = "Short Watch"
-
-    x["Setup Note"] = ""
-    x.loc[long_rs_fail, "Setup Note"] = (
-        "Technical A+ conditions met, but RS Rating is below the A+ minimum of 70."
+    # ---------------------------
+    # v5 Quality Engine
+    # ---------------------------
+    # Distance from EMA20 measures extension/chase risk.
+    x["EMA20 Distance %"] = np.where(
+        x["EMA20"].notna() & x["EMA20"].ne(0),
+        (x["Close"] / x["EMA20"] - 1.0) * 100.0,
+        np.nan,
     )
-    x.loc[short_rs_fail, "Setup Note"] = (
-        "Technical A+ short conditions met, but inverse RS is not weak enough for A+ (RS Rating must be 31 or lower)."
-    )
-    x.loc[x["Setup"].eq("A+ Long"), "Setup Note"] = "A+ confirmed: technical conditions met and RS Rating >= 70."
-    x.loc[x["Setup"].eq("A+ Short"), "Setup Note"] = "A+ confirmed: technical conditions met and RS Rating <= 31."
 
-    # Re-evaluate regime alignment after the RS quality gate changes Setup.
+    long_trend = (
+        (x["Close"] > x["EMA20"])
+        & (x["EMA20"] > x["EMA50"])
+        & (x["Close"] > x["EMA200"])
+    )
+    short_trend = (
+        (x["Close"] < x["EMA20"])
+        & (x["EMA20"] < x["EMA50"])
+        & (x["Close"] < x["EMA200"])
+    )
+
+    long_momentum = x["Momentum Score"] >= 25
+    short_momentum = x["Momentum Score"] <= -25
+    volume_confirm = x["Volume Ratio"].fillna(0) >= 1.2
+    long_rsi = x["RSI14"].between(50, 75, inclusive="both")
+    short_rsi = x["RSI14"].between(25, 50, inclusive="both")
+
+    long_rs = (x["RS Rating"] >= 70) & (x["RS Composite"] > 0)
+    short_rs = (x["RS Rating"] <= 31) & (x["RS Composite"] < 0)
+
+    not_long_extended = (
+        x["EMA20 Distance %"].fillna(999) <= 8.0
+    ) & (x["RSI14"].fillna(999) < 75)
+    not_short_extended = (
+        x["EMA20 Distance %"].fillna(-999) >= -8.0
+    ) & (x["RSI14"].fillna(-999) > 25)
+
+    # Quality points: 6 checks. A+ requires all 6.
+    x["Trend Check"] = np.where(long_trend | short_trend, "✅", "❌")
+    x["Momentum Check"] = np.where(long_momentum | short_momentum, "✅", "❌")
+    x["RS Check"] = np.where(long_rs | short_rs, "✅", "❌")
+    x["Volume Check"] = np.where(volume_confirm, "✅", "❌")
+    x["RSI Check"] = np.where(long_rsi | short_rsi, "✅", "❌")
+    x["Extension Check"] = np.where(not_long_extended | not_short_extended, "✅", "❌")
+
+    long_points = (
+        long_trend.astype(int)
+        + long_momentum.astype(int)
+        + long_rs.astype(int)
+        + volume_confirm.astype(int)
+        + long_rsi.astype(int)
+        + not_long_extended.astype(int)
+    )
+    short_points = (
+        short_trend.astype(int)
+        + short_momentum.astype(int)
+        + short_rs.astype(int)
+        + volume_confirm.astype(int)
+        + short_rsi.astype(int)
+        + not_short_extended.astype(int)
+    )
+
+    long_candidate = x["Momentum Score"] >= 15
+    short_candidate = x["Momentum Score"] <= -15
+
+    x["Quality Score"] = np.where(long_candidate, long_points, np.where(short_candidate, short_points, 0))
+
+    # Grade hierarchy:
+    # A+ = all 6 checks.
+    # A  = 5/6 checks.
+    # B+ = 4/6 checks.
+    # Watch = directional but <4 checks.
+    x["Setup"] = "Mixed"
+
+    x.loc[long_candidate & (long_points >= 6), "Setup"] = "A+ Long"
+    x.loc[long_candidate & (long_points == 5), "Setup"] = "A Long"
+    x.loc[long_candidate & (long_points == 4), "Setup"] = "B+ Long"
+    x.loc[long_candidate & (long_points < 4), "Setup"] = "Long Watch"
+
+    x.loc[short_candidate & (short_points >= 6), "Setup"] = "A+ Short"
+    x.loc[short_candidate & (short_points == 5), "Setup"] = "A Short"
+    x.loc[short_candidate & (short_points == 4), "Setup"] = "B+ Short"
+    x.loc[short_candidate & (short_points < 4), "Setup"] = "Short Watch"
+
+    x.loc[x["Momentum Score"].abs() < 15, "Setup"] = "Neutral"
+
+    def quality_note(row):
+        direction = "Long" if row["Momentum Score"] >= 15 else "Short" if row["Momentum Score"] <= -15 else "Neutral"
+        if direction == "Neutral":
+            return "Momentum Score is inside the neutral zone (-15 to +15)."
+
+        failed = []
+        if row["Trend Check"] != "✅":
+            failed.append("trend")
+        if row["Momentum Check"] != "✅":
+            failed.append("momentum")
+        if row["RS Check"] != "✅":
+            failed.append("relative strength")
+        if row["Volume Check"] != "✅":
+            failed.append("volume")
+        if row["RSI Check"] != "✅":
+            failed.append("RSI")
+        if row["Extension Check"] != "✅":
+            failed.append("extension")
+
+        if not failed:
+            return "A+ confirmed: all six quality checks passed."
+        return f"{int(row['Quality Score'])}/6 quality checks passed; missing: " + ", ".join(failed) + "."
+
+    x["Setup Note"] = x.apply(quality_note, axis=1)
+
+    # Re-evaluate regime alignment after Quality Grade is assigned.
     x["Regime Aligned"] = x.apply(is_regime_aligned, axis=1)
 
     def reasons(row):
         out = []
-        if pd.isna(row.get("Composite")):
+        if pd.isna(row.get("Momentum Score")):
             out.append("Incomplete momentum data")
         if pd.isna(row.get("Volume Ratio")) or row["Volume Ratio"] < min_volume:
             out.append(f"Vol<{min_volume:.1f}x")
@@ -707,12 +800,12 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
         elif row["RSI14"] < rsi_low or row["RSI14"] > rsi_high:
             out.append(f"RSI outside {rsi_low}-{rsi_high}")
 
-        if pd.notna(row.get("Composite")):
+        if pd.notna(row.get("Momentum Score")):
             if regime["label"] in {"RISK-OFF", "BEARISH"}:
-                if row["Composite"] > -abs(min_composite):
+                if row["Momentum Score"] > -abs(min_composite):
                     out.append("Short momentum weak")
-            elif row["Composite"] < min_composite:
-                out.append("Composite weak")
+            elif row["Momentum Score"] < min_composite:
+                out.append("Momentum weak")
 
         if not row["Regime Aligned"]:
             out.append("Not regime-aligned")
@@ -734,7 +827,7 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     vol_bonus = ((x["Volume Ratio"].fillna(1.0) - 1.0) * 10.0).clip(-5.0, 10.0)
     align_bonus = np.where(x["Regime Aligned"], 15.0, -10.0)
 
-    composite_safe = x["Composite"].fillna(0.0)
+    composite_safe = x["Momentum Score"].fillna(0.0)
     raw_momentum = -composite_safe if regime["label"] in {"RISK-OFF", "BEARISH"} else composite_safe
 
     rs_bonus = x["RS Composite"].fillna(0.0).clip(-20.0, 20.0) * 0.50
@@ -965,7 +1058,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
 
     return {
         "Ticker": symbol, "Company": company, "Close": close,
-        "Daily": daily, "Weekly": weekly, "Monthly": monthly, "Composite": composite,
+        "Daily": daily, "Weekly": weekly, "Monthly": monthly, "Momentum Score": composite,
         "Momentum Grade": momentum_grade,
         "Acceleration": acceleration, "Acceleration Delta": acceleration_delta,
         "Trend": trend, "RSI14": rsi14,
@@ -1054,7 +1147,7 @@ with ticker_tab:
 
             v1, v2, v3, v4 = st.columns(4)
             v1.metric("Close", fmt_price(diag["Close"]))
-            v2.metric("Momentum", f"{diag['Composite']:.1f}", diag["Acceleration"])
+            v2.metric("Momentum Score", f"{diag['Momentum Score']:.1f}", diag["Acceleration"])
             v3.metric("Trend", diag["Trend"])
             v4.metric("RS vs SPY", diag["RS vs SPY"])
 
@@ -1075,7 +1168,7 @@ with ticker_tab:
 
             # Explicit calculation note directly under headline metrics.
             st.info(
-                "**Momentum formula:** Composite score = 40% Daily + 35% Weekly + 25% Monthly. "
+                "**Momentum Score range: -100 to +100.** Formula = 40% Daily + 35% Weekly + 25% Monthly. "
                 "Daily uses 1 trading day, Weekly 5 trading days, Monthly 20 trading days. "
                 "Each component is scaled/capped to a -100 to +100 score, so the composite is a momentum score, not a % return."
             )
@@ -1088,14 +1181,14 @@ with ticker_tab:
             accel_delta = diag["Acceleration Delta"]
             if pd.notna(accel_delta):
                 if accel_delta >= 10:
-                    accel_rule = "Accelerating because composite improved by at least +10 points vs 5 trading days ago."
+                    accel_rule = "Accelerating because momentum score improved by at least +10 points vs 5 trading days ago."
                 elif accel_delta <= -10:
-                    accel_rule = "Weakening because composite fell by at least -10 points vs 5 trading days ago."
+                    accel_rule = "Weakening because momentum score fell by at least -10 points vs 5 trading days ago."
                 else:
-                    accel_rule = "Stable because the composite changed by less than 10 points vs 5 trading days ago."
+                    accel_rule = "Stable because the momentum score changed by less than 10 points vs 5 trading days ago."
                 st.caption(
                     f"Momentum quality: **{diag['Momentum Grade']}** • "
-                    f"5-day composite change: **{accel_delta:+.1f} pts** • {accel_rule}"
+                    f"5-day momentum change: **{accel_delta:+.1f} pts** • {accel_rule}"
                 )
             else:
                 st.caption(f"Momentum quality: **{diag['Momentum Grade']}** • 5-day acceleration comparison unavailable.")
@@ -1178,7 +1271,7 @@ with ticker_tab:
 
             with st.expander("How each signal is calculated", expanded=False):
                 rows = [
-                    ("Composite Momentum", "40% Daily + 35% Weekly + 25% Monthly; each component scaled to -100…+100"),
+                    ("Momentum Score", "40% Daily + 35% Weekly + 25% Monthly; each component scaled to -100…+100"),
                     ("Daily / Weekly / Monthly", "1D / 5D / 20D price change, normalized to score"),
                     ("Acceleration", "Current composite vs composite 5 trading days ago; ±10 points triggers Accelerating/Weakening"),
                     ("Trend", "Price/EMA20/EMA50/EMA200 stacking"),
@@ -1252,10 +1345,16 @@ with scanner_tab:
     else:
         st.caption(f"Universe contains **{len(universe_df):,}** unique symbols.")
 
+    st.info(
+        "**v5 Quality Engine:** A+ requires all 6 checks: "
+        "Trend + Momentum + Relative Strength + Volume + RSI + Not Extended. "
+        "A = 5/6, B+ = 4/6, Watch = fewer than 4."
+    )
+
     with st.expander("Scanner filters", expanded=False):
         f1, f2, f3 = st.columns(3)
         with f1:
-            min_composite = st.slider("Min momentum threshold", 0, 60, 10, 5)
+            min_composite = st.slider("Minimum Momentum Score", 0, 60, 10, 5)
         with f2:
             min_volume = st.slider("Min volume ratio", 0.0, 3.0, 0.8, 0.1)
         with f3:
@@ -1321,11 +1420,7 @@ with scanner_tab:
 
         a_plus_mask = ranked["Setup"].isin(["A+ Long", "A+ Short"])
         a_plus_count = int(a_plus_mask.sum())
-        st.caption(
-            "A+ relative-strength gate: Long setups require RS Rating ≥70; "
-            "Short setups require RS Rating ≤31. Technical A+ candidates that fail the RS gate are downgraded to Watch."
-        )
-
+        st.caption("A+ Quality Engine: all 6 checks must pass — Trend, Momentum, Relative Strength, Volume, RSI, and Extension.")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Stocks analyzed", f"{len(ranked):,}")
         k2.metric("Passing filters", f"{int(ranked['Passes Filters'].sum()):,}")
@@ -1358,9 +1453,9 @@ with scanner_tab:
                 )
 
                 aplus_cols = [
-                    "Ticker", "Company", "Sector", "Setup",
+                    "Ticker", "Company", "Sector", "Setup", "Quality Score",
                     "RS Rating", "RS Composite",
-                    "Adjusted Score", "Composite", "RSI14",
+                    "Adjusted Score", "Momentum Score", "RSI14",
                     "Volume Ratio", "1D %", "1W %", "1M %",
                 ]
                 aplus_cols = [c for c in aplus_cols if c in aplus.columns]
@@ -1374,7 +1469,7 @@ with scanner_tab:
                         "RS Rating": st.column_config.NumberColumn(format="%d"),
                         "RS Composite": st.column_config.NumberColumn(format="%+.1f"),
                         "Adjusted Score": st.column_config.NumberColumn(format="%.1f"),
-                        "Composite": st.column_config.NumberColumn(format="%.1f"),
+                        "Momentum Score": st.column_config.NumberColumn(format="%.1f"),
                         "RSI14": st.column_config.NumberColumn(format="%.1f"),
                         "Volume Ratio": st.column_config.NumberColumn(format="%.2fx"),
                         "1D %": st.column_config.NumberColumn(format="%.2%"),
@@ -1403,7 +1498,7 @@ with scanner_tab:
                 selected_row = aplus.loc[aplus["Ticker"] == selected_aplus].iloc[0]
 
                 with st.spinner(f"Loading {selected_aplus} chart..."):
-                    detail_df = download_one(selected_aplus, "1y")
+                    detail_df = download_one(selected_aplus, "5y")
 
                 if detail_df.empty:
                     st.warning(f"No chart data is available for {selected_aplus} right now.")
@@ -1414,17 +1509,21 @@ with scanner_tab:
                     d["EMA200"] = d["Close"].ewm(span=200, adjust=False).mean()
 
                     c1, c2, c3, c4, c5 = st.columns(5)
-                    c1.metric("Setup", selected_row["Setup"])
-                    c2.metric("Composite", f"{selected_row['Composite']:.1f}")
-                    c3.metric("RSI(14)", f"{selected_row['RSI14']:.1f}")
-                    c4.metric(
-                        "Volume",
-                        f"{selected_row['Volume Ratio']:.2f}x"
-                        if pd.notna(selected_row["Volume Ratio"]) else "N/A"
-                    )
-                    c5.metric(
-                        "RS Rating",
-                        f"{int(selected_row['RS Rating'])}" if pd.notna(selected_row.get("RS Rating")) else "N/A",
+                    c1.metric("Quality Grade", selected_row["Setup"])
+                    c2.metric("Quality Score", f"{int(selected_row['Quality Score'])}/6")
+                    c3.metric("Momentum Score", f"{selected_row['Momentum Score']:.1f}")
+                    c4.metric("RS Rating", f"{int(selected_row['RS Rating'])}" if pd.notna(selected_row.get("RS Rating")) else "N/A")
+                    c5.metric("RSI(14)", f"{selected_row['RSI14']:.1f}")
+
+                    st.caption(selected_row.get("Setup Note", ""))
+                    st.markdown(
+                        f"**Quality Checklist:** "
+                        f"Trend {selected_row.get('Trend Check','')}  •  "
+                        f"Momentum {selected_row.get('Momentum Check','')}  •  "
+                        f"RS {selected_row.get('RS Check','')}  •  "
+                        f"Volume {selected_row.get('Volume Check','')}  •  "
+                        f"RSI {selected_row.get('RSI Check','')}  •  "
+                        f"Extension {selected_row.get('Extension Check','')}"
                     )
 
                     timeframe = st.segmented_control(
@@ -1434,20 +1533,46 @@ with scanner_tab:
                         key=f"aplus_timeframe_{selected_aplus}",
                     )
 
-                    chart_df = detail_df.copy()
+                    base_chart = detail_df.copy()
+                    base_chart["Date"] = pd.to_datetime(base_chart["Date"])
+
                     if timeframe == "Daily":
-                        chart_df = chart_df.tail(60).copy()
+                        chart_df = base_chart.tail(90).copy()
                     elif timeframe == "Weekly":
-                        chart_df = chart_df.tail(120).copy()
+                        chart_df = (
+                            base_chart.set_index("Date")
+                            .resample("W-FRI")
+                            .agg({
+                                "Open": "first",
+                                "High": "max",
+                                "Low": "min",
+                                "Close": "last",
+                                "Volume": "sum",
+                            })
+                            .dropna(subset=["Open", "High", "Low", "Close"])
+                            .reset_index()
+                            .tail(104)
+                        )
                     elif timeframe == "Monthly":
-                        chart_df = chart_df.tail(252).copy()
+                        chart_df = (
+                            base_chart.set_index("Date")
+                            .resample("ME")
+                            .agg({
+                                "Open": "first",
+                                "High": "max",
+                                "Low": "min",
+                                "Close": "last",
+                                "Volume": "sum",
+                            })
+                            .dropna(subset=["Open", "High", "Low", "Close"])
+                            .reset_index()
+                            .tail(60)
+                        )
                     elif timeframe == "YTD":
                         current_year = pd.Timestamp.today().year
-                        chart_df = chart_df[
-                            pd.to_datetime(chart_df["Date"]).dt.year == current_year
-                        ].copy()
+                        chart_df = base_chart[base_chart["Date"].dt.year == current_year].copy()
                     else:
-                        chart_df = detail_df.copy()
+                        chart_df = base_chart.copy()
 
                     chart_df["EMA20"] = chart_df["Close"].ewm(span=20, adjust=False).mean()
                     chart_df["EMA50"] = chart_df["Close"].ewm(span=50, adjust=False).mean()
@@ -1497,10 +1622,10 @@ with scanner_tab:
         shown = shown.head(top_n)
 
         display_cols = [
-            "Rank", "Ticker", "Company", "Sector", "Setup", "Regime Aligned",
+            "Rank", "Ticker", "Company", "Sector", "Setup", "Quality Score", "Regime Aligned",
             "RS Rating", "RS Composite",
-            "Adjusted Score", "Composite", "RSI14", "Volume Ratio",
-            "1D %", "1W %", "1M %", "Filter Reasons",
+            "Adjusted Score", "Momentum Score", "RSI14", "Volume Ratio",
+            "1D %", "1W %", "1M %", "Setup Note", "Filter Reasons",
         ]
         existing_cols = [c for c in display_cols if c in shown.columns]
 
@@ -1513,7 +1638,7 @@ with scanner_tab:
                 "RS Rating": st.column_config.NumberColumn(format="%d"),
                 "RS Composite": st.column_config.NumberColumn(format="%+.1f"),
                 "Adjusted Score": st.column_config.NumberColumn(format="%.1f"),
-                "Composite": st.column_config.NumberColumn(format="%.1f"),
+                "Momentum Score": st.column_config.NumberColumn(format="%.1f"),
                 "RSI14": st.column_config.NumberColumn(format="%.1f"),
                 "Volume Ratio": st.column_config.NumberColumn(format="%.2fx"),
                 "1D %": st.column_config.NumberColumn(format="%.2%"),
