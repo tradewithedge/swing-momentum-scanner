@@ -489,6 +489,7 @@ def compute_record(symbol, company, sector, df):
     x["1W %"] = x["Close"].pct_change(5)
     x["1M %"] = x["Close"].pct_change(20)
     x["3M %"] = x["Close"].pct_change(60)
+    x["6M %"] = x["Close"].pct_change(126)
 
     row = x.iloc[-1]
     record = {
@@ -505,6 +506,7 @@ def compute_record(symbol, company, sector, df):
         "1W %": float(row["1W %"]) if pd.notna(row["1W %"]) else np.nan,
         "1M %": float(row["1M %"]) if pd.notna(row["1M %"]) else np.nan,
         "3M %": float(row["3M %"]) if pd.notna(row["3M %"]) else np.nan,
+        "6M %": float(row["6M %"]) if pd.notna(row["6M %"]) else np.nan,
     }
     record["Daily"] = momentum_score(record["1D %"], 2500)
     record["Weekly"] = momentum_score(record["1W %"], 700)
@@ -632,13 +634,44 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     x = df.copy()
     numeric_cols = [
         "Close", "EMA20", "EMA50", "EMA200", "RSI14", "Volume Ratio",
-        "1D %", "1W %", "1M %", "3M %", "Daily", "Weekly", "Monthly", "Composite",
+        "1D %", "1W %", "1M %", "3M %", "6M %", "Daily", "Weekly", "Monthly", "Composite",
     ]
     for col in numeric_cols:
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
 
     x["Regime Aligned"] = x.apply(is_regime_aligned, axis=1)
+
+    # Relative Strength vs SPY.
+    # RS Composite = 20% × 1M excess return + 35% × 3M excess return
+    #              + 45% × 6M excess return (percentage points).
+    spy_df = download_one("SPY", "1y")
+    if not spy_df.empty and len(spy_df) >= 127:
+        spy_1m = float(spy_df["Close"].pct_change(20).iloc[-1])
+        spy_3m = float(spy_df["Close"].pct_change(60).iloc[-1])
+        spy_6m = float(spy_df["Close"].pct_change(126).iloc[-1])
+    else:
+        spy_1m = spy_3m = spy_6m = 0.0
+
+    x["RS 1M vs SPY"] = (x["1M %"] - spy_1m) * 100.0
+    x["RS 3M vs SPY"] = (x["3M %"] - spy_3m) * 100.0
+    x["RS 6M vs SPY"] = (x["6M %"] - spy_6m) * 100.0
+    x["RS Composite"] = (
+        x["RS 1M vs SPY"].fillna(0.0) * 0.20
+        + x["RS 3M vs SPY"].fillna(0.0) * 0.35
+        + x["RS 6M vs SPY"].fillna(0.0) * 0.45
+    )
+
+    # 1-100 percentile rank inside the selected universe.
+    x["RS Rating"] = (
+        x["RS Composite"]
+        .rank(pct=True, method="average")
+        .mul(99)
+        .add(1)
+        .round()
+        .clip(1, 100)
+        .astype("Int64")
+    )
 
     def reasons(row):
         out = []
@@ -681,11 +714,14 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     composite_safe = x["Composite"].fillna(0.0)
     raw_momentum = -composite_safe if regime["label"] in {"RISK-OFF", "BEARISH"} else composite_safe
 
+    rs_bonus = x["RS Composite"].fillna(0.0).clip(-20.0, 20.0) * 0.50
+
     x["Adjusted Score"] = (
         pd.Series(raw_momentum, index=x.index, dtype="float64")
         + pd.Series(align_bonus, index=x.index, dtype="float64")
         + pd.Series(trend_bonus, index=x.index, dtype="float64")
         + pd.Series(vol_bonus, index=x.index, dtype="float64")
+        + pd.Series(rs_bonus, index=x.index, dtype="float64")
     )
     x["Adjusted Score"] = x["Adjusted Score"].replace([np.inf, -np.inf], np.nan).fillna(-9999.0)
 
@@ -722,6 +758,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     x["1W %"] = x["Close"].pct_change(5)
     x["1M %"] = x["Close"].pct_change(20)
     x["3M %"] = x["Close"].pct_change(60)
+    x["6M %"] = x["Close"].pct_change(126)
 
     latest = x.iloc[-1]
     prev = x.iloc[-6] if len(x) >= 6 else latest
@@ -782,20 +819,29 @@ def compute_search_diagnostic(symbol, company, df, metadata):
 
     rs_text = "N/A"
     rs_score = 0.0
+    rs_1m = rs_3m = rs_6m = np.nan
     spy = download_one("SPY", "1y")
-    if not spy.empty and len(spy) >= 61:
+    if not spy.empty and len(spy) >= 127:
         spy_1m = float(spy["Close"].pct_change(20).iloc[-1])
         spy_3m = float(spy["Close"].pct_change(60).iloc[-1])
+        spy_6m = float(spy["Close"].pct_change(126).iloc[-1])
+
         stock_1m = float(latest["1M %"])
         stock_3m = float(latest["3M %"])
-        rs_score = (stock_1m - spy_1m) * 100 + (stock_3m - spy_3m) * 50
-        if rs_score >= 5:
+        stock_6m = float(latest["6M %"])
+
+        rs_1m = (stock_1m - spy_1m) * 100.0
+        rs_3m = (stock_3m - spy_3m) * 100.0
+        rs_6m = (stock_6m - spy_6m) * 100.0
+        rs_score = rs_1m * 0.20 + rs_3m * 0.35 + rs_6m * 0.45
+
+        if rs_score >= 10:
             rs_text = "Strongly outperforming SPY"
-        elif rs_score >= 1:
+        elif rs_score >= 3:
             rs_text = "Outperforming SPY"
-        elif rs_score <= -5:
+        elif rs_score <= -10:
             rs_text = "Strongly underperforming SPY"
-        elif rs_score <= -1:
+        elif rs_score <= -3:
             rs_text = "Underperforming SPY"
         else:
             rs_text = "In line with SPY"
@@ -903,6 +949,10 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Volume Ratio": vol_ratio, "Extension": extension,
         "Distance EMA20": dist_ema20,
         "RS vs SPY": rs_text,
+        "RS 1M vs SPY": rs_1m,
+        "RS 3M vs SPY": rs_3m,
+        "RS 6M vs SPY": rs_6m,
+        "RS Composite": rs_score,
         "Chase Risk": chase_risk,
         "Trade Comment": trade_comment,
         "Sector": sector, "Industry": industry, "Earnings": earnings_text,
@@ -984,6 +1034,21 @@ with ticker_tab:
             v2.metric("Momentum", f"{diag['Composite']:.1f}", diag["Acceleration"])
             v3.metric("Trend", diag["Trend"])
             v4.metric("RS vs SPY", diag["RS vs SPY"])
+
+            st.caption(
+                "Relative Strength = the stock's return minus SPY's return. "
+                "Positive = outperforming SPY; negative = underperforming."
+            )
+            rs1, rs2, rs3, rs4 = st.columns(4)
+            rs1.metric("RS 1M", "N/A" if pd.isna(diag["RS 1M vs SPY"]) else f"{diag['RS 1M vs SPY']:+.1f} pp")
+            rs2.metric("RS 3M", "N/A" if pd.isna(diag["RS 3M vs SPY"]) else f"{diag['RS 3M vs SPY']:+.1f} pp")
+            rs3.metric("RS 6M", "N/A" if pd.isna(diag["RS 6M vs SPY"]) else f"{diag['RS 6M vs SPY']:+.1f} pp")
+            rs4.metric("RS Composite", f"{diag['RS Composite']:+.1f}")
+
+            st.caption(
+                "RS Composite = 20% × RS 1M + 35% × RS 3M + 45% × RS 6M. "
+                "Values are percentage points of outperformance/underperformance vs SPY."
+            )
 
             # Explicit calculation note directly under headline metrics.
             st.info(
@@ -1094,7 +1159,7 @@ with ticker_tab:
                     ("Daily / Weekly / Monthly", "1D / 5D / 20D price change, normalized to score"),
                     ("Acceleration", "Current composite vs composite 5 trading days ago; ±10 points triggers Accelerating/Weakening"),
                     ("Trend", "Price/EMA20/EMA50/EMA200 stacking"),
-                    ("RS vs SPY", "Stock relative return vs SPY over 1M and 3M"),
+                    ("RS vs SPY", "1M / 3M / 6M excess return vs SPY; composite weights 20% / 35% / 45%"),
                     ("Volume Ratio", "Current volume ÷ 20-day average volume"),
                     ("Extension", ">8% above EMA20 or RSI≥75 = Extended; >8% below EMA20 or RSI≤25 = Oversold"),
                     ("Trade Plan", "ATR(14), EMA structure and recent 20-day highs/lows"),
@@ -1267,6 +1332,7 @@ with scanner_tab:
 
                 aplus_cols = [
                     "Ticker", "Company", "Sector", "Setup",
+                    "RS Rating", "RS Composite",
                     "Adjusted Score", "Composite", "RSI14",
                     "Volume Ratio", "1D %", "1W %", "1M %",
                 ]
@@ -1278,6 +1344,8 @@ with scanner_tab:
                     use_container_width=True,
                     height=min(420, 45 + 36 * len(aplus)),
                     column_config={
+                        "RS Rating": st.column_config.NumberColumn(format="%d"),
+                        "RS Composite": st.column_config.NumberColumn(format="%+.1f"),
                         "Adjusted Score": st.column_config.NumberColumn(format="%.1f"),
                         "Composite": st.column_config.NumberColumn(format="%.1f"),
                         "RSI14": st.column_config.NumberColumn(format="%.1f"),
@@ -1327,7 +1395,10 @@ with scanner_tab:
                         f"{selected_row['Volume Ratio']:.2f}x"
                         if pd.notna(selected_row["Volume Ratio"]) else "N/A"
                     )
-                    c5.metric("1-Month", f"{selected_row['1M %']:.2%}")
+                    c5.metric(
+                        "RS Rating",
+                        f"{int(selected_row['RS Rating'])}" if pd.notna(selected_row.get("RS Rating")) else "N/A",
+                    )
 
                     timeframe = st.segmented_control(
                         "Chart timeframe",
@@ -1400,6 +1471,7 @@ with scanner_tab:
 
         display_cols = [
             "Rank", "Ticker", "Company", "Sector", "Setup", "Regime Aligned",
+            "RS Rating", "RS Composite",
             "Adjusted Score", "Composite", "RSI14", "Volume Ratio",
             "1D %", "1W %", "1M %", "Filter Reasons",
         ]
@@ -1411,6 +1483,8 @@ with scanner_tab:
             use_container_width=True,
             height=520,
             column_config={
+                "RS Rating": st.column_config.NumberColumn(format="%d"),
+                "RS Composite": st.column_config.NumberColumn(format="%+.1f"),
                 "Adjusted Score": st.column_config.NumberColumn(format="%.1f"),
                 "Composite": st.column_config.NumberColumn(format="%.1f"),
                 "RSI14": st.column_config.NumberColumn(format="%.1f"),
