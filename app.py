@@ -467,6 +467,88 @@ def price_data_status(df, min_rows=80):
     return True, ""
 
 
+
+def expected_latest_completed_us_session(now=None):
+    """
+    Best-effort freshness guard for US daily bars.
+    Uses weekdays (not the full exchange holiday calendar) and a conservative
+    18:00 New York cutoff so Yahoo has time to publish the completed bar.
+    """
+    try:
+        now_ny = pd.Timestamp.now(tz="America/New_York") if now is None else pd.Timestamp(now).tz_convert("America/New_York")
+    except Exception:
+        now_ny = pd.Timestamp.now(tz="America/New_York")
+
+    d = now_ny.normalize()
+    if now_ny.weekday() < 5 and now_ny.hour >= 18:
+        expected = d
+    else:
+        expected = d - pd.Timedelta(days=1)
+
+    while expected.weekday() >= 5:
+        expected -= pd.Timedelta(days=1)
+    return expected.tz_localize(None).normalize()
+
+
+def market_data_freshness(df):
+    x = sanitize_ohlcv(df)
+    if x.empty or "Date" not in x.columns:
+        return False, pd.NaT, pd.NaT, "No valid dated OHLCV rows."
+
+    latest = pd.to_datetime(x["Date"], errors="coerce").dropna().max()
+    if pd.isna(latest):
+        return False, pd.NaT, pd.NaT, "Latest market-data date is unavailable."
+
+    latest = pd.Timestamp(latest).tz_localize(None).normalize()
+    expected = expected_latest_completed_us_session()
+    fresh = latest >= expected
+    reason = (
+        f"Latest completed daily bar: {latest:%d-%b-%Y}. Expected latest session: {expected:%d-%b-%Y}."
+        if fresh else
+        f"Latest completed daily bar: {latest:%d-%b-%Y}; expected at least {expected:%d-%b-%Y}."
+    )
+    return fresh, latest, expected, reason
+
+
+def chart_frame_for_timeframe(base_df, timeframe):
+    base = sanitize_ohlcv(base_df).copy()
+    if base.empty:
+        return base
+
+    base["Date"] = pd.to_datetime(base["Date"], errors="coerce")
+    base = base.dropna(subset=["Date"]).sort_values("Date")
+
+    if timeframe == "Daily":
+        chart = base.tail(90).copy()
+    elif timeframe == "Weekly":
+        chart = (
+            base.set_index("Date")
+            .resample("W-FRI")
+            .agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"})
+            .dropna(subset=["Open","High","Low","Close"])
+            .reset_index()
+            .tail(104)
+        )
+    elif timeframe == "Monthly":
+        chart = (
+            base.set_index("Date")
+            .resample("ME")
+            .agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"})
+            .dropna(subset=["Open","High","Low","Close"])
+            .reset_index()
+            .tail(60)
+        )
+    elif timeframe == "YTD":
+        current_year = pd.Timestamp.today().year
+        chart = base[base["Date"].dt.year == current_year].copy()
+    else:
+        chart = base.copy()
+
+    chart["EMA20"] = chart["Close"].ewm(span=20, adjust=False).mean()
+    chart["EMA50"] = chart["Close"].ewm(span=50, adjust=False).mean()
+    chart["EMA200"] = chart["Close"].ewm(span=200, adjust=False).mean()
+    return chart
+
 def finite_or_nan(value):
     """Convert to float only when finite; otherwise return NaN."""
     try:
@@ -476,7 +558,7 @@ def finite_or_nan(value):
         return np.nan
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def download_one(symbol, period="1y"):
     """Download and validate a single ticker; retry once if Yahoo returns a bad frame."""
     for attempt in range(2):
@@ -1236,7 +1318,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     long_bias = composite >= 15 and close > ema20
     short_bias = composite <= -15 and close < ema20
 
-    # v6.2 Tradeability & Risk Engine
+    # v6.3 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
     extended_long = (dist_ema20 > 0.08) or (rsi14 >= 75)
     extended_short = (dist_ema20 < -0.08) or (rsi14 <= 25)
@@ -1480,7 +1562,7 @@ with ticker_tab:
         selected_company = chosen.split(" — ", 1)[1] if " — " in chosen else selected_ticker
 
         with st.spinner(f"Analyzing {selected_ticker}..."):
-            df = download_one(selected_ticker, "1y")
+            df = download_one(selected_ticker, "5y")
             metadata = get_company_snapshot(selected_ticker)
             diag = compute_search_diagnostic(selected_ticker, selected_company, df, metadata)
 
@@ -1492,8 +1574,73 @@ with ticker_tab:
             )
             st.info("Try the ticker again shortly. The app automatically retries the data download once.")
         else:
+            data_fresh, latest_bar, expected_bar, freshness_reason = market_data_freshness(df)
+            if data_fresh:
+                st.success(f"🟢 **Market data CURRENT** — {freshness_reason}")
+            else:
+                st.error(
+                    f"🔴 **DATA STALE — DO NOT ACT.** {freshness_reason} "
+                    "Scores may still be displayed for diagnosis, but no actionable trade plan is allowed."
+                )
+                diag["Trade State"] = "DATA INCOMPLETE"
+                diag["Trade Block Reason"] = (
+                    f"Daily price history is stale. {freshness_reason} "
+                    "Refresh/retry after the latest completed session is available."
+                )
+                diag["Bias"] = "WAIT"
+                diag["Entry Low"] = diag["Entry High"] = diag["Stop"] = np.nan
+                diag["Target 1"] = diag["Target 2"] = diag["RR"] = np.nan
+                diag["Stop %"] = np.nan
+
             st.markdown(f"### {selected_ticker} — {selected_company}")
             st.markdown(f"## {diag['Verdict']}")
+
+            # v6.3: separate stock quality from entry quality and current action.
+            candidate_points = 0
+            candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
+            candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
+            candidate_points += 2 if pd.notna(diag["RS Composite"]) and abs(diag["RS Composite"]) >= 15 else (1 if pd.notna(diag["RS Composite"]) and abs(diag["RS Composite"]) >= 5 else 0)
+            candidate_points += 1 if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] >= 1.2 else 0
+
+            if candidate_points >= 6:
+                candidate_quality = "A+"
+            elif candidate_points >= 5:
+                candidate_quality = "A"
+            elif candidate_points >= 4:
+                candidate_quality = "B+"
+            elif candidate_points >= 3:
+                candidate_quality = "B"
+            else:
+                candidate_quality = "C"
+
+            if not data_fresh:
+                entry_quality = "N/A — DATA STALE"
+                action_label = "DO NOT ACT"
+            elif diag["Trade State"] == "ACTIONABLE":
+                sp = diag.get("Stop %", np.nan)
+                if pd.notna(sp) and sp <= 0.06 and pd.notna(diag["RR"]) and diag["RR"] >= 2:
+                    entry_quality = "A"
+                elif pd.notna(sp) and sp <= 0.08:
+                    entry_quality = "B+"
+                else:
+                    entry_quality = "B"
+                action_label = diag["Bias"]
+            elif diag["Extension"] in ("Extended", "Oversold"):
+                entry_quality = "D — EXTENDED" if diag["Extension"] == "Extended" else "D — OVERSOLD"
+                action_label = diag["Trade State"]
+            else:
+                entry_quality = "C — NOT READY"
+                action_label = diag["Trade State"]
+
+            cq1, cq2, cq3 = st.columns(3)
+            cq1.metric("Candidate Quality", candidate_quality)
+            cq2.metric("Entry Quality", entry_quality)
+            cq3.metric("Action", action_label)
+            st.caption(
+                "Quality Engine: **Candidate Quality** asks whether the stock is worth watching; "
+                "**Entry Quality** asks whether today's location/risk is acceptable; "
+                "**Action** is the current decision. A strong candidate can correctly remain WAIT."
+            )
 
             v1, v2, v3, v4 = st.columns(4)
             v1.metric("Close", fmt_price(diag["Close"]))
@@ -1663,10 +1810,13 @@ with ticker_tab:
                 f3.metric("Forward P/E", "N/A" if pd.isna(diag["Forward PE"]) else f"{diag['Forward PE']:.1f}")
 
             if not df.empty:
-                d = df.tail(120).copy()
-                d["EMA20"] = d["Close"].ewm(span=20, adjust=False).mean()
-                d["EMA50"] = d["Close"].ewm(span=50, adjust=False).mean()
-                d["EMA200"] = d["Close"].ewm(span=200, adjust=False).mean()
+                diagnostic_timeframe = st.segmented_control(
+                    "Chart timeframe",
+                    ["Daily", "Weekly", "Monthly", "YTD", "All"],
+                    default="Daily",
+                    key=f"diagnostic_timeframe_{selected_ticker}",
+                )
+                d = chart_frame_for_timeframe(df, diagnostic_timeframe)
 
                 fig = go.Figure()
                 fig.add_trace(go.Candlestick(
@@ -1676,9 +1826,10 @@ with ticker_tab:
                 fig.add_trace(go.Scatter(x=d["Date"], y=d["EMA50"], name="EMA50"))
                 fig.add_trace(go.Scatter(x=d["Date"], y=d["EMA200"], name="EMA200"))
                 fig.update_layout(
+                    title=f"{selected_ticker} — Price Chart ({diagnostic_timeframe})",
                     height=460,
                     xaxis_rangeslider_visible=False,
-                    margin=dict(l=5, r=5, t=20, b=5),
+                    margin=dict(l=5, r=5, t=45, b=5),
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -1917,50 +2068,7 @@ with scanner_tab:
                         key=f"aplus_timeframe_{selected_aplus}",
                     )
 
-                    base_chart = detail_df.copy()
-                    base_chart["Date"] = pd.to_datetime(base_chart["Date"])
-
-                    if timeframe == "Daily":
-                        chart_df = base_chart.tail(90).copy()
-                    elif timeframe == "Weekly":
-                        chart_df = (
-                            base_chart.set_index("Date")
-                            .resample("W-FRI")
-                            .agg({
-                                "Open": "first",
-                                "High": "max",
-                                "Low": "min",
-                                "Close": "last",
-                                "Volume": "sum",
-                            })
-                            .dropna(subset=["Open", "High", "Low", "Close"])
-                            .reset_index()
-                            .tail(104)
-                        )
-                    elif timeframe == "Monthly":
-                        chart_df = (
-                            base_chart.set_index("Date")
-                            .resample("ME")
-                            .agg({
-                                "Open": "first",
-                                "High": "max",
-                                "Low": "min",
-                                "Close": "last",
-                                "Volume": "sum",
-                            })
-                            .dropna(subset=["Open", "High", "Low", "Close"])
-                            .reset_index()
-                            .tail(60)
-                        )
-                    elif timeframe == "YTD":
-                        current_year = pd.Timestamp.today().year
-                        chart_df = base_chart[base_chart["Date"].dt.year == current_year].copy()
-                    else:
-                        chart_df = base_chart.copy()
-
-                    chart_df["EMA20"] = chart_df["Close"].ewm(span=20, adjust=False).mean()
-                    chart_df["EMA50"] = chart_df["Close"].ewm(span=50, adjust=False).mean()
-                    chart_df["EMA200"] = chart_df["Close"].ewm(span=200, adjust=False).mean()
+                    chart_df = chart_frame_for_timeframe(detail_df, timeframe)
 
                     fig_aplus = go.Figure()
                     fig_aplus.add_trace(go.Candlestick(
