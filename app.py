@@ -1236,27 +1236,110 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     long_bias = composite >= 15 and close > ema20
     short_bias = composite <= -15 and close < ema20
 
-    if long_bias:
-        entry_low = max(ema20, close - 0.50 * atr)
-        entry_high = close + 0.15 * atr
-        stop = min(ema50, entry_low - 1.35 * atr)
-        risk = max(entry_low - stop, atr * 0.6)
-        target1 = max(high20, entry_high + 1.5 * risk)
-        target2 = entry_high + 2.5 * risk
-        rr = (target2 - entry_high) / max(entry_high - stop, 0.01)
-        bias = "LONG"
+    # v6.2 Tradeability & Risk Engine
+    # Candidate quality and current entry quality are separate.
+    extended_long = (dist_ema20 > 0.08) or (rsi14 >= 75)
+    extended_short = (dist_ema20 < -0.08) or (rsi14 <= 25)
+
+    trade_state = "NO TRADE"
+    trade_block_reason = ""
+    stop_pct = np.nan
+    entry_mid = np.nan
+
+    if long_bias and extended_long:
+        entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        bias = "WAIT"
+        trade_state = "WAIT FOR PULLBACK"
+        trade_block_reason = (
+            f"Extended: price is {dist_ema20:+.1%} vs EMA20 and RSI is {rsi14:.1f}. "
+            "Do not chase. Wait for a pullback, consolidation, or new base before recalculating entry."
+        )
+    elif short_bias and extended_short:
+        entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        bias = "WAIT"
+        trade_state = "WAIT FOR BOUNCE"
+        trade_block_reason = (
+            f"Oversold: price is {dist_ema20:+.1%} vs EMA20 and RSI is {rsi14:.1f}. "
+            "Do not chase weakness. Wait for a bounce/rejection before recalculating entry."
+        )
+    elif long_bias:
+        entry_low = max(ema20, close - 0.35 * atr)
+        entry_high = close + 0.10 * atr
+        entry_mid = (entry_low + entry_high) / 2.0
+
+        stop = min(ema50, entry_low - 1.10 * atr)
+        stop_pct = (entry_mid - stop) / entry_mid if entry_mid > 0 else np.nan
+
+        if not np.isfinite(stop_pct):
+            bias = "WAIT"
+            trade_state = "NO TRADE"
+            trade_block_reason = "Stop distance could not be validated."
+            entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        elif stop_pct > 0.10:
+            bias = "WAIT"
+            trade_state = "WAIT FOR BETTER ENTRY"
+            trade_block_reason = (
+                f"Required stop is {stop_pct:.1%} from the proposed entry, above the 10% hard cap. "
+                "Wait for price to pull back or form a tighter structure."
+            )
+            entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        elif stop_pct < 0.02:
+            bias = "WAIT"
+            trade_state = "WAIT FOR STRUCTURE"
+            trade_block_reason = (
+                f"Required stop is only {stop_pct:.1%}, too tight for a normal swing setup. "
+                "Wait for a clearer structure."
+            )
+            entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        else:
+            risk = entry_mid - stop
+            target1 = max(high20, entry_mid + 1.5 * risk)
+            target2 = entry_mid + 2.5 * risk
+            rr = (target2 - entry_mid) / max(risk, 0.01)
+            bias = "LONG"
+            trade_state = "ACTIONABLE"
+
     elif short_bias:
-        entry_high = min(ema20, close + 0.50 * atr)
-        entry_low = close - 0.15 * atr
-        stop = max(ema50, entry_high + 1.35 * atr)
-        risk = max(stop - entry_high, atr * 0.6)
-        target1 = min(low20, entry_low - 1.5 * risk)
-        target2 = entry_low - 2.5 * risk
-        rr = (entry_low - target2) / max(stop - entry_low, 0.01)
-        bias = "SHORT"
+        entry_high = min(ema20, close + 0.35 * atr)
+        entry_low = close - 0.10 * atr
+        entry_mid = (entry_low + entry_high) / 2.0
+
+        stop = max(ema50, entry_high + 1.10 * atr)
+        stop_pct = (stop - entry_mid) / entry_mid if entry_mid > 0 else np.nan
+
+        if not np.isfinite(stop_pct):
+            bias = "WAIT"
+            trade_state = "NO TRADE"
+            trade_block_reason = "Stop distance could not be validated."
+            entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        elif stop_pct > 0.10:
+            bias = "WAIT"
+            trade_state = "WAIT FOR BETTER ENTRY"
+            trade_block_reason = (
+                f"Required stop is {stop_pct:.1%} from the proposed entry, above the 10% hard cap. "
+                "Wait for a rally/rejection or tighter structure."
+            )
+            entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        elif stop_pct < 0.02:
+            bias = "WAIT"
+            trade_state = "WAIT FOR STRUCTURE"
+            trade_block_reason = (
+                f"Required stop is only {stop_pct:.1%}, too tight for a normal swing setup. "
+                "Wait for clearer structure."
+            )
+            entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        else:
+            risk = stop - entry_mid
+            target1 = min(low20, entry_mid - 1.5 * risk)
+            target2 = entry_mid - 2.5 * risk
+            rr = (entry_mid - target2) / max(risk, 0.01)
+            bias = "SHORT"
+            trade_state = "ACTIONABLE"
     else:
         entry_low = entry_high = stop = target1 = target2 = rr = np.nan
         bias = "WAIT"
+        trade_state = "NO TRADE"
+        trade_block_reason = "Momentum/trend alignment is mixed."
 
     points = 0
     points += 2 if bull_stack else 1 if bull_mid else -2 if bear_stack else -1 if bear_mid else 0
@@ -1331,6 +1414,9 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Earnings Risk": earnings_risk, "Bias": bias, "Verdict": verdict,
         "Entry Low": entry_low, "Entry High": entry_high, "Stop": stop,
         "Target 1": target1, "Target 2": target2, "RR": rr,
+        "Trade State": trade_state,
+        "Trade Block Reason": trade_block_reason,
+        "Stop %": stop_pct,
         "EMA20": ema20, "EMA50": ema50, "EMA200": ema200,
         "Market Cap": metadata.get("market_cap", np.nan),
         "Trailing PE": metadata.get("trailing_pe", np.nan),
@@ -1411,7 +1497,13 @@ with ticker_tab:
 
             v1, v2, v3, v4 = st.columns(4)
             v1.metric("Close", fmt_price(diag["Close"]))
-            v2.metric("Momentum Score", f"{diag['Momentum Score']:.1f}", diag["Acceleration"])
+            v2.metric("Momentum Score", f"{diag['Momentum Score']:.1f}")
+            if diag["Acceleration"] == "Accelerating ↑":
+                st.success("Momentum: Accelerating ↑")
+            elif diag["Acceleration"] == "Weakening ↓":
+                st.warning("Momentum: Weakening ↓")
+            else:
+                st.info(f"Momentum: {diag['Acceleration']}")
             v3.metric("Trend", diag["Trend"])
             v4.metric("RS vs SPY", diag["RS vs SPY"])
 
@@ -1509,27 +1601,44 @@ with ticker_tab:
                 st.info(f"Earnings: {diag['Earnings']}")
 
             st.markdown("### Trade Plan")
-            if diag["Bias"] == "WAIT":
+            st.caption(
+                "Trade plan is shown only when entry quality passes the risk gate. "
+                "Hard stop-distance cap: **10%**. Extended/oversold names are blocked from actionable entries."
+            )
+
+            if diag["Trade State"] != "ACTIONABLE":
                 st.warning(
-                    "No clean entry plan right now. Momentum/trend alignment is mixed, "
-                    "so the better action is to wait for confirmation."
+                    f"**{diag['Trade State']}** — {diag.get('Trade Block Reason', '')}"
+                )
+                st.info(
+                    "The stock can still be a high-quality candidate, but the current entry is not acceptable. "
+                    "Candidate quality and entry quality are intentionally scored separately."
                 )
             else:
-                p1, p2, p3, p4 = st.columns(4)
+                p1, p2, p3, p4, p5 = st.columns(5)
                 p1.metric("Bias", diag["Bias"])
                 p2.metric(
                     "Entry Zone",
                     f"{fmt_price(diag['Entry Low'])} – {fmt_price(diag['Entry High'])}"
                 )
                 p3.metric("Stop", fmt_price(diag["Stop"]))
-                p4.metric("R:R", fmt_ratio(diag["RR"]))
+                p4.metric(
+                    "Stop Distance",
+                    "N/A" if pd.isna(diag["Stop %"]) else f"{diag['Stop %']:.1%}"
+                )
+                p5.metric("R:R", fmt_ratio(diag["RR"]))
 
                 t1, t2 = st.columns(2)
                 t1.metric("Target 1", fmt_price(diag["Target 1"]))
                 t2.metric("Target 2", fmt_price(diag["Target 2"]))
 
-                if diag["RR"] >= 2:
-                    st.success("Risk/reward is attractive on the heuristic plan.")
+                if pd.notna(diag["Stop %"]) and diag["Stop %"] > 0.08:
+                    st.warning(
+                        "Stop distance is above 8%. This is still inside the 10% hard cap, "
+                        "but risk is on the wide side for a typical swing trade."
+                    )
+                elif diag["RR"] >= 2:
+                    st.success("Entry quality and risk/reward both pass the current swing-trade gate.")
                 elif pd.notna(diag["RR"]):
                     st.warning("Risk/reward is below 2R. Entry quality may need improvement.")
 
@@ -1542,7 +1651,7 @@ with ticker_tab:
                     ("RS vs SPY", "1M / 3M / 6M excess return vs SPY; composite weights 20% / 35% / 45%"),
                     ("Volume Ratio", "Current volume ÷ 20-day average volume"),
                     ("Extension", ">8% above EMA20 or RSI≥75 = Extended; >8% below EMA20 or RSI≤25 = Oversold"),
-                    ("Trade Plan", "ATR(14), EMA structure and recent 20-day highs/lows"),
+                    ("Trade Plan", "ATR(14), EMA structure and 20-day highs/lows; blocked if extended/oversold or stop distance exceeds 10%"),
                 ]
                 st.dataframe(pd.DataFrame(rows, columns=["Signal", "Rule"]), hide_index=True, use_container_width=True)
 
