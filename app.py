@@ -593,6 +593,85 @@ def continuity_status(df, lookback_days=14):
     return False, missing, f"Missing recent session(s): {formatted}."
 
 
+
+def data_confidence(df, recent_lookback=14):
+    """
+    Practical data-confidence model.
+
+    HIGH:
+      - latest completed session is current
+      - no recent weekday gaps
+
+    MEDIUM:
+      - latest session is current
+      - exactly one recent missing weekday session
+      - sufficient valid history remains
+
+    LOW:
+      - stale latest bar
+      - multiple recent gaps
+      - insufficient valid history / invalid OHLC
+
+    LOW blocks actionable trade plans.
+    MEDIUM keeps calculations available but displays a caution flag.
+    """
+    valid, reason = price_data_status(df, min_rows=126)
+    if not valid:
+        return {
+            "level": "LOW",
+            "score": 0,
+            "block": True,
+            "message": f"Invalid/insufficient price data: {reason}",
+            "missing": [],
+        }
+
+    fresh, latest, expected, fresh_reason = market_data_freshness(df)
+    missing = missing_recent_sessions(df, lookback_days=recent_lookback)
+
+    if not fresh:
+        return {
+            "level": "LOW",
+            "score": 20,
+            "block": True,
+            "message": fresh_reason,
+            "missing": missing,
+        }
+
+    if len(missing) == 0:
+        return {
+            "level": "HIGH",
+            "score": 100,
+            "block": False,
+            "message": "Latest session is current and no recent weekday gaps were detected.",
+            "missing": [],
+        }
+
+    if len(missing) == 1:
+        d = pd.Timestamp(missing[0]).strftime("%d-%b-%Y")
+        return {
+            "level": "MEDIUM",
+            "score": 70,
+            "block": False,
+            "message": (
+                f"Latest session is current, but one isolated recent data gap was detected: {d}. "
+                "Signals remain usable with reduced confidence."
+            ),
+            "missing": missing,
+        }
+
+    formatted = ", ".join(pd.Timestamp(d).strftime("%d-%b-%Y") for d in missing[:5])
+    return {
+        "level": "LOW",
+        "score": 35,
+        "block": True,
+        "message": (
+            f"Multiple recent data gaps were detected ({len(missing)}): {formatted}. "
+            "Actionable signals are blocked until data quality improves."
+        ),
+        "missing": missing,
+    }
+
+
 def chart_frame_for_timeframe(base_df, timeframe):
     base = sanitize_ohlcv(base_df).copy()
     if base.empty:
@@ -1593,7 +1672,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     long_bias = composite >= 15 and close > ema20
     short_bias = composite <= -15 and close < ema20
 
-    # v6.6 Tradeability & Risk Engine
+    # v6.7 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
     extended_long = (dist_ema20 > 0.08) or (rsi14 >= 75)
     extended_short = (dist_ema20 < -0.08) or (rsi14 <= 25)
@@ -1819,7 +1898,7 @@ with ticker_tab:
     st.caption(
         "Data Quality Gate: invalid or incomplete market data produces **no score, no grade, and no trade plan**."
     )
-    st.caption("Choose any ticker/company and get a fast decision-oriented readout with the calculation logic shown.")
+    st.caption("Choose any ticker/company and get a fast decision-oriented readout focused on quality, entry risk, and action.")
 
     company_dir = load_company_directory()
     labels = company_dir["Label"].tolist()
@@ -1849,39 +1928,27 @@ with ticker_tab:
             )
             st.info("Yahoo primary and an independent Stooq fallback are used for individual tickers. Retry shortly if both are unavailable.")
         else:
-            data_fresh, latest_bar, expected_bar, freshness_reason = market_data_freshness(df)
-            continuity_ok, missing_dates, continuity_reason = continuity_status(df, lookback_days=14)
+            confidence = data_confidence(df, recent_lookback=14)
             download_route = df.attrs.get("download_route", "validated market-data route")
             data_provider = df.attrs.get("provider", "Yahoo")
 
-            if data_fresh and continuity_ok:
+            if confidence["level"] == "HIGH":
                 st.success(
-                    f"🟢 **Market data CURRENT + CONTINUOUS** — {freshness_reason} "
-                    f"{continuity_reason} Provider: **{data_provider}** • Retrieval: **{download_route}**."
+                    f"🟢 **Data Confidence: HIGH** — {confidence['message']} "
+                    f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
-            elif data_fresh and not continuity_ok:
-                st.error(
-                    f"🔴 **DATA GAP — DO NOT ACT.** {continuity_reason} "
-                    f"Provider: **{data_provider}** • Retrieval: **{download_route}**. "
-                    "No actionable trade plan is allowed until the gap is repaired."
+            elif confidence["level"] == "MEDIUM":
+                st.warning(
+                    f"🟠 **Data Confidence: MEDIUM** — {confidence['message']} "
+                    f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
-                diag["Trade State"] = "DATA GAP"
-                diag["Trade Block Reason"] = continuity_reason
-                diag["Bias"] = "WAIT"
-                diag["Entry Low"] = diag["Entry High"] = diag["Stop"] = np.nan
-                diag["Target 1"] = diag["Target 2"] = diag["RR"] = np.nan
-                diag["Stop %"] = np.nan
             else:
                 st.error(
-                    f"🔴 **DATA STALE — DO NOT ACT.** {freshness_reason} "
-                    f"Best provider: **{data_provider}** • Retrieval: **{download_route}**. "
-                    "Primary and fallback providers were checked; no actionable trade plan is allowed."
+                    f"🔴 **Data Confidence: LOW — DO NOT ACT.** {confidence['message']} "
+                    f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
-                diag["Trade State"] = "DATA INCOMPLETE"
-                diag["Trade Block Reason"] = (
-                    f"Daily price history is stale. {freshness_reason} "
-                    "Refresh/retry after the latest completed session is available."
-                )
+                diag["Trade State"] = "DATA ISSUE"
+                diag["Trade Block Reason"] = confidence["message"]
                 diag["Bias"] = "WAIT"
                 diag["Entry Low"] = diag["Entry High"] = diag["Stop"] = np.nan
                 diag["Target 1"] = diag["Target 2"] = diag["RR"] = np.nan
@@ -1890,7 +1957,7 @@ with ticker_tab:
             st.markdown(f"### {selected_ticker} — {selected_company}")
             st.markdown(f"## {diag['Verdict']}")
 
-            # v6.6: separate stock quality from entry quality and current action.
+            # v6.7: separate stock quality from entry quality and current action.
             candidate_points = 0
             candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
             candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
@@ -1908,7 +1975,7 @@ with ticker_tab:
             else:
                 candidate_quality = "C"
 
-            if (not data_fresh) or (not continuity_ok):
+            if confidence["block"]:
                 entry_quality = "N/A — DATA ISSUE"
                 action_label = "DO NOT ACT"
             elif diag["Trade State"] == "ACTIONABLE":
@@ -1919,7 +1986,12 @@ with ticker_tab:
                     entry_quality = "B+"
                 else:
                     entry_quality = "B"
-                action_label = diag["Bias"]
+
+                if confidence["level"] == "MEDIUM":
+                    entry_quality = {"A": "B+", "B+": "B", "B": "C"}.get(entry_quality, entry_quality)
+                    action_label = f"{diag['Bias']} — REDUCED CONFIDENCE"
+                else:
+                    action_label = diag["Bias"]
             elif diag["Extension"] in ("Extended", "Oversold"):
                 entry_quality = "D — EXTENDED" if diag["Extension"] == "Extended" else "D — OVERSOLD"
                 action_label = diag["Trade State"]
@@ -1927,10 +1999,11 @@ with ticker_tab:
                 entry_quality = "C — NOT READY"
                 action_label = diag["Trade State"]
 
-            cq1, cq2, cq3 = st.columns(3)
+            cq1, cq2, cq3, cq4 = st.columns(4)
             cq1.metric("Candidate Quality", candidate_quality)
             cq2.metric("Entry Quality", entry_quality)
             cq3.metric("Action", action_label)
+            cq4.metric("Data Confidence", confidence["level"])
             st.caption(
                 "Quality Engine: **Candidate Quality** asks whether the stock is worth watching; "
                 "**Entry Quality** asks whether today's location/risk is acceptable; "
@@ -2042,6 +2115,64 @@ with ticker_tab:
             else:
                 st.info(f"Earnings: {diag['Earnings']}")
 
+            st.markdown("### Decision Summary")
+            d1, d2 = st.columns(2)
+
+            with d1:
+                st.markdown("**Why it qualifies / strengths**")
+                strengths = []
+                if diag["Trend"] in ("Strong bullish", "Strong bearish"):
+                    strengths.append(f"Strong trend: {diag['Trend']}")
+                elif diag["Trend"] in ("Bullish", "Bearish"):
+                    strengths.append(f"Directional trend: {diag['Trend']}")
+                if pd.notna(diag["RS Composite"]) and abs(diag["RS Composite"]) >= 5:
+                    strengths.append(f"Relative strength edge vs SPY: {diag['RS Composite']:+.1f} pp")
+                if abs(diag["Momentum Score"]) >= 40:
+                    strengths.append(f"Momentum Score: {diag['Momentum Score']:.1f}")
+                if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] >= 1.2:
+                    strengths.append(f"Volume confirmation: {diag['Volume Ratio']:.2f}x")
+                if strengths:
+                    for item in strengths:
+                        st.write(f"• {item}")
+                else:
+                    st.write("• No major quality edge is currently confirmed.")
+
+            with d2:
+                st.markdown("**Why to wait / key risks**")
+                risks = []
+                if diag["Extension"] in ("Extended", "Oversold"):
+                    risks.append(f"Entry location: {diag['Extension']}")
+                if diag["Acceleration"] == "Weakening ↓":
+                    risks.append("Momentum is weakening")
+                if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 0.75:
+                    risks.append(f"Volume is weak: {diag['Volume Ratio']:.2f}x")
+                if confidence["level"] != "HIGH":
+                    risks.append(f"Data Confidence is {confidence['level']}")
+                if diag["Trade State"] != "ACTIONABLE":
+                    risks.append(diag.get("Trade Block Reason", diag["Trade State"]))
+                if risks:
+                    for item in risks:
+                        st.write(f"• {item}")
+                else:
+                    st.write("• No major blocking risk identified.")
+
+            st.markdown("**What would improve the setup?**")
+            improvement = []
+            if diag["Extension"] == "Extended":
+                improvement.append("Pullback/consolidation closer to EMA20 with RSI cooling below 75")
+            elif diag["Extension"] == "Oversold":
+                improvement.append("Bounce/rejection structure before considering a short")
+            if diag["Acceleration"] == "Weakening ↓":
+                improvement.append("Momentum stabilization or renewed acceleration")
+            if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 1.0:
+                improvement.append("Stronger volume confirmation")
+            if confidence["level"] == "MEDIUM":
+                improvement.append("Cleaner data feed / repaired isolated gap for higher confidence")
+            if not improvement:
+                improvement.append("Maintain current trend/RS while preserving acceptable entry risk")
+            for item in improvement:
+                st.write(f"• {item}")
+
             st.markdown("### Trade Plan")
             st.caption(
                 "Trade plan is shown only when entry quality passes the risk gate. "
@@ -2104,29 +2235,6 @@ with ticker_tab:
                 f2.metric("Trailing P/E", "N/A" if pd.isna(diag["Trailing PE"]) else f"{diag['Trailing PE']:.1f}")
                 f3.metric("Forward P/E", "N/A" if pd.isna(diag["Forward PE"]) else f"{diag['Forward PE']:.1f}")
 
-            if not df.empty:
-                diagnostic_timeframe = st.segmented_control(
-                    "Chart timeframe",
-                    ["Daily", "Weekly", "Monthly", "YTD", "All"],
-                    default="Daily",
-                    key=f"diagnostic_timeframe_{selected_ticker}",
-                )
-                d = chart_frame_for_timeframe(df, diagnostic_timeframe)
-
-                fig = go.Figure()
-                fig.add_trace(go.Candlestick(
-                    x=d["Date"], open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Price"
-                ))
-                fig.add_trace(go.Scatter(x=d["Date"], y=d["EMA20"], name="EMA20"))
-                fig.add_trace(go.Scatter(x=d["Date"], y=d["EMA50"], name="EMA50"))
-                fig.add_trace(go.Scatter(x=d["Date"], y=d["EMA200"], name="EMA200"))
-                fig.update_layout(
-                    title=f"{selected_ticker} — Price Chart ({diagnostic_timeframe})",
-                    height=460,
-                    xaxis_rangeslider_visible=False,
-                    margin=dict(l=5, r=5, t=45, b=5),
-                )
-                st.plotly_chart(fig, use_container_width=True)
 
             st.caption(
                 "Trade plan levels are heuristic decision-support estimates based on ATR, trend and recent highs/lows. "
