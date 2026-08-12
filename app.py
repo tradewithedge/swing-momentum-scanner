@@ -162,51 +162,126 @@ def load_sp500():
 
 @st.cache_data(ttl=UNIVERSE_CACHE_TTL, show_spinner=False)
 def load_nasdaq100():
+    """Load Nasdaq-100 constituents with robust parsing and a fallback symbol set."""
     try:
-        tables = pd.read_html(NASDAQ100_URL)
-        chosen = None
-        for table in tables:
-            cols = [str(c).strip() for c in table.columns]
-            if "Ticker" in cols and any(c in cols for c in ["Company", "Company name"]):
-                chosen = table.copy()
-                chosen.columns = cols
-                break
-        if chosen is None:
-            return pd.DataFrame(columns=["Ticker", "Company", "Sector"])
+        response = requests.get(
+            NASDAQ100_URL,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        tables = pd.read_html(io.StringIO(response.text))
 
-        company_col = "Company" if "Company" in chosen.columns else "Company name"
-        sector_col = next((c for c in ["GICS Sector", "Sector"] if c in chosen.columns), None)
-        out = pd.DataFrame({
-            "Ticker": chosen["Ticker"].map(clean_symbol),
-            "Company": chosen[company_col].astype(str),
-            "Sector": chosen[sector_col].astype(str) if sector_col else "",
-        })
-        return out[out["Ticker"] != ""].drop_duplicates("Ticker")
+        for table in tables:
+            table = table.copy()
+            # Flatten MultiIndex headers if present.
+            if isinstance(table.columns, pd.MultiIndex):
+                table.columns = [
+                    " ".join([str(v) for v in c if str(v) != "nan"]).strip()
+                    for c in table.columns
+                ]
+            else:
+                table.columns = [str(c).strip() for c in table.columns]
+
+            ticker_col = next(
+                (c for c in table.columns if c.lower() in {"ticker", "symbol", "ticker symbol"}),
+                None,
+            )
+            company_col = next(
+                (
+                    c for c in table.columns
+                    if c.lower() in {"company", "company name", "security"}
+                    or "company" in c.lower()
+                ),
+                None,
+            )
+            if ticker_col and company_col and len(table) >= 90:
+                sector_col = next(
+                    (c for c in table.columns if "sector" in c.lower() or "industry" in c.lower()),
+                    None,
+                )
+                out = pd.DataFrame({
+                    "Ticker": table[ticker_col].map(clean_symbol),
+                    "Company": table[company_col].astype(str),
+                    "Sector": table[sector_col].astype(str) if sector_col else "",
+                })
+                out = out[out["Ticker"] != ""].drop_duplicates("Ticker")
+                if len(out) >= 90:
+                    return out.reset_index(drop=True)
     except Exception:
-        return pd.DataFrame(columns=["Ticker", "Company", "Sector"])
+        pass
+
+    # Fallback: current-style Nasdaq-100 symbol basket. Company names are filled
+    # from the SEC company directory, so the scanner remains usable even if
+    # Wikipedia changes its table markup temporarily.
+    fallback_symbols = """
+    AAPL ABNB ADBE ADI ADP ADSK AEP AMAT AMD AMGN AMZN APP ARM ASML AVGO AXON
+    BKNG BKR CCEP CDNS CEG CHTR CMCSA COST CPRT CRWD CSCO CSGP CSX CTAS CTSH
+    DASH DDOG DXCM EA EXC FANG FAST FTNT GFS GILD GOOG GOOGL HON IDXX INTC INTU
+    ISRG KDP KHC KLAC LIN LRCX MAR MCHP MDB MDLZ MELI META MNST MRVL MSFT MSTR
+    MU NFLX NVDA NXPI ODFL ON ORLY PANW PAYX PCAR PDD PEP PLTR PYPL QCOM REGN
+    ROP ROST SBUX SNPS TEAM TMUS TSLA TTWO TXN VRSK VRTX WBD WDAY XEL ZS
+    """.split()
+
+    directory = load_company_directory().set_index("Ticker")
+    rows = []
+    for ticker in fallback_symbols:
+        company = ticker
+        if ticker in directory.index:
+            company = directory.loc[ticker, "Company"]
+            if isinstance(company, pd.Series):
+                company = company.iloc[0]
+        rows.append((ticker, str(company), ""))
+    return pd.DataFrame(rows, columns=["Ticker", "Company", "Sector"]).drop_duplicates("Ticker")
+
 
 @st.cache_data(ttl=UNIVERSE_CACHE_TTL, show_spinner=False)
 def load_iwm():
-    try:
-        response = requests.get(IWM_HOLDINGS_URL, timeout=20)
-        response.raise_for_status()
-        raw = response.text
-        holdings = pd.read_csv(io.StringIO(raw), skiprows=8)
+    """Load IWM holdings from iShares' downloadable holdings CSV."""
+    csv_urls = [
+        "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund",
+        IWM_HOLDINGS_URL,
+    ]
+    for url in csv_urls:
+        try:
+            response = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            raw = response.content.decode("utf-8-sig", errors="ignore")
 
-        if "Ticker" not in holdings.columns:
-            return pd.DataFrame(columns=["Ticker", "Company", "Sector"])
+            # iShares CSV files contain several metadata lines before the header.
+            lines = raw.splitlines()
+            header_idx = next(
+                (
+                    i for i, line in enumerate(lines[:30])
+                    if "Ticker" in line and ("Name" in line or "Sector" in line)
+                ),
+                None,
+            )
+            if header_idx is None:
+                continue
 
-        if "Asset Class" in holdings.columns:
-            holdings = holdings[holdings["Asset Class"].astype(str).str.lower().eq("equity")]
+            holdings = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+            if "Ticker" not in holdings.columns:
+                continue
 
-        out = pd.DataFrame({
-            "Ticker": holdings["Ticker"].map(clean_symbol),
-            "Company": holdings["Name"].astype(str) if "Name" in holdings.columns else "",
-            "Sector": holdings["Sector"].astype(str) if "Sector" in holdings.columns else "",
-        })
-        return out[out["Ticker"] != ""].drop_duplicates("Ticker")
-    except Exception:
-        return pd.DataFrame(columns=["Ticker", "Company", "Sector"])
+            if "Asset Class" in holdings.columns:
+                equity_mask = holdings["Asset Class"].astype(str).str.lower().eq("equity")
+                if equity_mask.any():
+                    holdings = holdings[equity_mask]
+
+            out = pd.DataFrame({
+                "Ticker": holdings["Ticker"].map(clean_symbol),
+                "Company": holdings["Name"].astype(str) if "Name" in holdings.columns else "",
+                "Sector": holdings["Sector"].astype(str) if "Sector" in holdings.columns else "",
+            })
+            out = out[out["Ticker"] != ""].drop_duplicates("Ticker")
+            if len(out) > 1000:
+                return out.reset_index(drop=True)
+        except Exception:
+            continue
+
+    return pd.DataFrame(columns=["Ticker", "Company", "Sector"])
+
 
 def parse_watchlist(text):
     tickers = []
@@ -610,7 +685,13 @@ with scanner_tab:
         )
 
     universe_df = get_universe(universe_name, watchlist_text)
-    st.caption(f"Universe contains **{len(universe_df):,}** unique symbols.")
+    if universe_df.empty:
+        st.warning(
+            f"{universe_name} constituent source did not load on this request. "
+            "The Run Scan button remains available and will retry the source."
+        )
+    else:
+        st.caption(f"Universe contains **{len(universe_df):,}** unique symbols.")
 
     with st.expander("Scanner filters", expanded=False):
         f1, f2, f3 = st.columns(3)
@@ -627,7 +708,6 @@ with scanner_tab:
             f"Run {universe_name} scan",
             type="primary",
             use_container_width=True,
-            disabled=universe_df.empty,
         )
     with clear_col:
         clear_scan = st.button("Clear results", use_container_width=True)
@@ -640,6 +720,16 @@ with scanner_tab:
         st.rerun()
 
     if run_scan:
+        if universe_df.empty:
+            st.cache_data.clear()
+            universe_df = get_universe(universe_name, watchlist_text)
+        if universe_df.empty:
+            st.error(
+                f"Could not load the {universe_name} constituent list. "
+                "Please retry once. If it still fails, use My Watchlist while the source is unavailable."
+            )
+            st.stop()
+
         progress = st.progress(0.0)
         status = st.empty()
         started = time.time()
