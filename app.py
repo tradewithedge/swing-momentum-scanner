@@ -47,6 +47,15 @@ if "scan_timestamp" not in st.session_state:
     st.session_state.scan_timestamp = None
 if "scan_errors" not in st.session_state:
     st.session_state.scan_errors = []
+if "provider_health" not in st.session_state:
+    st.session_state.provider_health = {
+        "status": "UNKNOWN",
+        "provider": "Yahoo",
+        "coverage": np.nan,
+        "message": "No market scan has run yet.",
+    }
+if "last_good_scans" not in st.session_state:
+    st.session_state.last_good_scans = {}
 if "show_a_plus" not in st.session_state:
     st.session_state.show_a_plus = False
 if "a_plus_selected_ticker" not in st.session_state:
@@ -579,13 +588,16 @@ def period_start_date(period):
 def normalize_single_history(df):
     if df is None or df.empty:
         return pd.DataFrame()
+
     x = df.copy()
     if isinstance(x.columns, pd.MultiIndex):
         x.columns = [c[0] for c in x.columns]
+
     if "Date" not in x.columns:
         x = x.reset_index()
     if "Datetime" in x.columns and "Date" not in x.columns:
         x = x.rename(columns={"Datetime": "Date"})
+
     if "Date" in x.columns:
         x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
         try:
@@ -593,12 +605,58 @@ def normalize_single_history(df):
                 x["Date"] = x["Date"].dt.tz_localize(None)
         except Exception:
             pass
+
     return sanitize_ohlcv(x)
+
+
+def stooq_symbol(symbol):
+    """Map common US ticker punctuation to Stooq's symbol convention."""
+    s = clean_symbol(symbol).lower().replace("-", ".")
+    if s.startswith("^"):
+        return None
+    return f"{s}.us"
+
+
+@st.cache_data(ttl=5 * 60, show_spinner=False)
+def download_stooq(symbol, period="1y"):
+    """Independent fallback provider for individual US equities."""
+    mapped = stooq_symbol(symbol)
+    if not mapped:
+        return pd.DataFrame()
+
+    try:
+        start_date = period_start_date(period)
+        end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+        url = "https://stooq.com/q/d/l/"
+        response = requests.get(
+            url,
+            params={
+                "s": mapped,
+                "d1": start_date.strftime("%Y%m%d"),
+                "d2": end_date.strftime("%Y%m%d"),
+                "i": "d",
+            },
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        raw = response.text.strip()
+        if not raw or raw.lower().startswith("no data"):
+            return pd.DataFrame()
+
+        df = pd.read_csv(io.StringIO(raw))
+        clean = normalize_single_history(df)
+        if not clean.empty:
+            clean.attrs["download_route"] = "Stooq fallback"
+            clean.attrs["provider"] = "Stooq"
+        return clean
+    except Exception:
+        return pd.DataFrame()
 
 
 def choose_freshest_history(candidates):
     valid = []
-    for route, df in candidates:
+    for provider, route, df in candidates:
         clean = normalize_single_history(df)
         if clean.empty or "Date" not in clean.columns:
             continue
@@ -611,82 +669,78 @@ def choose_freshest_history(candidates):
                 ts = ts.tz_localize(None)
         except Exception:
             pass
-        valid.append((ts, len(clean), route, clean))
+        valid.append((ts, len(clean), provider, route, clean))
+
     if not valid:
         return pd.DataFrame()
+
     valid.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    _, _, route, best = valid[0]
+    _, _, provider, route, best = valid[0]
     best = best.copy()
     best.attrs["download_route"] = route
+    best.attrs["provider"] = provider
     return best
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def download_one(symbol, period="1y"):
-    """Try multiple yfinance paths and return the freshest valid history."""
+    """
+    Production-style individual download:
+    Yahoo primary + independent Stooq fallback.
+    Avoids hammering one provider with multiple near-identical calls.
+    """
     candidates = []
 
+    # Yahoo primary: conservative arguments for broad yfinance compatibility.
     try:
-        df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, repair=True,
-                         keepna=False, progress=False, threads=False, timeout=12)
-        candidates.append(("yf.download(period)", df))
+        df = yf.download(
+            symbol,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            timeout=12,
+        )
+        candidates.append(("Yahoo", "Yahoo / yfinance", df))
     except Exception:
         pass
 
-    try:
-        start_date = period_start_date(period)
-        end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
-        df = yf.download(symbol, start=start_date.strftime("%Y-%m-%d"),
-                         end=end_date.strftime("%Y-%m-%d"), interval="1d", auto_adjust=True,
-                         repair=True, keepna=False, progress=False, threads=False, timeout=12)
-        candidates.append(("yf.download(explicit dates)", df))
-    except Exception:
-        pass
+    # Only use independent fallback when Yahoo is empty or stale.
+    yahoo_best = choose_freshest_history(candidates)
+    yahoo_fresh = False
+    if not yahoo_best.empty:
+        yahoo_fresh, _, _, _ = market_data_freshness(yahoo_best)
 
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval="1d", auto_adjust=True, repair=True,
-                            keepna=False, timeout=12, raise_errors=False)
-        candidates.append(("Ticker.history(period)", df))
-    except Exception:
-        pass
-
-    try:
-        ticker = yf.Ticker(symbol)
-        start_date = period_start_date(period)
-        end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
-        df = ticker.history(start=start_date.strftime("%Y-%m-%d"),
-                            end=end_date.strftime("%Y-%m-%d"), interval="1d", auto_adjust=True,
-                            repair=True, keepna=False, timeout=12, raise_errors=False)
-        candidates.append(("Ticker.history(explicit dates)", df))
-    except Exception:
-        pass
+    if not yahoo_fresh:
+        stooq = download_stooq(symbol, period)
+        if not stooq.empty:
+            candidates.append(("Stooq", "Stooq fallback", stooq))
 
     return choose_freshest_history(candidates)
 
 
 @st.cache_data(ttl=SCAN_CACHE_TTL, show_spinner=False)
-def download_batch_cached(symbols_tuple):
+def download_batch_cached(symbols_tuple, conservative=False):
     symbols = list(symbols_tuple)
     if not symbols:
         return pd.DataFrame()
 
     try:
-        data = yf.download(
+        return yf.download(
             tickers=symbols,
             period="1y",
             interval="1d",
             auto_adjust=True,
-            repair=True,
-            keepna=False,
             group_by="ticker",
             progress=False,
-            threads=True,
-            timeout=20,
+            threads=False if conservative else True,
+            timeout=25,
         )
-        return data
     except Exception:
         return pd.DataFrame()
+
+
 
 def split_batch_result(data, symbol):
     if data is None or data.empty:
@@ -795,8 +849,19 @@ def compute_record(symbol, company, sector, df):
     return record
 
 def run_market_scan(universe_df, progress_bar, status_box):
+    """
+    Bulk scan with provider-health detection.
+
+    A provider outage is NOT treated as hundreds of failed stocks.
+    If Yahoo coverage collapses, abort the scan and preserve the last good result.
+    """
     if universe_df.empty:
-        return pd.DataFrame(), []
+        return pd.DataFrame(), [], {
+            "status": "NO_UNIVERSE",
+            "provider": "Yahoo",
+            "coverage": 0.0,
+            "message": "Universe is empty.",
+        }
 
     universe_df = universe_df.drop_duplicates("Ticker").reset_index(drop=True)
     metadata = universe_df.set_index("Ticker").to_dict("index")
@@ -804,15 +869,35 @@ def run_market_scan(universe_df, progress_bar, status_box):
 
     records = []
     failures = []
+    provider_batches_failed = 0
     total_batches = max(1, int(np.ceil(len(tickers) / YAHOO_BATCH_SIZE)))
 
-    for batch_no, start in enumerate(range(0, len(tickers), YAHOO_BATCH_SIZE), start=1):
-        batch = tickers[start : start + YAHOO_BATCH_SIZE]
+    for batch_no, start_i in enumerate(range(0, len(tickers), YAHOO_BATCH_SIZE), start=1):
+        batch = tickers[start_i : start_i + YAHOO_BATCH_SIZE]
         status_box.info(
-            f"Downloading batch {batch_no}/{total_batches} "
-            f"({start + 1}-{min(start + len(batch), len(tickers))} of {len(tickers)})"
+            f"Yahoo bulk download {batch_no}/{total_batches} "
+            f"({start_i + 1}-{min(start_i + len(batch), len(tickers))} of {len(tickers)})"
         )
-        raw = download_batch_cached(tuple(batch))
+
+        raw = download_batch_cached(tuple(batch), conservative=False)
+
+        # Provider-level retry: one conservative retry, not per-stock hammering.
+        valid_in_batch = sum(
+            1 for symbol in batch
+            if price_data_status(split_batch_result(raw, symbol), min_rows=126)[0]
+        )
+        if valid_in_batch < max(2, int(len(batch) * 0.20)):
+            raw_retry = download_batch_cached(tuple(batch), conservative=True)
+            retry_valid = sum(
+                1 for symbol in batch
+                if price_data_status(split_batch_result(raw_retry, symbol), min_rows=126)[0]
+            )
+            if retry_valid > valid_in_batch:
+                raw = raw_retry
+                valid_in_batch = retry_valid
+
+        if valid_in_batch < max(2, int(len(batch) * 0.20)):
+            provider_batches_failed += 1
 
         for symbol in batch:
             df = split_batch_result(raw, symbol)
@@ -830,7 +915,40 @@ def run_market_scan(universe_df, progress_bar, status_box):
 
         progress_bar.progress(min(batch_no / total_batches, 1.0))
 
-    return pd.DataFrame(records), failures
+        # Fail fast when the first two large batches are essentially empty.
+        if batch_no >= 2 and provider_batches_failed == batch_no and len(records) < 5:
+            break
+
+    coverage = len(records) / max(len(tickers), 1)
+
+    if coverage < 0.20:
+        health = {
+            "status": "PROVIDER_FAILURE",
+            "provider": "Yahoo",
+            "coverage": coverage,
+            "message": (
+                f"Yahoo bulk coverage collapsed to {len(records)}/{len(tickers)} "
+                f"({coverage:.0%}). Scan aborted to protect data integrity."
+            ),
+        }
+    elif coverage < 0.80:
+        health = {
+            "status": "DEGRADED",
+            "provider": "Yahoo",
+            "coverage": coverage,
+            "message": f"Yahoo coverage is degraded: {len(records)}/{len(tickers)} ({coverage:.0%}).",
+        }
+    else:
+        health = {
+            "status": "HEALTHY",
+            "provider": "Yahoo",
+            "coverage": coverage,
+            "message": f"Yahoo coverage healthy: {len(records)}/{len(tickers)} ({coverage:.0%}).",
+        }
+
+    return pd.DataFrame(records), failures, health
+
+
 
 # ---------------------------
 # Market regime
@@ -1394,7 +1512,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     long_bias = composite >= 15 and close > ema20
     short_bias = composite <= -15 and close < ema20
 
-    # v6.4 Tradeability & Risk Engine
+    # v6.5 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
     extended_long = (dist_ema20 > 0.08) or (rsi14 >= 75)
     extended_short = (dist_ema20 < -0.08) or (rsi14 <= 25)
@@ -1648,20 +1766,21 @@ with ticker_tab:
                 f"⚠️ **Market data unavailable for {selected_ticker}.** {reason} "
                 "No Momentum Score, Relative Strength, grade, or Trade Plan will be generated from invalid data."
             )
-            st.info("Try the ticker again shortly. The app automatically retries the data download once.")
+            st.info("Yahoo primary and an independent Stooq fallback are used for individual tickers. Retry shortly if both are unavailable.")
         else:
             data_fresh, latest_bar, expected_bar, freshness_reason = market_data_freshness(df)
-            download_route = df.attrs.get("download_route", "validated yfinance route")
+            download_route = df.attrs.get("download_route", "validated market-data route")
+            data_provider = df.attrs.get("provider", "Yahoo")
             if data_fresh:
                 st.success(
                     f"🟢 **Market data CURRENT** — {freshness_reason} "
-                    f"Retrieval: **{download_route}**."
+                    f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
             else:
                 st.error(
                     f"🔴 **DATA STALE — DO NOT ACT.** {freshness_reason} "
-                    f"Best retrieval route: **{download_route}**. "
-                    "All retrieval paths were checked; no actionable trade plan is allowed."
+                    f"Best provider: **{data_provider}** • Retrieval: **{download_route}**. "
+                    "Primary and fallback providers were checked; no actionable trade plan is allowed."
                 )
                 diag["Trade State"] = "DATA INCOMPLETE"
                 diag["Trade Block Reason"] = (
@@ -1676,7 +1795,7 @@ with ticker_tab:
             st.markdown(f"### {selected_ticker} — {selected_company}")
             st.markdown(f"## {diag['Verdict']}")
 
-            # v6.4: separate stock quality from entry quality and current action.
+            # v6.5: separate stock quality from entry quality and current action.
             candidate_points = 0
             candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
             candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
@@ -1926,6 +2045,17 @@ with ticker_tab:
 with scanner_tab:
     st.subheader("Choose scan universe")
 
+    health = st.session_state.provider_health
+    h_status = health.get("status", "UNKNOWN")
+    if h_status == "HEALTHY":
+        st.success(f"🟢 **Data Health: HEALTHY** — {health.get('message', '')}")
+    elif h_status == "DEGRADED":
+        st.warning(f"🟠 **Data Health: DEGRADED** — {health.get('message', '')}")
+    elif h_status == "PROVIDER_FAILURE":
+        st.error(f"🔴 **Data Health: PROVIDER FAILURE** — {health.get('message', '')}")
+    else:
+        st.info("🔵 **Data Health:** Run a scan to test current bulk-provider coverage.")
+
     c1, c2 = st.columns([1, 2])
     with c1:
         universe_name = st.selectbox(
@@ -2003,20 +2133,54 @@ with scanner_tab:
         status = st.empty()
         started = time.time()
 
-        results, failures = run_market_scan(universe_df, progress, status)
+        results, failures, health = run_market_scan(universe_df, progress, status)
         progress.empty()
         status.empty()
 
-        st.session_state.scan_df = results
-        st.session_state.scan_universe_name = universe_name
-        st.session_state.scan_timestamp = datetime.now()
-        st.session_state.scan_errors = failures
-
+        st.session_state.provider_health = health
         elapsed = time.time() - started
-        st.success(
-            f"Scan complete: {len(results):,}/{len(universe_df):,} symbols analyzed "
-            f"in {elapsed:.0f}s. Results stay loaded while you use the dashboard."
-        )
+
+        if health["status"] == "PROVIDER_FAILURE":
+            previous = st.session_state.last_good_scans.get(universe_name)
+            st.error(
+                f"🔴 **DATA PROVIDER FAILURE** — {health['message']} "
+                "The failed scan has NOT replaced your last valid results."
+            )
+            if previous is not None and not previous.get("df", pd.DataFrame()).empty:
+                st.session_state.scan_df = previous["df"].copy()
+                st.session_state.scan_universe_name = universe_name
+                st.session_state.scan_timestamp = previous["timestamp"]
+                st.session_state.scan_errors = previous.get("failures", [])
+                st.warning(
+                    f"Showing the last good {universe_name} scan from "
+                    f"{previous['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} instead."
+                )
+            else:
+                st.warning(
+                    "No last-good scan is available in this session. "
+                    "Please retry later rather than using an empty/partial scan."
+                )
+        else:
+            st.session_state.scan_df = results
+            st.session_state.scan_universe_name = universe_name
+            st.session_state.scan_timestamp = datetime.now()
+            st.session_state.scan_errors = failures
+
+            if health["status"] == "HEALTHY":
+                st.session_state.last_good_scans[universe_name] = {
+                    "df": results.copy(),
+                    "timestamp": st.session_state.scan_timestamp,
+                    "failures": list(failures),
+                }
+                st.success(
+                    f"Scan complete: {len(results):,}/{len(universe_df):,} symbols analyzed "
+                    f"in {elapsed:.0f}s."
+                )
+            else:
+                st.warning(
+                    f"⚠️ Scan completed with degraded coverage: "
+                    f"{len(results):,}/{len(universe_df):,} in {elapsed:.0f}s."
+                )
 
     scan_df = st.session_state.scan_df
     if not scan_df.empty:
