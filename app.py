@@ -519,6 +519,80 @@ def market_data_freshness(df):
     return fresh, latest, expected, reason
 
 
+
+def expected_recent_us_sessions(lookback_days=14):
+    """
+    Best-effort recent US business-day calendar.
+    This intentionally uses weekdays only; exchange holidays are tolerated
+    during continuity checks if neither provider supplies a bar.
+    """
+    end = expected_latest_completed_us_session()
+    start = end - pd.Timedelta(days=lookback_days * 2)
+    days = pd.date_range(start=start, end=end, freq="B")
+    return pd.DatetimeIndex(days[-lookback_days:])
+
+
+def missing_recent_sessions(df, lookback_days=14):
+    x = sanitize_ohlcv(df)
+    if x.empty or "Date" not in x.columns:
+        return list(expected_recent_us_sessions(lookback_days))
+
+    present = pd.to_datetime(x["Date"], errors="coerce").dropna()
+    present = pd.DatetimeIndex([pd.Timestamp(d).normalize() for d in present])
+
+    expected = expected_recent_us_sessions(lookback_days)
+    return [d for d in expected if d not in present]
+
+
+def merge_price_sources(primary_df, fallback_df):
+    """
+    Merge OHLCV by date, preferring primary rows and filling only missing
+    sessions from fallback.
+    """
+    p = normalize_single_history(primary_df)
+    f = normalize_single_history(fallback_df)
+
+    if p.empty and f.empty:
+        return pd.DataFrame()
+    if p.empty:
+        out = f.copy()
+        out.attrs["provider"] = f.attrs.get("provider", "Fallback")
+        out.attrs["download_route"] = f.attrs.get("download_route", "fallback only")
+        return out
+    if f.empty:
+        return p.copy()
+
+    p = p.copy()
+    f = f.copy()
+    p["Date"] = pd.to_datetime(p["Date"]).dt.normalize()
+    f["Date"] = pd.to_datetime(f["Date"]).dt.normalize()
+
+    p = p.drop_duplicates("Date", keep="last").set_index("Date")
+    f = f.drop_duplicates("Date", keep="last").set_index("Date")
+
+    combined = p.combine_first(f).reset_index().sort_values("Date")
+    combined = sanitize_ohlcv(combined)
+
+    # Preserve source metadata.
+    combined.attrs["provider"] = "Yahoo + Stooq"
+    combined.attrs["download_route"] = "Yahoo primary + Stooq gap fill"
+    return combined
+
+
+def continuity_status(df, lookback_days=14):
+    """
+    Return (ok, missing_dates, message) for recent-session continuity.
+    Weekend/holiday false positives are minimized by looking only at weekdays;
+    unresolved dates are reported explicitly.
+    """
+    missing = missing_recent_sessions(df, lookback_days=lookback_days)
+    if not missing:
+        return True, [], f"No missing weekday sessions in the last {lookback_days} expected sessions."
+
+    formatted = ", ".join(pd.Timestamp(d).strftime("%d-%b-%Y") for d in missing)
+    return False, missing, f"Missing recent session(s): {formatted}."
+
+
 def chart_frame_for_timeframe(base_df, timeframe):
     base = sanitize_ohlcv(base_df).copy()
     if base.empty:
@@ -685,15 +759,13 @@ def choose_freshest_history(candidates):
 @st.cache_data(ttl=60, show_spinner=False)
 def download_one(symbol, period="1y"):
     """
-    Production-style individual download:
-    Yahoo primary + independent Stooq fallback.
-    Avoids hammering one provider with multiple near-identical calls.
+    Individual download with continuity repair:
+    Yahoo primary, Stooq fallback, then date-by-date merge when Yahoo is stale
+    or has recent session gaps.
     """
-    candidates = []
-
-    # Yahoo primary: conservative arguments for broad yfinance compatibility.
+    yahoo = pd.DataFrame()
     try:
-        df = yf.download(
+        yahoo = yf.download(
             symbol,
             period=period,
             interval="1d",
@@ -702,22 +774,31 @@ def download_one(symbol, period="1y"):
             threads=False,
             timeout=12,
         )
-        candidates.append(("Yahoo", "Yahoo / yfinance", df))
+        yahoo = normalize_single_history(yahoo)
+        if not yahoo.empty:
+            yahoo.attrs["provider"] = "Yahoo"
+            yahoo.attrs["download_route"] = "Yahoo / yfinance"
     except Exception:
-        pass
+        yahoo = pd.DataFrame()
 
-    # Only use independent fallback when Yahoo is empty or stale.
-    yahoo_best = choose_freshest_history(candidates)
     yahoo_fresh = False
-    if not yahoo_best.empty:
-        yahoo_fresh, _, _, _ = market_data_freshness(yahoo_best)
+    yahoo_continuous = False
+    if not yahoo.empty:
+        yahoo_fresh, _, _, _ = market_data_freshness(yahoo)
+        yahoo_continuous, _, _ = continuity_status(yahoo, lookback_days=14)
 
-    if not yahoo_fresh:
-        stooq = download_stooq(symbol, period)
-        if not stooq.empty:
-            candidates.append(("Stooq", "Stooq fallback", stooq))
+    # If Yahoo is both current and continuous, avoid extra network load.
+    if yahoo_fresh and yahoo_continuous:
+        return yahoo
 
-    return choose_freshest_history(candidates)
+    stooq = download_stooq(symbol, period)
+
+    # Merge by date to fill specific missing sessions.
+    merged = merge_price_sources(yahoo, stooq)
+    if not merged.empty:
+        return merged
+
+    return yahoo if not yahoo.empty else stooq
 
 
 @st.cache_data(ttl=SCAN_CACHE_TTL, show_spinner=False)
@@ -1512,7 +1593,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     long_bias = composite >= 15 and close > ema20
     short_bias = composite <= -15 and close < ema20
 
-    # v6.5 Tradeability & Risk Engine
+    # v6.6 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
     extended_long = (dist_ema20 > 0.08) or (rsi14 >= 75)
     extended_short = (dist_ema20 < -0.08) or (rsi14 <= 25)
@@ -1769,13 +1850,27 @@ with ticker_tab:
             st.info("Yahoo primary and an independent Stooq fallback are used for individual tickers. Retry shortly if both are unavailable.")
         else:
             data_fresh, latest_bar, expected_bar, freshness_reason = market_data_freshness(df)
+            continuity_ok, missing_dates, continuity_reason = continuity_status(df, lookback_days=14)
             download_route = df.attrs.get("download_route", "validated market-data route")
             data_provider = df.attrs.get("provider", "Yahoo")
-            if data_fresh:
+
+            if data_fresh and continuity_ok:
                 st.success(
-                    f"🟢 **Market data CURRENT** — {freshness_reason} "
-                    f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
+                    f"🟢 **Market data CURRENT + CONTINUOUS** — {freshness_reason} "
+                    f"{continuity_reason} Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
+            elif data_fresh and not continuity_ok:
+                st.error(
+                    f"🔴 **DATA GAP — DO NOT ACT.** {continuity_reason} "
+                    f"Provider: **{data_provider}** • Retrieval: **{download_route}**. "
+                    "No actionable trade plan is allowed until the gap is repaired."
+                )
+                diag["Trade State"] = "DATA GAP"
+                diag["Trade Block Reason"] = continuity_reason
+                diag["Bias"] = "WAIT"
+                diag["Entry Low"] = diag["Entry High"] = diag["Stop"] = np.nan
+                diag["Target 1"] = diag["Target 2"] = diag["RR"] = np.nan
+                diag["Stop %"] = np.nan
             else:
                 st.error(
                     f"🔴 **DATA STALE — DO NOT ACT.** {freshness_reason} "
@@ -1795,7 +1890,7 @@ with ticker_tab:
             st.markdown(f"### {selected_ticker} — {selected_company}")
             st.markdown(f"## {diag['Verdict']}")
 
-            # v6.5: separate stock quality from entry quality and current action.
+            # v6.6: separate stock quality from entry quality and current action.
             candidate_points = 0
             candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
             candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
@@ -1813,8 +1908,8 @@ with ticker_tab:
             else:
                 candidate_quality = "C"
 
-            if not data_fresh:
-                entry_quality = "N/A — DATA STALE"
+            if (not data_fresh) or (not continuity_ok):
+                entry_quality = "N/A — DATA ISSUE"
                 action_label = "DO NOT ACT"
             elif diag["Trade State"] == "ACTIONABLE":
                 sp = diag.get("Stop %", np.nan)
@@ -2282,6 +2377,15 @@ with scanner_tab:
                 if detail_df.empty:
                     st.warning(f"No chart data is available for {selected_aplus} right now.")
                 else:
+                    aplus_fresh, _, _, aplus_fresh_reason = market_data_freshness(detail_df)
+                    aplus_continuous, _, aplus_cont_reason = continuity_status(detail_df, lookback_days=14)
+                    if aplus_fresh and aplus_continuous:
+                        st.success(f"🟢 Chart data current and continuous. {aplus_fresh_reason}")
+                    else:
+                        st.warning(
+                            f"⚠️ Chart data issue: {aplus_fresh_reason} {aplus_cont_reason} "
+                            "Treat setup status as non-actionable until data is complete."
+                        )
                     d = detail_df.tail(120).copy()
                     d["EMA20"] = d["Close"].ewm(span=20, adjust=False).mean()
                     d["EMA50"] = d["Close"].ewm(span=50, adjust=False).mean()
