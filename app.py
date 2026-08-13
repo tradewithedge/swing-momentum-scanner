@@ -1,4 +1,5 @@
-# Quality Engine v6.9 — Quantitative Entry Repair Map\n
+# Quality Engine v7.0 — Phase 1 Final (Completed-Session + Event Risk Integrity)
+
 import io
 import time
 from datetime import datetime
@@ -30,7 +31,7 @@ YAHOO_BATCH_SIZE = 120
 SCAN_CACHE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-PHASE1_ENGINE_VERSION = "v7.0-P1.1"
+PHASE1_ENGINE_VERSION = "v7.0-P1.2"
 EARNINGS_HARD_BLOCK_DAYS = 3
 EARNINGS_CAUTION_DAYS = 14
 RECENT_EARNINGS_GRACE_DAYS = 5
@@ -712,8 +713,8 @@ def sanitize_ohlcv(df):
 
 
 def price_data_status(df, min_rows=80):
-    """Return (is_valid, reason) for diagnostic/scanner calculations."""
-    x = sanitize_ohlcv(df)
+    """Return (is_valid, reason) using completed daily sessions only."""
+    x = completed_session_frame(df)
     if x.empty:
         return False, "No valid OHLC price rows were returned."
     if len(x) < min_rows:
@@ -735,7 +736,14 @@ def expected_latest_completed_us_session(now=None):
     18:00 New York cutoff so Yahoo has time to publish the completed bar.
     """
     try:
-        now_ny = pd.Timestamp.now(tz="America/New_York") if now is None else pd.Timestamp(now).tz_convert("America/New_York")
+        if now is None:
+            now_ny = pd.Timestamp.now(tz="America/New_York")
+        else:
+            now_ny = pd.Timestamp(now)
+            if now_ny.tzinfo is None:
+                now_ny = now_ny.tz_localize("America/New_York")
+            else:
+                now_ny = now_ny.tz_convert("America/New_York")
     except Exception:
         now_ny = pd.Timestamp.now(tz="America/New_York")
 
@@ -750,8 +758,43 @@ def expected_latest_completed_us_session(now=None):
     return expected.tz_localize(None).normalize()
 
 
-def market_data_freshness(df):
+def completed_session_frame(df, now=None):
+    """Return only completed US daily bars for signal/scoring calculations.
+
+    Yahoo can expose an in-progress same-day daily candle during the regular
+    session. Swing signals must not use that partial bar because volume, close,
+    RSI, momentum, ATR and EMA location are still changing. The raw provider
+    frame may retain it, but the decision engine works only from sessions at or
+    before the latest expected completed US session.
+    """
+    attrs = dict(getattr(df, "attrs", {}) or {}) if df is not None else {}
     x = sanitize_ohlcv(df)
+    if x.empty or "Date" not in x.columns:
+        return x
+
+    x = x.copy()
+    x["Date"] = pd.to_datetime(x["Date"], errors="coerce")
+    x = x.dropna(subset=["Date"])
+    try:
+        if x["Date"].dt.tz is not None:
+            x["Date"] = x["Date"].dt.tz_localize(None)
+    except Exception:
+        pass
+
+    x["Date"] = x["Date"].dt.normalize()
+    raw_latest = x["Date"].max() if not x.empty else pd.NaT
+    cutoff = expected_latest_completed_us_session(now=now)
+    x = x[x["Date"] <= cutoff].sort_values("Date").drop_duplicates("Date", keep="last").reset_index(drop=True)
+
+    x.attrs.update(attrs)
+    x.attrs["signal_session_cutoff"] = cutoff
+    x.attrs["raw_latest_date"] = raw_latest
+    x.attrs["excluded_incomplete_session"] = bool(pd.notna(raw_latest) and raw_latest > cutoff)
+    return x
+
+
+def market_data_freshness(df):
+    x = completed_session_frame(df)
     if x.empty or "Date" not in x.columns:
         return False, pd.NaT, pd.NaT, "No valid dated OHLCV rows."
 
@@ -784,7 +827,7 @@ def expected_recent_us_sessions(lookback_days=14):
 
 
 def missing_recent_sessions(df, lookback_days=14):
-    x = sanitize_ohlcv(df)
+    x = completed_session_frame(df)
     if x.empty or "Date" not in x.columns:
         return list(expected_recent_us_sessions(lookback_days))
 
@@ -893,7 +936,7 @@ def data_confidence(df, recent_lookback=14):
             "level": "HIGH",
             "score": 100,
             "block": False,
-            "message": "Latest session is current and no recent weekday gaps were detected.",
+            "message": "Latest completed session is current and no recent weekday gaps were detected.",
             "missing": [],
         }
 
@@ -904,7 +947,7 @@ def data_confidence(df, recent_lookback=14):
             "score": 70,
             "block": False,
             "message": (
-                f"Latest session is current, but one isolated recent data gap was detected: {d}. "
+                f"Latest completed session is current, but one isolated recent data gap was detected: {d}. "
                 "Signals remain usable with reduced confidence."
             ),
             "missing": missing,
@@ -940,6 +983,15 @@ def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan
     if not np.isfinite(dist) or not np.isfinite(rsi_value):
         return {"state": "NO TRADE", "quality": "UNKNOWN", "block": True, "reason": "Entry location could not be validated."}
 
+    # Confirmed/unknown earnings risk is the primary hard gate for a directional
+    # swing setup. Price defects are still diagnosed separately and are
+    # recalculated after the event has passed or been verified.
+    if event_block:
+        return {
+            "state": "WAIT — EVENT RISK", "quality": "WAIT", "block": True,
+            "reason": event_reason or "Earnings/event timing is not safely verified.",
+        }
+
     if direction == "LONG" and (dist > 8.0 or rsi_value >= 75):
         return {
             "state": "WAIT FOR PULLBACK", "quality": "WAIT", "block": True,
@@ -963,17 +1015,11 @@ def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan
                 "reason": f"Required stop is only {stop_value:.1%}, too tight for a normal swing setup.",
             }
 
-    if event_block:
-        return {
-            "state": "WAIT — EVENT RISK", "quality": "WAIT", "block": True,
-            "reason": event_reason or "Earnings/event timing is not safely verified.",
-        }
-
     return {"state": "ACTIONABLE", "quality": "PASS", "block": False, "reason": ""}
 
 
 def chart_frame_for_timeframe(base_df, timeframe):
-    base = sanitize_ohlcv(base_df).copy()
+    base = completed_session_frame(base_df).copy()
     if base.empty:
         return base
 
@@ -1237,7 +1283,7 @@ def compute_record(symbol, company, sector, df):
     if not valid:
         return None
 
-    x = sanitize_ohlcv(df)
+    x = completed_session_frame(df)
     x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
     x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
     x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
@@ -1439,7 +1485,7 @@ def market_regime():
     rows = []
 
     for symbol, weight in [("SPY", 2), ("QQQ", 2), ("IWM", 1)]:
-        df = download_one(symbol, "1y")
+        df = completed_session_frame(download_one(symbol, "1y"))
         valid, _ = price_data_status(df, min_rows=126)
         if not valid:
             rows.append((symbol, "Unavailable"))
@@ -1463,7 +1509,7 @@ def market_regime():
         score += 0.5 if last > ema200 else -0.5
         rows.append((symbol, signal))
 
-    vix_df = download_one("^VIX", "6mo")
+    vix_df = completed_session_frame(download_one("^VIX", "6mo"))
     vix = np.nan
     if not vix_df.empty:
         vix = float(vix_df["Close"].iloc[-1])
@@ -1529,7 +1575,7 @@ def build_ranked_master(df):
     # ---------------------------
     # Relative Strength vs SPY
     # ---------------------------
-    spy_df = download_one("SPY", "1y")
+    spy_df = completed_session_frame(download_one("SPY", "1y"))
     if not spy_df.empty and len(spy_df) >= 127:
         spy_1m = float(spy_df["Close"].pct_change(20).iloc[-1])
         spy_3m = float(spy_df["Close"].pct_change(60).iloc[-1])
@@ -1895,7 +1941,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     if not valid:
         return {"Data Valid": False, "Data Error": reason}
 
-    x = sanitize_ohlcv(df)
+    x = completed_session_frame(df)
     x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
     x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
     x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
@@ -2006,7 +2052,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     rs_text = "N/A"
     rs_score = np.nan
     rs_1m = rs_3m = rs_6m = np.nan
-    spy = download_one("SPY", "1y")
+    spy = completed_session_frame(download_one("SPY", "1y"))
     if not spy.empty and len(spy) >= 127:
         spy_1m = float(spy["Close"].pct_change(20).iloc[-1])
         spy_3m = float(spy["Close"].pct_change(60).iloc[-1])
@@ -2215,25 +2261,31 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     if long_bias and extension == "Extended":
         chase_risk = "Elevated"
         trade_comment = (
-            "Strong momentum, but chase risk is elevated. "
+            "Technical direction is bullish, but chase risk is elevated. "
             "Prefer a pullback toward EMA20 / support or fresh confirmation rather than chasing."
         )
     elif short_bias and extension == "Oversold":
         chase_risk = "Elevated"
         trade_comment = (
-            "Bearish momentum is strong, but the stock is stretched lower. "
+            "Technical direction is bearish, but the stock is stretched lower. "
             "Prefer a bounce/rejection setup rather than chasing weakness."
         )
-    elif bias == "LONG":
-        trade_comment = "Momentum and trend are constructive; focus on entry quality and risk/reward."
-    elif bias == "SHORT":
-        trade_comment = "Bearish momentum and trend are constructive for shorts; focus on entry quality."
+    elif long_bias:
+        trade_comment = "Trend, momentum and relative strength are constructive on completed daily bars."
+    elif short_bias:
+        trade_comment = "Trend, momentum and relative strength are constructive for shorts on completed daily bars."
     else:
         trade_comment = "Momentum/trend alignment is mixed. Waiting for confirmation is preferable."
+
+    if trade_state != "ACTIONABLE" and trade_block_reason and (long_bias or short_bias):
+        trade_comment += f" Current action remains WAIT because: {trade_block_reason}"
 
     return {
         "Data Valid": True,
         "Data Error": "",
+        "Signal Session": pd.Timestamp(latest["Date"]).normalize() if "Date" in latest.index and pd.notna(latest["Date"]) else pd.NaT,
+        "In-Progress Session Excluded": bool(x.attrs.get("excluded_incomplete_session", False)),
+        "Raw Latest Date": x.attrs.get("raw_latest_date", pd.NaT),
         "Ticker": symbol, "Company": company, "Close": close,
         "Daily": daily, "Weekly": weekly, "Monthly": monthly, "Momentum Score": composite,
         "Momentum Grade": momentum_grade,
@@ -2368,9 +2420,8 @@ with ticker_tab:
                 diag["Stop %"] = np.nan
 
             st.markdown(f"### {selected_ticker} — {selected_company}")
-            st.markdown(f"## {diag['Verdict']}")
 
-            # v6.9: separate stock quality from entry quality and current action.
+            # Phase 1: separate stock quality from entry quality and current action.
             candidate_points = 0
             candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
             candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
@@ -2392,6 +2443,19 @@ with ticker_tab:
                 candidate_quality = "B"
             else:
                 candidate_quality = "C"
+
+            if confidence["block"]:
+                headline_action = "DO NOT ACT / DATA ISSUE"
+            elif diag["Trade State"] == "ACTIONABLE":
+                headline_action = f"{diag['Bias']} / ACTIONABLE"
+            elif diag["Trade State"] == "WAIT — EVENT RISK":
+                headline_action = "WAIT / EVENT RISK"
+            elif diag["Trade State"] == "WAIT — VERIFY EARNINGS":
+                headline_action = "WAIT / VERIFY EARNINGS"
+            else:
+                headline_action = str(diag["Trade State"]).replace(" — ", " / ")
+
+            st.markdown(f"## {candidate_quality} CANDIDATE — {headline_action}")
 
             if confidence["block"]:
                 entry_quality = "N/A — DATA ISSUE"
@@ -2424,12 +2488,19 @@ with ticker_tab:
             cq4.metric("Price Data Confidence", confidence["level"])
             st.caption(
                 "Quality Engine: **Candidate Quality** asks whether the stock is worth watching; "
-                "**Entry Quality** asks whether today's location/risk is acceptable; "
+                "**Entry Quality** asks whether the latest completed-session location/risk is acceptable; "
                 "**Action** is the current decision. A strong candidate can correctly remain WAIT."
             )
 
+            signal_session = diag.get("Signal Session", pd.NaT)
+            signal_session_text = pd.Timestamp(signal_session).strftime("%d-%b-%Y") if pd.notna(signal_session) else "N/A"
+            session_note = f"Technical signals use completed US daily bars only. Signal session: **{signal_session_text}**."
+            if diag.get("In-Progress Session Excluded", False):
+                session_note += " The provider's in-progress same-day daily candle was excluded from scoring."
+            st.info(session_note)
+
             v1, v2, v3, v4 = st.columns(4)
-            v1.metric("Close", fmt_price(diag["Close"]))
+            v1.metric("Signal Close", fmt_price(diag["Close"]))
             v2.metric("Momentum Score", f"{diag['Momentum Score']:.1f}")
             v3.metric("Trend", diag["Trend"])
             v4.metric("RS vs SPY", diag["RS vs SPY"])
@@ -2494,7 +2565,7 @@ with ticker_tab:
             accel_delta = diag["Acceleration Delta"]
             st.caption(
                 f"Momentum quality: **{diag['Momentum Grade']}** • "
-                "Momentum state compares the absolute strength of today's Momentum Score with the score 5 trading days ago. "
+                "Momentum state compares the absolute strength of the current completed-session Momentum Score with the score 5 trading days ago. "
                 "A ≥10-point increase in magnitude = Accelerating; a ≥10-point decrease in magnitude = Decelerating."
             )
 
@@ -2762,7 +2833,22 @@ with ticker_tab:
                     if pd.notna(vol_now) and vol_now < 1.0:
                         repair_items.append(f"Volume is {vol_now:.2f}x; prefer ≥1.0x, with ≥1.2x stronger.")
 
-                if bullish_candidate or bearish_candidate:
+                event_primary_block = diag.get("Earnings Risk State") in {"HIGH", "UNKNOWN"}
+                publish_price_repair = (bullish_candidate or bearish_candidate) and not event_primary_block and not confidence["block"]
+
+                if event_primary_block:
+                    if diag.get("Earnings Risk State") == "HIGH":
+                        st.info(
+                            "**No pre-earnings price repair area is published.** The confirmed earnings event is the primary blocker. "
+                            "Wait through the event, then rerun the ticker so price structure, volume, ATR, momentum, RSI and EMA location "
+                            "are recalculated from completed post-event daily bars."
+                        )
+                    else:
+                        st.info(
+                            "**No price repair area is published while earnings timing is unverified.** Verify the event first, then "
+                            "recalculate the setup from completed daily bars."
+                        )
+                elif publish_price_repair:
                     r1, r2, r3 = st.columns(3)
                     r1.metric("Preferred Repair Area", f"{fmt_price(preferred_low)} – {fmt_price(preferred_high)}")
                     r2.metric(
@@ -2778,7 +2864,7 @@ with ticker_tab:
                     )
 
                     st.info(
-                        "**Confirmation is dynamic after repair.** The engine will NOT use today's high/low as a permanent trigger. "
+                        "**Confirmation is dynamic after repair.** The engine will NOT use the current completed bar's high/low as a permanent trigger. "
                         "After the pullback, bounce, or base forms, rerun the ticker. The engine then recalculates momentum, RS, RSI, "
                         "volume, stop distance and the new local price structure before publishing an actionable trade plan."
                     )
