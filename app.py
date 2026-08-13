@@ -1,4 +1,4 @@
-# Quality Engine v6.8 — Quantitative Entry Repair Map\n
+# Quality Engine v6.9 — Quantitative Entry Repair Map\n
 import io
 import time
 from datetime import datetime
@@ -1235,9 +1235,9 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
         total_w = sum(w for _, w in valid)
         return sum(v * w for v, w in valid) / total_w
 
-    x["RS Composite"] = x.apply(rs_composite, axis=1)
+    x["RS Edge"] = x.apply(rs_composite, axis=1)
     x["RS Rating"] = (
-        x["RS Composite"]
+        x["RS Edge"]
         .rank(pct=True, method="average", na_option="bottom")
         .mul(99)
         .add(1)
@@ -1316,8 +1316,8 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
         & (x["Close"] < x["EMA200"])
     )
 
-    long_rs = (x["RS Rating"] >= 70) & (x["RS Composite"] > 0)
-    short_rs = (x["RS Rating"] <= 31) & (x["RS Composite"] < 0)
+    long_rs = (x["RS Rating"] >= 70) & (x["RS Edge"] > 0)
+    short_rs = (x["RS Rating"] <= 31) & (x["RS Edge"] < 0)
 
     long_location = (
         x["EMA20 Distance %"].between(-2.5, 8.0, inclusive="both")
@@ -1362,7 +1362,7 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     # entry location 10, risk/ATR 5, regime fit 5.
     long_score = (
         np.where(long_trend, 25, np.where((x["Close"] > x["EMA50"]) & (x["Close"] > x["EMA200"]), 15, 0))
-        + np.where(long_rs, 20, np.where((x["RS Rating"] >= 55) & (x["RS Composite"] > 0), 10, 0))
+        + np.where(long_rs, 20, np.where((x["RS Rating"] >= 55) & (x["RS Edge"] > 0), 10, 0))
         + np.where((x["Momentum Score"] >= 40) & long_persistence, 15,
                    np.where(x["Momentum Score"] >= 25, 10, np.where(x["Momentum Score"] >= 15, 5, 0)))
         + np.where(liquidity_ok, 10, 0)
@@ -1374,7 +1374,7 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
 
     short_score = (
         np.where(short_trend, 25, np.where((x["Close"] < x["EMA50"]) & (x["Close"] < x["EMA200"]), 15, 0))
-        + np.where(short_rs, 20, np.where((x["RS Rating"] <= 45) & (x["RS Composite"] < 0), 10, 0))
+        + np.where(short_rs, 20, np.where((x["RS Rating"] <= 45) & (x["RS Edge"] < 0), 10, 0))
         + np.where((x["Momentum Score"] <= -40) & short_persistence, 15,
                    np.where(x["Momentum Score"] <= -25, 10, np.where(x["Momentum Score"] <= -15, 5, 0)))
         + np.where(liquidity_ok, 10, 0)
@@ -1508,7 +1508,7 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     # RS and volume are tie-breakers only.
     x["Adjusted Score"] = (
         x["Quality Score"]
-        + x["RS Composite"].fillna(0).clip(-10, 10) * 0.20
+        + x["RS Edge"].fillna(0).clip(-10, 10) * 0.20
         + (x["Volume Ratio"].fillna(1) - 1).clip(-0.5, 1.5) * 2.0
     )
     x["Adjusted Score"] = x["Adjusted Score"].replace([np.inf, -np.inf], np.nan).fillna(-9999.0)
@@ -1567,15 +1567,25 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     prev_monthly = momentum_score(prev["1M %"], 350) if pd.notna(prev["1M %"]) else np.nan
 
     acceleration_delta = np.nan
+    prev_momentum_score = np.nan
     if all(pd.notna(v) for v in [prev_daily, prev_weekly, prev_monthly]):
-        prev_composite = prev_daily * 0.40 + prev_weekly * 0.35 + prev_monthly * 0.25
-        acceleration_delta = composite - prev_composite
-        if acceleration_delta >= 10:
-            acceleration = "Accelerating ↑"
-        elif acceleration_delta <= -10:
-            acceleration = "Weakening ↓"
+        prev_momentum_score = prev_daily * 0.40 + prev_weekly * 0.35 + prev_monthly * 0.25
+        acceleration_delta = composite - prev_momentum_score
+
+        same_direction = (
+            (composite > 0 and prev_momentum_score > 0) or
+            (composite < 0 and prev_momentum_score < 0)
+        )
+        magnitude_change = abs(composite) - abs(prev_momentum_score)
+
+        if same_direction and magnitude_change >= 10:
+            acceleration = "Accelerating"
+        elif same_direction and magnitude_change <= -10:
+            acceleration = "Decelerating"
+        elif not same_direction and abs(composite) >= 15:
+            acceleration = "Direction Shift"
         else:
-            acceleration = "Stable →"
+            acceleration = "Stable"
     else:
         acceleration = "N/A"
 
@@ -1672,7 +1682,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     long_bias = composite >= 15 and close > ema20
     short_bias = composite <= -15 and close < ema20
 
-    # v6.8 Tradeability & Risk Engine
+    # v6.9 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
     extended_long = (dist_ema20 > 0.08) or (rsi14 >= 75)
     extended_short = (dist_ema20 < -0.08) or (rsi14 <= 25)
@@ -1836,6 +1846,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Daily": daily, "Weekly": weekly, "Monthly": monthly, "Momentum Score": composite,
         "Momentum Grade": momentum_grade,
         "Acceleration": acceleration, "Acceleration Delta": acceleration_delta,
+        "Previous Momentum Score": prev_momentum_score,
         "Trend": trend, "RSI14": rsi14,
         "Volume Ratio": vol_ratio, "Extension": extension,
         "Distance EMA20": dist_ema20,
@@ -1843,7 +1854,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "RS 1M vs SPY": rs_1m,
         "RS 3M vs SPY": rs_3m,
         "RS 6M vs SPY": rs_6m,
-        "RS Composite": rs_score,
+        "RS Edge": rs_score,
         "Chase Risk": chase_risk,
         "Trade Comment": trade_comment,
         "Sector": sector, "Industry": industry, "Earnings": earnings_text,
@@ -1961,12 +1972,17 @@ with ticker_tab:
             st.markdown(f"### {selected_ticker} — {selected_company}")
             st.markdown(f"## {diag['Verdict']}")
 
-            # v6.8: separate stock quality from entry quality and current action.
+            # v6.9: separate stock quality from entry quality and current action.
             candidate_points = 0
             candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
             candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
-            candidate_points += 2 if pd.notna(diag["RS Composite"]) and abs(diag["RS Composite"]) >= 15 else (1 if pd.notna(diag["RS Composite"]) and abs(diag["RS Composite"]) >= 5 else 0)
+            candidate_points += 2 if pd.notna(diag["RS Edge"]) and abs(diag["RS Edge"]) >= 15 else (1 if pd.notna(diag["RS Edge"]) and abs(diag["RS Edge"]) >= 5 else 0)
             candidate_points += 1 if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] >= 1.2 else 0
+
+            # Near-term momentum deterioration matters, but does not contaminate Entry Quality.
+            # One-point penalty prevents stale 3M/6M RS leadership from preserving A+ indefinitely.
+            if diag["Acceleration"] == "Decelerating":
+                candidate_points -= 1
 
             if candidate_points >= 6:
                 candidate_quality = "A+"
@@ -2017,14 +2033,38 @@ with ticker_tab:
             v1, v2, v3, v4 = st.columns(4)
             v1.metric("Close", fmt_price(diag["Close"]))
             v2.metric("Momentum Score", f"{diag['Momentum Score']:.1f}")
-            if diag["Acceleration"] == "Accelerating ↑":
-                st.success("Momentum: Accelerating ↑")
-            elif diag["Acceleration"] == "Weakening ↓":
-                st.warning("Momentum: Weakening ↓")
-            else:
-                st.info(f"Momentum: {diag['Acceleration']}")
             v3.metric("Trend", diag["Trend"])
             v4.metric("RS vs SPY", diag["RS vs SPY"])
+
+            prev_mom = diag.get("Previous Momentum Score", np.nan)
+            mom_delta = diag.get("Acceleration Delta", np.nan)
+            if pd.notna(prev_mom) and pd.notna(mom_delta):
+                if diag["Acceleration"] == "Accelerating":
+                    st.success(
+                        f"Momentum: **Accelerating** — 5 trading days ago **{prev_mom:.1f}** "
+                        f"→ now **{diag['Momentum Score']:.1f}** "
+                        f"({mom_delta:+.1f} pts)."
+                    )
+                elif diag["Acceleration"] == "Decelerating":
+                    st.warning(
+                        f"Momentum: **Decelerating** — 5 trading days ago **{prev_mom:.1f}** "
+                        f"→ now **{diag['Momentum Score']:.1f}** "
+                        f"({mom_delta:+.1f} pts)."
+                    )
+                elif diag["Acceleration"] == "Direction Shift":
+                    st.warning(
+                        f"Momentum: **Direction Shift** — 5 trading days ago **{prev_mom:.1f}** "
+                        f"→ now **{diag['Momentum Score']:.1f}** "
+                        f"({mom_delta:+.1f} pts)."
+                    )
+                else:
+                    st.info(
+                        f"Momentum: **Stable** — 5 trading days ago **{prev_mom:.1f}** "
+                        f"→ now **{diag['Momentum Score']:.1f}** "
+                        f"({mom_delta:+.1f} pts)."
+                    )
+            else:
+                st.info("Momentum change comparison is unavailable.")
 
             st.caption(
                 "Relative Strength = the stock's return minus SPY's return. "
@@ -2034,10 +2074,10 @@ with ticker_tab:
             rs1.metric("RS 1M", "N/A" if pd.isna(diag["RS 1M vs SPY"]) else f"{diag['RS 1M vs SPY']:+.1f} pp")
             rs2.metric("RS 3M", "N/A" if pd.isna(diag["RS 3M vs SPY"]) else f"{diag['RS 3M vs SPY']:+.1f} pp")
             rs3.metric("RS 6M", "N/A" if pd.isna(diag["RS 6M vs SPY"]) else f"{diag['RS 6M vs SPY']:+.1f} pp")
-            rs4.metric("RS Composite", "N/A" if pd.isna(diag["RS Composite"]) else f"{diag['RS Composite']:+.1f}")
+            rs4.metric("RS Edge", "N/A" if pd.isna(diag["RS Edge"]) else f"{diag['RS Edge']:+.1f}")
 
             st.caption(
-                "RS Composite = 20% × RS 1M + 35% × RS 3M + 45% × RS 6M. "
+                "RS Edge = 20% × RS 1M + 35% × RS 3M + 45% × RS 6M. "
                 "Values are percentage points of outperformance/underperformance vs SPY."
             )
 
@@ -2045,7 +2085,7 @@ with ticker_tab:
             st.info(
                 "**Momentum Score range: -100 to +100.** Formula = 40% Daily + 35% Weekly + 25% Monthly. "
                 "Daily uses 1 trading day, Weekly 5 trading days, Monthly 20 trading days. "
-                "Each component is scaled/capped to a -100 to +100 score, so the composite is a momentum score, not a % return."
+                "Each component is scaled/capped to a -100 to +100 score, so the final Momentum Score is a weighted momentum reading, not a % return."
             )
 
             m1, m2, m3 = st.columns(3)
@@ -2054,19 +2094,11 @@ with ticker_tab:
             m3.metric("Monthly score", f"{diag['Monthly']:.1f}")
 
             accel_delta = diag["Acceleration Delta"]
-            if pd.notna(accel_delta):
-                if accel_delta >= 10:
-                    accel_rule = "Accelerating because momentum score improved by at least +10 points vs 5 trading days ago."
-                elif accel_delta <= -10:
-                    accel_rule = "Weakening because momentum score fell by at least -10 points vs 5 trading days ago."
-                else:
-                    accel_rule = "Stable because the momentum score changed by less than 10 points vs 5 trading days ago."
-                st.caption(
-                    f"Momentum quality: **{diag['Momentum Grade']}** • "
-                    f"5-day momentum change: **{accel_delta:+.1f} pts** • {accel_rule}"
-                )
-            else:
-                st.caption(f"Momentum quality: **{diag['Momentum Grade']}** • 5-day acceleration comparison unavailable.")
+            st.caption(
+                f"Momentum quality: **{diag['Momentum Grade']}** • "
+                "Momentum state compares the absolute strength of today's Momentum Score with the score 5 trading days ago. "
+                "A ≥10-point increase in magnitude = Accelerating; a ≥10-point decrease in magnitude = Decelerating."
+            )
 
             q1, q2, q3, q4 = st.columns(4)
             q1.metric("RSI(14)", f"{diag['RSI14']:.1f}")
@@ -2129,8 +2161,8 @@ with ticker_tab:
                     strengths.append(f"Strong trend: {diag['Trend']}")
                 elif diag["Trend"] in ("Bullish", "Bearish"):
                     strengths.append(f"Directional trend: {diag['Trend']}")
-                if pd.notna(diag["RS Composite"]) and abs(diag["RS Composite"]) >= 5:
-                    strengths.append(f"Relative strength edge vs SPY: {diag['RS Composite']:+.1f} pp")
+                if pd.notna(diag["RS Edge"]) and abs(diag["RS Edge"]) >= 5:
+                    strengths.append(f"Relative strength edge vs SPY: {diag['RS Edge']:+.1f} pp")
                 if abs(diag["Momentum Score"]) >= 40:
                     strengths.append(f"Momentum Score: {diag['Momentum Score']:.1f}")
                 if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] >= 1.2:
@@ -2146,8 +2178,15 @@ with ticker_tab:
                 risks = []
                 if diag["Extension"] in ("Extended", "Oversold"):
                     risks.append(f"Entry location: {diag['Extension']}")
-                if diag["Acceleration"] == "Weakening ↓":
-                    risks.append("Momentum is weakening")
+                if diag["Acceleration"] == "Decelerating":
+                    prev_mom = diag.get("Previous Momentum Score", np.nan)
+                    if pd.notna(prev_mom):
+                        risks.append(
+                            f"Momentum is decelerating: {prev_mom:.1f} → {diag['Momentum Score']:.1f} "
+                            f"({diag['Acceleration Delta']:+.1f} pts in 5 trading days)"
+                        )
+                    else:
+                        risks.append("Momentum is decelerating")
                 if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 0.75:
                     risks.append(f"Volume is weak: {diag['Volume Ratio']:.2f}x")
                 if confidence["level"] != "HIGH":
@@ -2162,107 +2201,156 @@ with ticker_tab:
 
             st.markdown("### Setup Repair Map")
             st.caption(
-                "Decision levels below are **conditional guideposts, not automatic buy/sell signals**. "
-                "They show what price/confirmation would repair today's entry quality. "
-                "A setup is recalculated from fresh data before it becomes actionable."
+                "The engine first identifies **why the entry is not ready**, then shows what repairs that defect. "
+                "A repair threshold is **not an entry signal**. After repair, the setup must be recalculated and confirmed from the new structure."
             )
 
             ema20_now = diag.get("EMA20", np.nan)
             ema50_now = diag.get("EMA50", np.nan)
             atr_now = diag.get("ATR14", np.nan)
-            last_high = diag.get("Latest High", np.nan)
-            last_low = diag.get("Latest Low", np.nan)
             close_now = diag.get("Close", np.nan)
+            rsi_now = diag.get("RSI14", np.nan)
+            vol_now = diag.get("Volume Ratio", np.nan)
+            dist_now = diag.get("Distance EMA20", np.nan)
+            stop_now = diag.get("Stop %", np.nan)
 
-            repair_items = []
-            ideal_low = ideal_high = max_chase = confirm_trigger = invalidation = np.nan
-            repair_direction = None
-
-            # Long repair map: applies to bullish candidates, including extended WAIT names.
             bullish_candidate = diag["Trend"] in ("Strong bullish", "Bullish") and diag["Momentum Score"] > 0
             bearish_candidate = diag["Trend"] in ("Strong bearish", "Bearish") and diag["Momentum Score"] < 0
 
+            # Failure-specific diagnosis.
+            defects = []
+            if confidence["block"]:
+                defects.append("DATA")
+            if bullish_candidate and pd.notna(dist_now) and dist_now > 0.08:
+                defects.append("PRICE EXTENSION")
+            if bearish_candidate and pd.notna(dist_now) and dist_now < -0.08:
+                defects.append("PRICE EXTENSION")
+            if bullish_candidate and pd.notna(rsi_now) and rsi_now >= 75:
+                defects.append("RSI EXTENSION")
+            if bearish_candidate and pd.notna(rsi_now) and rsi_now <= 25:
+                defects.append("RSI EXTENSION")
+            if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
+                defects.append("STOP GEOMETRY")
+            if diag["Acceleration"] == "Decelerating":
+                defects.append("MOMENTUM DECELERATION")
+            if pd.notna(vol_now) and vol_now < 1.0:
+                defects.append("WEAK VOLUME")
+            if not bullish_candidate and not bearish_candidate:
+                defects.append("DIRECTIONAL ALIGNMENT")
+
+            # De-duplicate while preserving order.
+            defects = list(dict.fromkeys(defects))
+
+            if "DATA" in defects:
+                repair_mode = "DATA REPAIR"
+            elif "DIRECTIONAL ALIGNMENT" in defects:
+                repair_mode = "WAIT FOR STRUCTURE"
+            elif "PRICE EXTENSION" in defects or "RSI EXTENSION" in defects:
+                repair_mode = "PULLBACK / CONSOLIDATION" if bullish_candidate else "BOUNCE / CONSOLIDATION"
+            elif "STOP GEOMETRY" in defects:
+                repair_mode = "RISK GEOMETRY REPAIR"
+            elif "MOMENTUM DECELERATION" in defects:
+                repair_mode = "MOMENTUM STABILIZATION"
+            elif "WEAK VOLUME" in defects:
+                repair_mode = "PARTICIPATION CONFIRMATION"
+            else:
+                repair_mode = "MAINTAIN QUALITY"
+
+            st.markdown(f"**Repair Mode: {repair_mode}**")
+            if defects:
+                st.caption("Current defects: " + " • ".join(defects))
+            else:
+                st.caption("No major repair defect is currently identified.")
+
+            repair_items = []
+            repair_boundary = invalidation = np.nan
+            preferred_low = preferred_high = np.nan
+
             if bullish_candidate and all(pd.notna(v) for v in [ema20_now, atr_now, close_now]):
-                repair_direction = "LONG"
-                # Preferred location: around EMA20, but allow a modest ATR buffer above it.
-                ideal_low = max(0.01, ema20_now - 0.25 * atr_now)
-                ideal_high = ema20_now + 0.50 * atr_now
-                # Absolute location gate inherited from the engine: >8% above EMA20 is extended.
-                max_chase = ema20_now * 1.08
-                # Confirmation is deliberately structural, not "buy at this number":
-                # reclaim/break the latest daily high after location has repaired.
-                confirm_trigger = last_high if pd.notna(last_high) else np.nan
-                # Structural failure guide: below EMA50 or 1.25 ATR below EMA20, whichever is tighter.
+                raw_low = max(0.01, ema20_now - 0.25 * atr_now)
+                raw_high = ema20_now + 0.50 * atr_now
                 inv_candidates = [v for v in [ema50_now, ema20_now - 1.25 * atr_now] if pd.notna(v) and v > 0]
                 invalidation = max(inv_candidates) if inv_candidates else np.nan
 
-                repair_items.append("RSI(14) must cool below 75; price location alone does not clear the extension gate.")
-                repair_items.append("Prefer volume confirmation ≥1.0x 20-day average; ≥1.2x is stronger.")
-                repair_items.append("After a pullback/base, require fresh price confirmation rather than buying simply because price enters the zone.")
+                # Internal consistency: preferred long entry area must remain ABOVE structural invalidation.
+                safety = 0.15 * atr_now
+                preferred_low = max(raw_low, invalidation + safety) if pd.notna(invalidation) else raw_low
+                preferred_high = max(raw_high, preferred_low)
+                repair_boundary = ema20_now * 1.08
+
+                if pd.notna(dist_now) and dist_now > 0.08:
+                    repair_items.append(
+                        f"Price extension must repair from {dist_now:+.1%} vs EMA20 to **≤ +8.0%**. "
+                        f"Current no-chase boundary: {fmt_price(repair_boundary)}."
+                    )
+                if pd.notna(rsi_now) and rsi_now >= 75:
+                    repair_items.append(f"RSI must cool from {rsi_now:.1f} to **below 75**.")
+                if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
+                    repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed entry.")
+                if diag["Acceleration"] == "Decelerating":
+                    repair_items.append("Momentum must stabilize or re-accelerate; the dashboard will show the new 5-day comparison.")
+                if pd.notna(vol_now) and vol_now < 1.0:
+                    repair_items.append(f"Volume is {vol_now:.2f}x; prefer ≥1.0x, with ≥1.2x stronger.")
 
             elif bearish_candidate and all(pd.notna(v) for v in [ema20_now, atr_now, close_now]):
-                repair_direction = "SHORT"
-                ideal_low = ema20_now - 0.50 * atr_now
-                ideal_high = ema20_now + 0.25 * atr_now
-                max_chase = ema20_now * 0.92
-                confirm_trigger = last_low if pd.notna(last_low) else np.nan
+                raw_low = ema20_now - 0.50 * atr_now
+                raw_high = ema20_now + 0.25 * atr_now
                 inv_candidates = [v for v in [ema50_now, ema20_now + 1.25 * atr_now] if pd.notna(v) and v > 0]
                 invalidation = min(inv_candidates) if inv_candidates else np.nan
 
-                repair_items.append("RSI(14) must recover above 25; price location alone does not clear the oversold gate.")
-                repair_items.append("Prefer volume confirmation ≥1.0x 20-day average; ≥1.2x is stronger.")
-                repair_items.append("After a bounce/rejection, require fresh downside confirmation rather than shorting simply because price enters the zone.")
+                # Internal consistency: preferred short repair area must remain BELOW structural invalidation.
+                safety = 0.15 * atr_now
+                preferred_high = min(raw_high, invalidation - safety) if pd.notna(invalidation) else raw_high
+                preferred_low = min(raw_low, preferred_high)
+                repair_boundary = ema20_now * 0.92
 
-            if repair_direction:
-                r1, r2, r3, r4 = st.columns(4)
-                r1.metric(
-                    "Preferred Entry Zone",
-                    f"{fmt_price(ideal_low)} – {fmt_price(ideal_high)}"
-                )
+                if pd.notna(dist_now) and dist_now < -0.08:
+                    repair_items.append(
+                        f"Downside extension must repair from {dist_now:+.1%} vs EMA20 to **≥ -8.0%**. "
+                        f"Current no-chase boundary: {fmt_price(repair_boundary)}."
+                    )
+                if pd.notna(rsi_now) and rsi_now <= 25:
+                    repair_items.append(f"RSI must recover from {rsi_now:.1f} to **above 25**.")
+                if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
+                    repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed short entry.")
+                if diag["Acceleration"] == "Decelerating":
+                    repair_items.append("Bearish momentum must stabilize or re-accelerate before entry.")
+                if pd.notna(vol_now) and vol_now < 1.0:
+                    repair_items.append(f"Volume is {vol_now:.2f}x; prefer ≥1.0x, with ≥1.2x stronger.")
+
+            if bullish_candidate or bearish_candidate:
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Preferred Repair Area", f"{fmt_price(preferred_low)} – {fmt_price(preferred_high)}")
                 r2.metric(
-                    "Max Chase Boundary" if repair_direction == "LONG" else "Max Downside Chase",
-                    fmt_price(max_chase)
+                    "No-Chase Boundary",
+                    fmt_price(repair_boundary)
                 )
-                r3.metric(
-                    "Confirmation Reference",
-                    fmt_price(confirm_trigger)
-                )
-                r4.metric(
-                    "Structure Invalidation",
-                    fmt_price(invalidation)
+                r3.metric("Structure Invalidation", fmt_price(invalidation))
+
+                st.caption(
+                    "**Preferred Repair Area** = where location/risk may become more attractive; it is not an order instruction. "
+                    "**No-Chase Boundary** = the ±8% EMA20 extension limit; crossing back inside it only repairs one gate. "
+                    "**Structure Invalidation** = a structural reference used to prevent the repair area from contradicting the risk framework."
                 )
 
-                if repair_direction == "LONG":
-                    st.caption(
-                        f"**How to read it:** Preferred Entry Zone ≈ EMA20 ± ATR buffer. "
-                        f"Max Chase Boundary = 8% above EMA20 ({fmt_price(max_chase)}); this is a hard extension boundary, "
-                        f"not a recommended entry. Confirmation Reference = latest daily high ({fmt_price(confirm_trigger)}), "
-                        "to be used only after the pullback/base repairs entry location. "
-                        f"Structure Invalidation ≈ tighter of EMA50 / EMA20−1.25 ATR ({fmt_price(invalidation)})."
-                    )
-                else:
-                    st.caption(
-                        f"**How to read it:** Preferred Entry Zone ≈ EMA20 ± ATR buffer. "
-                        f"Max Downside Chase = 8% below EMA20 ({fmt_price(max_chase)}); this is a hard oversold boundary, "
-                        f"not a recommended short entry. Confirmation Reference = latest daily low ({fmt_price(confirm_trigger)}), "
-                        "to be used only after a bounce/rejection repairs entry location. "
-                        f"Structure Invalidation ≈ tighter structural ceiling from EMA50 / EMA20+1.25 ATR ({fmt_price(invalidation)})."
-                    )
+                st.info(
+                    "**Confirmation is dynamic after repair.** The engine will NOT use today's high/low as a permanent trigger. "
+                    "After the pullback, bounce, or base forms, rerun the ticker. The engine then recalculates momentum, RS, RSI, "
+                    "volume, stop distance and the new local price structure before publishing an actionable trade plan."
+                )
             else:
                 st.info(
-                    "No quantitative repair zone is published because trend/momentum direction is not sufficiently aligned. "
-                    "Wait for directional structure first."
+                    "No price repair area is published because trend and momentum direction are not sufficiently aligned. "
+                    "Directional structure must form first."
                 )
 
             st.markdown("**Conditions required to improve the setup**")
-            if diag["Acceleration"] == "Weakening ↓":
-                repair_items.append("Momentum should stabilize or re-accelerate before entry.")
-            if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 1.0:
-                repair_items.append(f"Current volume is only {diag['Volume Ratio']:.2f}x; stronger participation is preferred.")
-            if confidence["level"] == "MEDIUM":
-                repair_items.append("Repair/confirm the isolated data gap to restore HIGH Data Confidence.")
             if not repair_items:
-                repair_items.append("Preserve trend and relative-strength leadership while maintaining acceptable stop distance and R:R.")
+                repair_items.append(
+                    "Maintain trend and relative-strength leadership while preserving acceptable entry location, stop distance and R:R."
+                )
+            if confidence["level"] == "MEDIUM":
+                repair_items.append("Restore HIGH Data Confidence if the isolated data gap can be repaired.")
             for item in repair_items:
                 st.write(f"• {item}")
 
@@ -2312,9 +2400,9 @@ with ticker_tab:
                 rows = [
                     ("Momentum Score", "40% Daily + 35% Weekly + 25% Monthly; each component scaled to -100…+100"),
                     ("Daily / Weekly / Monthly", "1D / 5D / 20D price change, normalized to score"),
-                    ("Acceleration", "Current composite vs composite 5 trading days ago; ±10 points triggers Accelerating/Weakening"),
+                    ("Momentum Change", "Current Momentum Score vs 5 trading days ago; the dashboard shows both values and the point change"),
                     ("Trend", "Price/EMA20/EMA50/EMA200 stacking"),
-                    ("RS vs SPY", "1M / 3M / 6M excess return vs SPY; composite weights 20% / 35% / 45%"),
+                    ("RS vs SPY", "1M / 3M / 6M excess return vs SPY; RS Edge weights 20% / 35% / 45%"),
                     ("Volume Ratio", "Current volume ÷ 20-day average volume"),
                     ("Extension", ">8% above EMA20 or RSI≥75 = Extended; >8% below EMA20 or RSI≤25 = Oversold"),
                     ("Trade Plan", "ATR(14), EMA structure and 20-day highs/lows; blocked if extended/oversold or stop distance exceeds 10%"),
@@ -2525,7 +2613,7 @@ with scanner_tab:
 
                 aplus_cols = [
                     "Ticker", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
-                    "RS Rating", "RS Composite", "Momentum Score", "RSI14",
+                    "RS Rating", "RS Edge", "Momentum Score", "RSI14",
                     "Volume Ratio", "ATR %", "EMA20 Distance %", "20D High Distance %",
                     "Avg Dollar Volume 20", "Setup Note",
                 ]
@@ -2539,7 +2627,7 @@ with scanner_tab:
                     column_config={
                         "Quality Score": st.column_config.NumberColumn(format="%.0f"),
                         "RS Rating": st.column_config.NumberColumn(format="%d"),
-                        "RS Composite": st.column_config.NumberColumn(format="%+.1f"),
+                        "RS Edge": st.column_config.NumberColumn(format="%+.1f"),
                         "Momentum Score": st.column_config.NumberColumn(format="%.1f"),
                         "ATR %": st.column_config.NumberColumn(format="%.1f%%"),
                         "EMA20 Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
@@ -2670,7 +2758,7 @@ with scanner_tab:
 
         display_cols = [
             "Rank", "Ticker", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
-            "Tradeable", "Regime Aligned", "RS Rating", "RS Composite",
+            "Tradeable", "Regime Aligned", "RS Rating", "RS Edge",
             "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
             "EMA20 Distance %", "20D High Distance %", "Avg Dollar Volume 20",
             "Setup Note", "Filter Reasons",
@@ -2685,7 +2773,7 @@ with scanner_tab:
             column_config={
                 "Quality Score": st.column_config.NumberColumn(format="%.0f"),
                 "RS Rating": st.column_config.NumberColumn(format="%d"),
-                "RS Composite": st.column_config.NumberColumn(format="%+.1f"),
+                "RS Edge": st.column_config.NumberColumn(format="%+.1f"),
                 "Momentum Score": st.column_config.NumberColumn(format="%.1f"),
                 "ATR %": st.column_config.NumberColumn(format="%.1f%%"),
                 "EMA20 Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
