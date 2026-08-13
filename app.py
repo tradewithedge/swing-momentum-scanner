@@ -1,4 +1,4 @@
-
+# Quality Engine v6.8 — Quantitative Entry Repair Map\n
 import io
 import time
 from datetime import datetime
@@ -1672,7 +1672,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     long_bias = composite >= 15 and close > ema20
     short_bias = composite <= -15 and close < ema20
 
-    # v6.7 Tradeability & Risk Engine
+    # v6.8 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
     extended_long = (dist_ema20 > 0.08) or (rsi14 >= 75)
     extended_short = (dist_ema20 < -0.08) or (rsi14 <= 25)
@@ -1854,6 +1854,10 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Trade Block Reason": trade_block_reason,
         "Stop %": stop_pct,
         "EMA20": ema20, "EMA50": ema50, "EMA200": ema200,
+        "ATR14": atr,
+        "Latest High": float(latest["High"]) if pd.notna(latest["High"]) else np.nan,
+        "Latest Low": float(latest["Low"]) if pd.notna(latest["Low"]) else np.nan,
+        "High20": high20, "Low20": low20,
         "Market Cap": metadata.get("market_cap", np.nan),
         "Trailing PE": metadata.get("trailing_pe", np.nan),
         "Forward PE": metadata.get("forward_pe", np.nan),
@@ -1957,7 +1961,7 @@ with ticker_tab:
             st.markdown(f"### {selected_ticker} — {selected_company}")
             st.markdown(f"## {diag['Verdict']}")
 
-            # v6.7: separate stock quality from entry quality and current action.
+            # v6.8: separate stock quality from entry quality and current action.
             candidate_points = 0
             candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
             candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
@@ -2156,21 +2160,110 @@ with ticker_tab:
                 else:
                     st.write("• No major blocking risk identified.")
 
-            st.markdown("**What would improve the setup?**")
-            improvement = []
-            if diag["Extension"] == "Extended":
-                improvement.append("Pullback/consolidation closer to EMA20 with RSI cooling below 75")
-            elif diag["Extension"] == "Oversold":
-                improvement.append("Bounce/rejection structure before considering a short")
+            st.markdown("### Setup Repair Map")
+            st.caption(
+                "Decision levels below are **conditional guideposts, not automatic buy/sell signals**. "
+                "They show what price/confirmation would repair today's entry quality. "
+                "A setup is recalculated from fresh data before it becomes actionable."
+            )
+
+            ema20_now = diag.get("EMA20", np.nan)
+            ema50_now = diag.get("EMA50", np.nan)
+            atr_now = diag.get("ATR14", np.nan)
+            last_high = diag.get("Latest High", np.nan)
+            last_low = diag.get("Latest Low", np.nan)
+            close_now = diag.get("Close", np.nan)
+
+            repair_items = []
+            ideal_low = ideal_high = max_chase = confirm_trigger = invalidation = np.nan
+            repair_direction = None
+
+            # Long repair map: applies to bullish candidates, including extended WAIT names.
+            bullish_candidate = diag["Trend"] in ("Strong bullish", "Bullish") and diag["Momentum Score"] > 0
+            bearish_candidate = diag["Trend"] in ("Strong bearish", "Bearish") and diag["Momentum Score"] < 0
+
+            if bullish_candidate and all(pd.notna(v) for v in [ema20_now, atr_now, close_now]):
+                repair_direction = "LONG"
+                # Preferred location: around EMA20, but allow a modest ATR buffer above it.
+                ideal_low = max(0.01, ema20_now - 0.25 * atr_now)
+                ideal_high = ema20_now + 0.50 * atr_now
+                # Absolute location gate inherited from the engine: >8% above EMA20 is extended.
+                max_chase = ema20_now * 1.08
+                # Confirmation is deliberately structural, not "buy at this number":
+                # reclaim/break the latest daily high after location has repaired.
+                confirm_trigger = last_high if pd.notna(last_high) else np.nan
+                # Structural failure guide: below EMA50 or 1.25 ATR below EMA20, whichever is tighter.
+                inv_candidates = [v for v in [ema50_now, ema20_now - 1.25 * atr_now] if pd.notna(v) and v > 0]
+                invalidation = max(inv_candidates) if inv_candidates else np.nan
+
+                repair_items.append("RSI(14) must cool below 75; price location alone does not clear the extension gate.")
+                repair_items.append("Prefer volume confirmation ≥1.0x 20-day average; ≥1.2x is stronger.")
+                repair_items.append("After a pullback/base, require fresh price confirmation rather than buying simply because price enters the zone.")
+
+            elif bearish_candidate and all(pd.notna(v) for v in [ema20_now, atr_now, close_now]):
+                repair_direction = "SHORT"
+                ideal_low = ema20_now - 0.50 * atr_now
+                ideal_high = ema20_now + 0.25 * atr_now
+                max_chase = ema20_now * 0.92
+                confirm_trigger = last_low if pd.notna(last_low) else np.nan
+                inv_candidates = [v for v in [ema50_now, ema20_now + 1.25 * atr_now] if pd.notna(v) and v > 0]
+                invalidation = min(inv_candidates) if inv_candidates else np.nan
+
+                repair_items.append("RSI(14) must recover above 25; price location alone does not clear the oversold gate.")
+                repair_items.append("Prefer volume confirmation ≥1.0x 20-day average; ≥1.2x is stronger.")
+                repair_items.append("After a bounce/rejection, require fresh downside confirmation rather than shorting simply because price enters the zone.")
+
+            if repair_direction:
+                r1, r2, r3, r4 = st.columns(4)
+                r1.metric(
+                    "Preferred Entry Zone",
+                    f"{fmt_price(ideal_low)} – {fmt_price(ideal_high)}"
+                )
+                r2.metric(
+                    "Max Chase Boundary" if repair_direction == "LONG" else "Max Downside Chase",
+                    fmt_price(max_chase)
+                )
+                r3.metric(
+                    "Confirmation Reference",
+                    fmt_price(confirm_trigger)
+                )
+                r4.metric(
+                    "Structure Invalidation",
+                    fmt_price(invalidation)
+                )
+
+                if repair_direction == "LONG":
+                    st.caption(
+                        f"**How to read it:** Preferred Entry Zone ≈ EMA20 ± ATR buffer. "
+                        f"Max Chase Boundary = 8% above EMA20 ({fmt_price(max_chase)}); this is a hard extension boundary, "
+                        f"not a recommended entry. Confirmation Reference = latest daily high ({fmt_price(confirm_trigger)}), "
+                        "to be used only after the pullback/base repairs entry location. "
+                        f"Structure Invalidation ≈ tighter of EMA50 / EMA20−1.25 ATR ({fmt_price(invalidation)})."
+                    )
+                else:
+                    st.caption(
+                        f"**How to read it:** Preferred Entry Zone ≈ EMA20 ± ATR buffer. "
+                        f"Max Downside Chase = 8% below EMA20 ({fmt_price(max_chase)}); this is a hard oversold boundary, "
+                        f"not a recommended short entry. Confirmation Reference = latest daily low ({fmt_price(confirm_trigger)}), "
+                        "to be used only after a bounce/rejection repairs entry location. "
+                        f"Structure Invalidation ≈ tighter structural ceiling from EMA50 / EMA20+1.25 ATR ({fmt_price(invalidation)})."
+                    )
+            else:
+                st.info(
+                    "No quantitative repair zone is published because trend/momentum direction is not sufficiently aligned. "
+                    "Wait for directional structure first."
+                )
+
+            st.markdown("**Conditions required to improve the setup**")
             if diag["Acceleration"] == "Weakening ↓":
-                improvement.append("Momentum stabilization or renewed acceleration")
+                repair_items.append("Momentum should stabilize or re-accelerate before entry.")
             if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 1.0:
-                improvement.append("Stronger volume confirmation")
+                repair_items.append(f"Current volume is only {diag['Volume Ratio']:.2f}x; stronger participation is preferred.")
             if confidence["level"] == "MEDIUM":
-                improvement.append("Cleaner data feed / repaired isolated gap for higher confidence")
-            if not improvement:
-                improvement.append("Maintain current trend/RS while preserving acceptable entry risk")
-            for item in improvement:
+                repair_items.append("Repair/confirm the isolated data gap to restore HIGH Data Confidence.")
+            if not repair_items:
+                repair_items.append("Preserve trend and relative-strength leadership while maintaining acceptable stop distance and R:R.")
+            for item in repair_items:
                 st.write(f"• {item}")
 
             st.markdown("### Trade Plan")
