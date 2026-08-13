@@ -2174,7 +2174,10 @@ with ticker_tab:
                     st.write("• No major quality edge is currently confirmed.")
 
             with d2:
-                st.markdown("**Why to wait / key risks**")
+                if diag["Trade State"] == "ACTIONABLE":
+                    st.markdown("**Key risks / entry considerations**")
+                else:
+                    st.markdown("**Why to wait / key risks**")
                 risks = []
                 if diag["Extension"] in ("Extended", "Oversold"):
                     risks.append(f"Entry location: {diag['Extension']}")
@@ -2189,6 +2192,15 @@ with ticker_tab:
                         risks.append("Momentum is decelerating")
                 if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 0.75:
                     risks.append(f"Volume is weak: {diag['Volume Ratio']:.2f}x")
+                elif (
+                    diag["Trade State"] == "ACTIONABLE"
+                    and pd.notna(diag["Volume Ratio"])
+                    and diag["Volume Ratio"] < 1.0
+                ):
+                    risks.append(
+                        f"Volume participation is slightly below ideal: {diag['Volume Ratio']:.2f}x "
+                        "(non-blocking; ≥1.0x preferred, ≥1.2x stronger)"
+                    )
                 if confidence["level"] != "HIGH":
                     risks.append(f"Data Confidence is {confidence['level']}")
                 if diag["Trade State"] != "ACTIONABLE":
@@ -2199,160 +2211,196 @@ with ticker_tab:
                 else:
                     st.write("• No major blocking risk identified.")
 
-            st.markdown("### Setup Repair Map")
-            st.caption(
-                "The engine first identifies **why the entry is not ready**, then shows what repairs that defect. "
-                "A repair threshold is **not an entry signal**. After repair, the setup must be recalculated and confirmed from the new structure."
-            )
-
-            ema20_now = diag.get("EMA20", np.nan)
-            ema50_now = diag.get("EMA50", np.nan)
-            atr_now = diag.get("ATR14", np.nan)
-            close_now = diag.get("Close", np.nan)
-            rsi_now = diag.get("RSI14", np.nan)
-            vol_now = diag.get("Volume Ratio", np.nan)
-            dist_now = diag.get("Distance EMA20", np.nan)
-            stop_now = diag.get("Stop %", np.nan)
-
-            bullish_candidate = diag["Trend"] in ("Strong bullish", "Bullish") and diag["Momentum Score"] > 0
-            bearish_candidate = diag["Trend"] in ("Strong bearish", "Bearish") and diag["Momentum Score"] < 0
-
-            # Failure-specific diagnosis.
-            defects = []
-            if confidence["block"]:
-                defects.append("DATA")
-            if bullish_candidate and pd.notna(dist_now) and dist_now > 0.08:
-                defects.append("PRICE EXTENSION")
-            if bearish_candidate and pd.notna(dist_now) and dist_now < -0.08:
-                defects.append("PRICE EXTENSION")
-            if bullish_candidate and pd.notna(rsi_now) and rsi_now >= 75:
-                defects.append("RSI EXTENSION")
-            if bearish_candidate and pd.notna(rsi_now) and rsi_now <= 25:
-                defects.append("RSI EXTENSION")
-            if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
-                defects.append("STOP GEOMETRY")
-            if diag["Acceleration"] == "Decelerating":
-                defects.append("MOMENTUM DECELERATION")
-            if pd.notna(vol_now) and vol_now < 1.0:
-                defects.append("WEAK VOLUME")
-            if not bullish_candidate and not bearish_candidate:
-                defects.append("DIRECTIONAL ALIGNMENT")
-
-            # De-duplicate while preserving order.
-            defects = list(dict.fromkeys(defects))
-
-            if "DATA" in defects:
-                repair_mode = "DATA REPAIR"
-            elif "DIRECTIONAL ALIGNMENT" in defects:
-                repair_mode = "WAIT FOR STRUCTURE"
-            elif "PRICE EXTENSION" in defects or "RSI EXTENSION" in defects:
-                repair_mode = "PULLBACK / CONSOLIDATION" if bullish_candidate else "BOUNCE / CONSOLIDATION"
-            elif "STOP GEOMETRY" in defects:
-                repair_mode = "RISK GEOMETRY REPAIR"
-            elif "MOMENTUM DECELERATION" in defects:
-                repair_mode = "MOMENTUM STABILIZATION"
-            elif "WEAK VOLUME" in defects:
-                repair_mode = "PARTICIPATION CONFIRMATION"
-            else:
-                repair_mode = "MAINTAIN QUALITY"
-
-            st.markdown(f"**Repair Mode: {repair_mode}**")
-            if defects:
-                st.caption("Current defects: " + " • ".join(defects))
-            else:
-                st.caption("No major repair defect is currently identified.")
-
-            repair_items = []
-            repair_boundary = invalidation = np.nan
-            preferred_low = preferred_high = np.nan
-
-            if bullish_candidate and all(pd.notna(v) for v in [ema20_now, atr_now, close_now]):
-                raw_low = max(0.01, ema20_now - 0.25 * atr_now)
-                raw_high = ema20_now + 0.50 * atr_now
-                inv_candidates = [v for v in [ema50_now, ema20_now - 1.25 * atr_now] if pd.notna(v) and v > 0]
-                invalidation = max(inv_candidates) if inv_candidates else np.nan
-
-                # Internal consistency: preferred long entry area must remain ABOVE structural invalidation.
-                safety = 0.15 * atr_now
-                preferred_low = max(raw_low, invalidation + safety) if pd.notna(invalidation) else raw_low
-                preferred_high = max(raw_high, preferred_low)
-                repair_boundary = ema20_now * 1.08
-
-                if pd.notna(dist_now) and dist_now > 0.08:
-                    repair_items.append(
-                        f"Price extension must repair from {dist_now:+.1%} vs EMA20 to **≤ +8.0%**. "
-                        f"Current no-chase boundary: {fmt_price(repair_boundary)}."
-                    )
-                if pd.notna(rsi_now) and rsi_now >= 75:
-                    repair_items.append(f"RSI must cool from {rsi_now:.1f} to **below 75**.")
-                if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
-                    repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed entry.")
-                if diag["Acceleration"] == "Decelerating":
-                    repair_items.append("Momentum must stabilize or re-accelerate; the dashboard will show the new 5-day comparison.")
-                if pd.notna(vol_now) and vol_now < 1.0:
-                    repair_items.append(f"Volume is {vol_now:.2f}x; prefer ≥1.0x, with ≥1.2x stronger.")
-
-            elif bearish_candidate and all(pd.notna(v) for v in [ema20_now, atr_now, close_now]):
-                raw_low = ema20_now - 0.50 * atr_now
-                raw_high = ema20_now + 0.25 * atr_now
-                inv_candidates = [v for v in [ema50_now, ema20_now + 1.25 * atr_now] if pd.notna(v) and v > 0]
-                invalidation = min(inv_candidates) if inv_candidates else np.nan
-
-                # Internal consistency: preferred short repair area must remain BELOW structural invalidation.
-                safety = 0.15 * atr_now
-                preferred_high = min(raw_high, invalidation - safety) if pd.notna(invalidation) else raw_high
-                preferred_low = min(raw_low, preferred_high)
-                repair_boundary = ema20_now * 0.92
-
-                if pd.notna(dist_now) and dist_now < -0.08:
-                    repair_items.append(
-                        f"Downside extension must repair from {dist_now:+.1%} vs EMA20 to **≥ -8.0%**. "
-                        f"Current no-chase boundary: {fmt_price(repair_boundary)}."
-                    )
-                if pd.notna(rsi_now) and rsi_now <= 25:
-                    repair_items.append(f"RSI must recover from {rsi_now:.1f} to **above 25**.")
-                if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
-                    repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed short entry.")
-                if diag["Acceleration"] == "Decelerating":
-                    repair_items.append("Bearish momentum must stabilize or re-accelerate before entry.")
-                if pd.notna(vol_now) and vol_now < 1.0:
-                    repair_items.append(f"Volume is {vol_now:.2f}x; prefer ≥1.0x, with ≥1.2x stronger.")
-
-            if bullish_candidate or bearish_candidate:
-                r1, r2, r3 = st.columns(3)
-                r1.metric("Preferred Repair Area", f"{fmt_price(preferred_low)} – {fmt_price(preferred_high)}")
-                r2.metric(
-                    "No-Chase Boundary",
-                    fmt_price(repair_boundary)
-                )
-                r3.metric("Structure Invalidation", fmt_price(invalidation))
-
+            if diag["Trade State"] != "ACTIONABLE":
+                st.markdown("### Setup Repair Map")
                 st.caption(
-                    "**Preferred Repair Area** = where location/risk may become more attractive; it is not an order instruction. "
-                    "**No-Chase Boundary** = the ±8% EMA20 extension limit; crossing back inside it only repairs one gate. "
-                    "**Structure Invalidation** = a structural reference used to prevent the repair area from contradicting the risk framework."
+                    "The engine first identifies **why the entry is not ready**, then shows what repairs that defect. "
+                    "A repair threshold is **not an entry signal**. After repair, the setup must be recalculated and confirmed from the new structure."
                 )
 
-                st.info(
-                    "**Confirmation is dynamic after repair.** The engine will NOT use today's high/low as a permanent trigger. "
-                    "After the pullback, bounce, or base forms, rerun the ticker. The engine then recalculates momentum, RS, RSI, "
-                    "volume, stop distance and the new local price structure before publishing an actionable trade plan."
-                )
+                ema20_now = diag.get("EMA20", np.nan)
+                ema50_now = diag.get("EMA50", np.nan)
+                atr_now = diag.get("ATR14", np.nan)
+                close_now = diag.get("Close", np.nan)
+                rsi_now = diag.get("RSI14", np.nan)
+                vol_now = diag.get("Volume Ratio", np.nan)
+                dist_now = diag.get("Distance EMA20", np.nan)
+                stop_now = diag.get("Stop %", np.nan)
+
+                bullish_candidate = diag["Trend"] in ("Strong bullish", "Bullish") and diag["Momentum Score"] > 0
+                bearish_candidate = diag["Trend"] in ("Strong bearish", "Bearish") and diag["Momentum Score"] < 0
+
+                # Failure-specific diagnosis.
+                defects = []
+                if confidence["block"]:
+                    defects.append("DATA")
+                if bullish_candidate and pd.notna(dist_now) and dist_now > 0.08:
+                    defects.append("PRICE EXTENSION")
+                if bearish_candidate and pd.notna(dist_now) and dist_now < -0.08:
+                    defects.append("PRICE EXTENSION")
+                if bullish_candidate and pd.notna(rsi_now) and rsi_now >= 75:
+                    defects.append("RSI EXTENSION")
+                if bearish_candidate and pd.notna(rsi_now) and rsi_now <= 25:
+                    defects.append("RSI EXTENSION")
+                if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
+                    defects.append("STOP GEOMETRY")
+                if diag["Acceleration"] == "Decelerating":
+                    defects.append("MOMENTUM DECELERATION")
+                if pd.notna(vol_now) and vol_now < 1.0:
+                    defects.append("WEAK VOLUME")
+                if not bullish_candidate and not bearish_candidate:
+                    defects.append("DIRECTIONAL ALIGNMENT")
+
+                # De-duplicate while preserving order.
+                defects = list(dict.fromkeys(defects))
+
+                if "DATA" in defects:
+                    repair_mode = "DATA REPAIR"
+                elif "DIRECTIONAL ALIGNMENT" in defects:
+                    repair_mode = "WAIT FOR STRUCTURE"
+                elif "PRICE EXTENSION" in defects or "RSI EXTENSION" in defects:
+                    repair_mode = "PULLBACK / CONSOLIDATION" if bullish_candidate else "BOUNCE / CONSOLIDATION"
+                elif "STOP GEOMETRY" in defects:
+                    repair_mode = "RISK GEOMETRY REPAIR"
+                elif "MOMENTUM DECELERATION" in defects:
+                    repair_mode = "MOMENTUM STABILIZATION"
+                elif "WEAK VOLUME" in defects:
+                    repair_mode = "PARTICIPATION CONFIRMATION"
+                else:
+                    repair_mode = "MAINTAIN QUALITY"
+
+                st.markdown(f"**Repair Mode: {repair_mode}**")
+                if defects:
+                    st.caption("Current defects: " + " • ".join(defects))
+                else:
+                    st.caption("No major repair defect is currently identified.")
+
+                repair_items = []
+                repair_boundary = invalidation = np.nan
+                preferred_low = preferred_high = np.nan
+
+                if bullish_candidate and all(pd.notna(v) for v in [ema20_now, atr_now, close_now]):
+                    raw_low = max(0.01, ema20_now - 0.25 * atr_now)
+                    raw_high = ema20_now + 0.50 * atr_now
+                    inv_candidates = [v for v in [ema50_now, ema20_now - 1.25 * atr_now] if pd.notna(v) and v > 0]
+                    invalidation = max(inv_candidates) if inv_candidates else np.nan
+
+                    # Internal consistency: preferred long entry area must remain ABOVE structural invalidation.
+                    safety = 0.15 * atr_now
+                    preferred_low = max(raw_low, invalidation + safety) if pd.notna(invalidation) else raw_low
+                    preferred_high = max(raw_high, preferred_low)
+                    repair_boundary = ema20_now * 1.08
+
+                    if pd.notna(dist_now) and dist_now > 0.08:
+                        repair_items.append(
+                            f"Price extension must repair from {dist_now:+.1%} vs EMA20 to **≤ +8.0%**. "
+                            f"Current no-chase boundary: {fmt_price(repair_boundary)}."
+                        )
+                    if pd.notna(rsi_now) and rsi_now >= 75:
+                        repair_items.append(f"RSI must cool from {rsi_now:.1f} to **below 75**.")
+                    if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
+                        repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed entry.")
+                    if diag["Acceleration"] == "Decelerating":
+                        repair_items.append("Momentum must stabilize or re-accelerate; the dashboard will show the new 5-day comparison.")
+                    if pd.notna(vol_now) and vol_now < 1.0:
+                        repair_items.append(f"Volume is {vol_now:.2f}x; prefer ≥1.0x, with ≥1.2x stronger.")
+
+                elif bearish_candidate and all(pd.notna(v) for v in [ema20_now, atr_now, close_now]):
+                    raw_low = ema20_now - 0.50 * atr_now
+                    raw_high = ema20_now + 0.25 * atr_now
+                    inv_candidates = [v for v in [ema50_now, ema20_now + 1.25 * atr_now] if pd.notna(v) and v > 0]
+                    invalidation = min(inv_candidates) if inv_candidates else np.nan
+
+                    # Internal consistency: preferred short repair area must remain BELOW structural invalidation.
+                    safety = 0.15 * atr_now
+                    preferred_high = min(raw_high, invalidation - safety) if pd.notna(invalidation) else raw_high
+                    preferred_low = min(raw_low, preferred_high)
+                    repair_boundary = ema20_now * 0.92
+
+                    if pd.notna(dist_now) and dist_now < -0.08:
+                        repair_items.append(
+                            f"Downside extension must repair from {dist_now:+.1%} vs EMA20 to **≥ -8.0%**. "
+                            f"Current no-chase boundary: {fmt_price(repair_boundary)}."
+                        )
+                    if pd.notna(rsi_now) and rsi_now <= 25:
+                        repair_items.append(f"RSI must recover from {rsi_now:.1f} to **above 25**.")
+                    if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
+                        repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed short entry.")
+                    if diag["Acceleration"] == "Decelerating":
+                        repair_items.append("Bearish momentum must stabilize or re-accelerate before entry.")
+                    if pd.notna(vol_now) and vol_now < 1.0:
+                        repair_items.append(f"Volume is {vol_now:.2f}x; prefer ≥1.0x, with ≥1.2x stronger.")
+
+                if bullish_candidate or bearish_candidate:
+                    r1, r2, r3 = st.columns(3)
+                    r1.metric("Preferred Repair Area", f"{fmt_price(preferred_low)} – {fmt_price(preferred_high)}")
+                    r2.metric(
+                        "No-Chase Boundary",
+                        fmt_price(repair_boundary)
+                    )
+                    r3.metric("Structure Invalidation", fmt_price(invalidation))
+
+                    st.caption(
+                        "**Preferred Repair Area** = where location/risk may become more attractive; it is not an order instruction. "
+                        "**No-Chase Boundary** = the ±8% EMA20 extension limit; crossing back inside it only repairs one gate. "
+                        "**Structure Invalidation** = a structural reference used to prevent the repair area from contradicting the risk framework."
+                    )
+
+                    st.info(
+                        "**Confirmation is dynamic after repair.** The engine will NOT use today's high/low as a permanent trigger. "
+                        "After the pullback, bounce, or base forms, rerun the ticker. The engine then recalculates momentum, RS, RSI, "
+                        "volume, stop distance and the new local price structure before publishing an actionable trade plan."
+                    )
+                else:
+                    st.info(
+                        "No price repair area is published because trend and momentum direction are not sufficiently aligned. "
+                        "Directional structure must form first."
+                    )
+
+                st.markdown("**Conditions required to improve the setup**")
+                if not repair_items:
+                    repair_items.append(
+                        "Maintain trend and relative-strength leadership while preserving acceptable entry location, stop distance and R:R."
+                    )
+                if confidence["level"] == "MEDIUM":
+                    repair_items.append("Restore HIGH Data Confidence if the isolated data gap can be repaired.")
+                for item in repair_items:
+                    st.write(f"• {item}")
+
             else:
-                st.info(
-                    "No price repair area is published because trend and momentum direction are not sufficiently aligned. "
-                    "Directional structure must form first."
+                st.markdown("### Entry Considerations")
+                st.caption(
+                    "This setup has already passed the entry-quality gate. Items below are **non-blocking considerations**, "
+                    "not repairs that must occur before entry."
                 )
+                considerations = []
 
-            st.markdown("**Conditions required to improve the setup**")
-            if not repair_items:
-                repair_items.append(
-                    "Maintain trend and relative-strength leadership while preserving acceptable entry location, stop distance and R:R."
-                )
-            if confidence["level"] == "MEDIUM":
-                repair_items.append("Restore HIGH Data Confidence if the isolated data gap can be repaired.")
-            for item in repair_items:
-                st.write(f"• {item}")
+                if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 1.0:
+                    considerations.append(
+                        f"Volume participation is {diag['Volume Ratio']:.2f}x of the 20-day average. "
+                        "≥1.0x is preferred; ≥1.2x provides stronger confirmation."
+                    )
+
+                if diag["Acceleration"] == "Decelerating":
+                    prev_mom = diag.get("Previous Momentum Score", np.nan)
+                    if pd.notna(prev_mom):
+                        considerations.append(
+                            f"Momentum is decelerating: {prev_mom:.1f} → {diag['Momentum Score']:.1f} "
+                            f"({diag['Acceleration Delta']:+.1f} pts in 5 trading days)."
+                        )
+                    else:
+                        considerations.append("Momentum is decelerating; monitor follow-through.")
+
+                if confidence["level"] != "HIGH":
+                    considerations.append(
+                        f"Data Confidence is {confidence['level']}; use additional caution."
+                    )
+
+                if considerations:
+                    for item in considerations:
+                        st.write(f"• {item}")
+                else:
+                    st.success("No material non-blocking entry consideration is currently identified.")
 
             st.markdown("### Trade Plan")
             st.caption(
