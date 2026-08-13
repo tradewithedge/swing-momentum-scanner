@@ -30,6 +30,11 @@ YAHOO_BATCH_SIZE = 120
 SCAN_CACHE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
+PHASE1_ENGINE_VERSION = "v7.0-P1.1"
+EARNINGS_HARD_BLOCK_DAYS = 3
+EARNINGS_CAUTION_DAYS = 14
+RECENT_EARNINGS_GRACE_DAYS = 5
+COMPANY_SNAPSHOT_TTL = 30 * 60
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 IWM_HOLDINGS_URL = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/latest-holdings.csv"
@@ -60,6 +65,12 @@ if "show_a_plus" not in st.session_state:
     st.session_state.show_a_plus = False
 if "a_plus_selected_ticker" not in st.session_state:
     st.session_state.a_plus_selected_ticker = None
+if "scan_ranked_df" not in st.session_state:
+    st.session_state.scan_ranked_df = pd.DataFrame()
+if "scan_ranked_regime_label" not in st.session_state:
+    st.session_state.scan_ranked_regime_label = ""
+if "scan_ranked_engine_version" not in st.session_state:
+    st.session_state.scan_ranked_engine_version = ""
 
 # ---------------------------
 # Helpers
@@ -74,6 +85,21 @@ def clean_symbol(symbol: str) -> str:
     if not s or s in {"-", "NAN", "CASH", "USD"}:
         return ""
     return yahoo_symbol(s)
+
+def us_market_today(now=None):
+    """Return the current New York calendar date as a naive normalized Timestamp."""
+    try:
+        if now is None:
+            ts = pd.Timestamp.now(tz="America/New_York")
+        else:
+            ts = pd.Timestamp(now)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("America/New_York")
+            else:
+                ts = ts.tz_convert("America/New_York")
+        return ts.tz_localize(None).normalize()
+    except Exception:
+        return pd.Timestamp.today().normalize()
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -361,13 +387,66 @@ def get_universe(name, watchlist_text):
         return out.drop_duplicates("Ticker").reset_index(drop=True)
     return pd.DataFrame(columns=["Ticker", "Company", "Sector"])
 
+
+def refresh_universe(name, watchlist_text):
+    """Refresh only the constituent cache that failed; never clear all app caches."""
+    if name == "S&P 500":
+        load_sp500.clear()
+    elif name == "Nasdaq-100":
+        load_nasdaq100.clear()
+    elif name == "Russell 2000 / IWM":
+        load_iwm.clear()
+    elif name == "Combined US":
+        load_sp500.clear()
+        load_nasdaq100.clear()
+        load_iwm.clear()
+    return get_universe(name, watchlist_text)
+
+
 # ---------------------------
 # Yahoo downloads
 # ---------------------------
 
-@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def _normalize_event_timestamp(value):
+    """Best-effort conversion of provider event values to a naive pandas Timestamp."""
+    if value is None:
+        return pd.NaT
+    if isinstance(value, (list, tuple, pd.Series, pd.Index, np.ndarray)):
+        values = list(value)
+        if not values:
+            return pd.NaT
+        value = values[0]
+    try:
+        if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+            ts = pd.to_datetime(value, unit="s", errors="coerce", utc=True)
+        else:
+            ts = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return pd.NaT
+        return pd.Timestamp(ts).tz_convert(None)
+    except Exception:
+        return pd.NaT
+
+
+def _split_earnings_dates(values, today=None):
+    """Return (next_date, last_date) using the New York market calendar date."""
+    dates = []
+    for value in values:
+        ts = _normalize_event_timestamp(value)
+        if pd.notna(ts):
+            dates.append(pd.Timestamp(ts).normalize())
+    if not dates:
+        return pd.NaT, pd.NaT
+    dates = sorted(set(dates))
+    market_day = us_market_today() if today is None else pd.Timestamp(today).normalize()
+    future = [d for d in dates if d >= market_day]
+    past = [d for d in dates if d < market_day]
+    return (min(future) if future else pd.NaT, max(past) if past else pd.NaT)
+
+
+@st.cache_data(ttl=COMPANY_SNAPSHOT_TTL, show_spinner=False)
 def get_company_snapshot(symbol):
-    """Lightweight cached metadata for direct ticker diagnostics."""
+    """Cached metadata with explicit fundamental/event confidence and earnings fallbacks."""
     snapshot = {
         "sector": "",
         "industry": "",
@@ -375,9 +454,15 @@ def get_company_snapshot(symbol):
         "trailing_pe": np.nan,
         "forward_pe": np.nan,
         "earnings_date": None,
+        "next_earnings_date": None,
+        "last_earnings_date": None,
+        "earnings_source": "",
+        "event_data_confidence": "LOW",
+        "fundamental_data_confidence": "LOW",
     }
     try:
         ticker = yf.Ticker(symbol)
+        info = {}
         try:
             fast = ticker.fast_info
             if fast:
@@ -394,26 +479,192 @@ def get_company_snapshot(symbol):
             if pd.isna(snapshot["market_cap"]):
                 snapshot["market_cap"] = info.get("marketCap", np.nan)
         except Exception:
-            pass
+            info = {}
 
+        # Route 1: Yahoo calendar. This is normally the cheapest forward-looking route.
+        calendar_dates = []
         try:
             cal = ticker.calendar
             if isinstance(cal, dict):
                 value = cal.get("Earnings Date")
-                if isinstance(value, (list, tuple)) and value:
-                    snapshot["earnings_date"] = pd.to_datetime(value[0], errors="coerce")
+                if isinstance(value, (list, tuple, pd.Series, pd.Index, np.ndarray)):
+                    calendar_dates.extend(list(value))
                 elif value is not None:
-                    snapshot["earnings_date"] = pd.to_datetime(value, errors="coerce")
+                    calendar_dates.append(value)
             elif isinstance(cal, pd.DataFrame) and not cal.empty:
                 if "Earnings Date" in cal.index:
-                    value = cal.loc["Earnings Date"].iloc[0]
-                    snapshot["earnings_date"] = pd.to_datetime(value, errors="coerce")
+                    calendar_dates.extend(list(cal.loc["Earnings Date"].dropna().values))
+                elif "Earnings Date" in cal.columns:
+                    calendar_dates.extend(list(cal["Earnings Date"].dropna().values))
         except Exception:
             pass
+
+        next_date, last_date = _split_earnings_dates(calendar_dates)
+        if pd.notna(next_date):
+            snapshot["next_earnings_date"] = next_date
+            snapshot["earnings_source"] = "Yahoo calendar"
+        if pd.notna(last_date):
+            snapshot["last_earnings_date"] = last_date
+
+        # Route 2: use the heavier earnings table only when the calendar did not
+        # produce a forward date. This preserves reliability without paying the
+        # latency cost on every ticker lookup.
+        if snapshot["next_earnings_date"] is None:
+            try:
+                earnings_dates = ticker.get_earnings_dates(limit=12)
+                values = []
+                if isinstance(earnings_dates, pd.DataFrame) and not earnings_dates.empty:
+                    values.extend(list(earnings_dates.index))
+                    for col in earnings_dates.columns:
+                        if "earnings date" in str(col).lower():
+                            values.extend(list(earnings_dates[col].dropna().values))
+                table_next, table_last = _split_earnings_dates(values)
+                if pd.notna(table_next):
+                    snapshot["next_earnings_date"] = table_next
+                    snapshot["earnings_source"] = "Yahoo earnings dates"
+                if snapshot["last_earnings_date"] is None and pd.notna(table_last):
+                    snapshot["last_earnings_date"] = table_last
+            except Exception:
+                pass
+
+        # Route 3: timestamp fields exposed through quote metadata. Use only if
+        # the first two routes did not verify a forward date.
+        if snapshot["next_earnings_date"] is None:
+            try:
+                timestamp_values = [
+                    info.get("earningsTimestamp"),
+                    info.get("earningsTimestampStart"),
+                    info.get("earningsTimestampEnd"),
+                ]
+                ts_next, ts_last = _split_earnings_dates([v for v in timestamp_values if v is not None])
+                if pd.notna(ts_next):
+                    snapshot["next_earnings_date"] = ts_next
+                    snapshot["earnings_source"] = "Yahoo quote timestamp"
+                if snapshot["last_earnings_date"] is None and pd.notna(ts_last):
+                    snapshot["last_earnings_date"] = ts_last
+            except Exception:
+                pass
     except Exception:
         pass
+
+    next_date = snapshot.get("next_earnings_date")
+    last_date = snapshot.get("last_earnings_date")
+    today = us_market_today()
+    if next_date is not None and not pd.isna(next_date):
+        snapshot["earnings_date"] = pd.Timestamp(next_date)
+        snapshot["event_data_confidence"] = "HIGH"
+    elif last_date is not None and not pd.isna(last_date):
+        snapshot["earnings_date"] = pd.Timestamp(last_date)
+        days_since = (today - pd.Timestamp(last_date).normalize()).days
+        # A very recent confirmed report is enough to know there is no same-day pre-earnings risk,
+        # but it does not verify the next quarter's scheduled date.
+        snapshot["event_data_confidence"] = "MEDIUM" if 0 <= days_since <= RECENT_EARNINGS_GRACE_DAYS else "LOW"
+        if not snapshot.get("earnings_source"):
+            snapshot["earnings_source"] = "Yahoo earnings history"
+
+    fundamental_available = 0
+    fundamental_available += bool(snapshot.get("sector"))
+    fundamental_available += int(pd.notna(snapshot.get("market_cap")))
+    fundamental_available += int(pd.notna(snapshot.get("trailing_pe")))
+    fundamental_available += int(pd.notna(snapshot.get("forward_pe")))
+    snapshot["fundamental_data_confidence"] = (
+        "HIGH" if fundamental_available >= 3 else "MEDIUM" if fundamental_available >= 1 else "LOW"
+    )
     return snapshot
 
+
+def evaluate_earnings_event(metadata, today=None):
+    """Convert earnings metadata into a conservative event-risk state.
+
+    Missing forward earnings timing is never treated as FALSE risk. A very recent
+    confirmed report gets a short grace period because another quarterly report
+    cannot reasonably occur immediately; otherwise an unverified next date blocks
+    an actionable swing plan.
+    """
+    market_day = us_market_today() if today is None else pd.Timestamp(today).normalize()
+    next_date = metadata.get("next_earnings_date")
+    last_date = metadata.get("last_earnings_date")
+    legacy_date = metadata.get("earnings_date")
+    source = metadata.get("earnings_source", "") or "Unverified"
+    confidence = metadata.get("event_data_confidence", "LOW") or "LOW"
+
+    def _fmt(ts):
+        return pd.Timestamp(ts).normalize().strftime("%d-%b-%Y")
+
+    if next_date is not None and not pd.isna(next_date):
+        event_date = pd.Timestamp(next_date).normalize()
+        days = (event_date - market_day).days
+        if days < 0:
+            return {
+                "text": f"{_fmt(event_date)} — provider date has passed; next date needs re-verification",
+                "risk": False, "state": "UNKNOWN", "block": True,
+                "block_reason": "The stored earnings date has passed and the next earnings date is not verified.",
+                "event_date": event_date, "source": source, "confidence": "LOW",
+            }
+        if days == 0:
+            text = f"{_fmt(event_date)} — Today"
+        else:
+            text = f"{_fmt(event_date)} — {days} days away"
+        if days <= EARNINGS_HARD_BLOCK_DAYS:
+            return {
+                "text": text, "risk": True, "state": "HIGH", "block": True,
+                "block_reason": (
+                    f"Confirmed earnings are {text}. New swing entries are blocked inside the "
+                    f"{EARNINGS_HARD_BLOCK_DAYS}-day earnings danger window."
+                ),
+                "event_date": event_date, "source": source, "confidence": "HIGH",
+            }
+        if days <= EARNINGS_CAUTION_DAYS:
+            return {
+                "text": text, "risk": True, "state": "CAUTION", "block": False,
+                "block_reason": "", "event_date": event_date, "source": source, "confidence": "HIGH",
+            }
+        return {
+            "text": text, "risk": False, "state": "CLEAR", "block": False,
+            "block_reason": "", "event_date": event_date, "source": source, "confidence": "HIGH",
+        }
+
+    if last_date is not None and not pd.isna(last_date):
+        event_date = pd.Timestamp(last_date).normalize()
+        days_since = (market_day - event_date).days
+        if 0 <= days_since <= RECENT_EARNINGS_GRACE_DAYS:
+            text = (
+                f"{_fmt(event_date)} — reported today" if days_since == 0 else
+                f"{_fmt(event_date)} — reported {days_since} day{'s' if days_since != 1 else ''} ago"
+            )
+            return {
+                "text": text, "risk": False, "state": "RECENT", "block": False,
+                "block_reason": "", "event_date": event_date, "source": source,
+                "confidence": "MEDIUM" if confidence != "HIGH" else "HIGH",
+            }
+        return {
+            "text": f"Last verified report: {_fmt(event_date)} — next earnings date not verified",
+            "risk": False, "state": "UNKNOWN", "block": True,
+            "block_reason": "The next earnings date could not be verified. Unknown event risk is not treated as safe.",
+            "event_date": event_date, "source": source, "confidence": "LOW",
+        }
+
+    # Compatibility path for metadata created by an older cached app version.
+    if legacy_date is not None and not pd.isna(legacy_date):
+        event_date = pd.Timestamp(legacy_date).normalize()
+        delta = (event_date - market_day).days
+        if delta >= 0:
+            temp = dict(metadata)
+            temp["next_earnings_date"] = event_date
+            temp["last_earnings_date"] = None
+            return evaluate_earnings_event(temp, today=market_day)
+        if -delta <= RECENT_EARNINGS_GRACE_DAYS:
+            temp = dict(metadata)
+            temp["next_earnings_date"] = None
+            temp["last_earnings_date"] = event_date
+            return evaluate_earnings_event(temp, today=market_day)
+
+    return {
+        "text": "Unknown — earnings date not verified",
+        "risk": False, "state": "UNKNOWN", "block": True,
+        "block_reason": "Earnings timing could not be verified. Unknown event risk is not treated as safe.",
+        "event_date": pd.NaT, "source": source, "confidence": "LOW",
+    }
 
 
 def sanitize_ohlcv(df):
@@ -670,6 +921,55 @@ def data_confidence(df, recent_lookback=14):
         ),
         "missing": missing,
     }
+
+
+def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan, event_block=False, event_reason=""):
+    """Canonical price-entry gate shared by scanner and ticker diagnostics.
+
+    `ema20_distance_pct` is expressed in percentage points (e.g. +8.5, not 0.085).
+    Scanner calls may omit stop_pct; ticker diagnostics add stop geometry and event risk.
+    """
+    direction = str(direction or "").upper()
+    dist = finite_or_nan(ema20_distance_pct)
+    rsi_value = finite_or_nan(rsi14)
+    stop_value = finite_or_nan(stop_pct)
+
+    if direction not in {"LONG", "SHORT"}:
+        return {"state": "NO TRADE", "quality": "N/A", "block": True, "reason": "Momentum/trend alignment is mixed."}
+
+    if not np.isfinite(dist) or not np.isfinite(rsi_value):
+        return {"state": "NO TRADE", "quality": "UNKNOWN", "block": True, "reason": "Entry location could not be validated."}
+
+    if direction == "LONG" and (dist > 8.0 or rsi_value >= 75):
+        return {
+            "state": "WAIT FOR PULLBACK", "quality": "WAIT", "block": True,
+            "reason": f"Extended: price is {dist:+.1f}% vs EMA20 and RSI is {rsi_value:.1f}. Do not chase.",
+        }
+    if direction == "SHORT" and (dist < -8.0 or rsi_value <= 25):
+        return {
+            "state": "WAIT FOR BOUNCE", "quality": "WAIT", "block": True,
+            "reason": f"Oversold: price is {dist:+.1f}% vs EMA20 and RSI is {rsi_value:.1f}. Do not chase weakness.",
+        }
+
+    if np.isfinite(stop_value):
+        if stop_value > 0.10:
+            return {
+                "state": "WAIT FOR BETTER ENTRY", "quality": "WAIT", "block": True,
+                "reason": f"Required stop is {stop_value:.1%}, above the 10% hard cap.",
+            }
+        if stop_value < 0.02:
+            return {
+                "state": "WAIT FOR STRUCTURE", "quality": "WAIT", "block": True,
+                "reason": f"Required stop is only {stop_value:.1%}, too tight for a normal swing setup.",
+            }
+
+    if event_block:
+        return {
+            "state": "WAIT — EVENT RISK", "quality": "WAIT", "block": True,
+            "reason": event_reason or "Earnings/event timing is not safely verified.",
+        }
+
+    return {"state": "ACTIONABLE", "quality": "PASS", "block": False, "reason": ""}
 
 
 def chart_frame_for_timeframe(base_df, timeframe):
@@ -970,6 +1270,9 @@ def compute_record(symbol, company, sector, df):
     x["Low252"] = x["Low"].rolling(252, min_periods=126).min()
     x["Volatility20"] = x["Close"].pct_change().rolling(20).std() * np.sqrt(252)
 
+    confidence = data_confidence(x, recent_lookback=14)
+    latest_date = pd.to_datetime(x["Date"], errors="coerce").max() if "Date" in x.columns else pd.NaT
+
     row = x.iloc[-1]
     record = {
         "Ticker": symbol,
@@ -995,6 +1298,11 @@ def compute_record(symbol, company, sector, df):
         "Low252": float(row["Low252"]) if pd.notna(row["Low252"]) else np.nan,
         "Volatility20": float(row["Volatility20"]) if pd.notna(row["Volatility20"]) else np.nan,
         "History Days": int(len(x)),
+        "Latest Date": latest_date,
+        "Price Data Confidence": confidence["level"],
+        "Price Data Confidence Score": confidence["score"],
+        "Price Data Block": bool(confidence["block"]),
+        "Price Data Note": confidence["message"],
     }
     record["Daily"] = momentum_score(record["1D %"], 2500)
     record["Weekly"] = momentum_score(record["1W %"], 700)
@@ -1080,30 +1388,42 @@ def run_market_scan(universe_df, progress_bar, status_box):
             break
 
     coverage = len(records) / max(len(tickers), 1)
+    usable_records = [r for r in records if not bool(r.get("Price Data Block", True))]
+    usable_coverage = len(usable_records) / max(len(tickers), 1)
 
-    if coverage < 0.20:
+    if coverage < 0.20 or usable_coverage < 0.20:
         health = {
             "status": "PROVIDER_FAILURE",
             "provider": "Yahoo",
             "coverage": coverage,
+            "usable_coverage": usable_coverage,
             "message": (
-                f"Yahoo bulk coverage collapsed to {len(records)}/{len(tickers)} "
-                f"({coverage:.0%}). Scan aborted to protect data integrity."
+                f"Yahoo bulk data integrity collapsed: raw coverage {len(records)}/{len(tickers)} "
+                f"({coverage:.0%}); fresh/usable coverage {len(usable_records)}/{len(tickers)} "
+                f"({usable_coverage:.0%}). Scan aborted to protect data integrity."
             ),
         }
-    elif coverage < 0.80:
+    elif coverage < 0.80 or usable_coverage < 0.80:
         health = {
             "status": "DEGRADED",
             "provider": "Yahoo",
             "coverage": coverage,
-            "message": f"Yahoo coverage is degraded: {len(records)}/{len(tickers)} ({coverage:.0%}).",
+            "usable_coverage": usable_coverage,
+            "message": (
+                f"Yahoo data is degraded: raw coverage {len(records)}/{len(tickers)} ({coverage:.0%}); "
+                f"fresh/usable {len(usable_records)}/{len(tickers)} ({usable_coverage:.0%})."
+            ),
         }
     else:
         health = {
             "status": "HEALTHY",
             "provider": "Yahoo",
             "coverage": coverage,
-            "message": f"Yahoo coverage healthy: {len(records)}/{len(tickers)} ({coverage:.0%}).",
+            "usable_coverage": usable_coverage,
+            "message": (
+                f"Yahoo coverage healthy: {len(records)}/{len(tickers)} ({coverage:.0%}); "
+                f"fresh/usable {len(usable_records)}/{len(tickers)} ({usable_coverage:.0%})."
+            ),
         }
 
     return pd.DataFrame(records), failures, health
@@ -1180,7 +1500,7 @@ def is_regime_aligned(row):
         return setup in {"A+ Short", "A Short", "B+ Short", "Short Watch", "Technical Short"}
     return setup not in {"Neutral", "Mixed"}
 
-def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
+def build_ranked_master(df):
     """Professional swing-candidate ranking engine.
 
     Design:
@@ -1278,8 +1598,12 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     history_ok = x["History Days"].fillna(0) >= 126
     atr_ok = x["ATR %"].between(1.0, 8.0, inclusive="both")
     data_ok = x[["Close", "EMA20", "EMA50", "RSI14", "Momentum Score"]].notna().all(axis=1)
+    if "Price Data Block" in x.columns:
+        price_confidence_ok = ~x["Price Data Block"].fillna(True).astype(bool)
+    else:
+        price_confidence_ok = pd.Series(True, index=x.index)
 
-    x["Tradeable"] = price_ok & liquidity_ok & history_ok & atr_ok & data_ok
+    x["Tradeable"] = price_ok & liquidity_ok & history_ok & atr_ok & data_ok & price_confidence_ok
 
     def gate_reason(row):
         reasons = []
@@ -1293,6 +1617,8 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
             reasons.append("ATR unavailable")
         elif not (1.0 <= row["ATR %"] <= 8.0):
             reasons.append("ATR% outside 1-8%")
+        if bool(row.get("Price Data Block", False)):
+            reasons.append("LOW price-data confidence")
         return "; ".join(reasons)
 
     x["Gate Note"] = x.apply(gate_reason, axis=1)
@@ -1437,6 +1763,42 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
 
     x.loc[x["Momentum Score"].abs() < 15, "Setup"] = "Neutral"
 
+    # Canonical price-entry gate. Scanner does not fetch earnings metadata for every
+    # symbol; final event verification remains part of the ticker diagnostic.
+    entry_results = []
+    for _, row in x.iterrows():
+        if row.get("Momentum Score", 0) >= 15 and row.get("Close", np.nan) > row.get("EMA20", np.nan):
+            direction = "LONG"
+        elif row.get("Momentum Score", 0) <= -15 and row.get("Close", np.nan) < row.get("EMA20", np.nan):
+            direction = "SHORT"
+        else:
+            direction = ""
+        entry_results.append(
+            evaluate_entry_quality(
+                direction,
+                row.get("EMA20 Distance %", np.nan),
+                row.get("RSI14", np.nan),
+            )
+        )
+    x["Price Entry State"] = [r["state"] for r in entry_results]
+    price_data_block = x.get("Price Data Block", pd.Series(False, index=x.index)).fillna(True).astype(bool)
+    raw_entry_pass = pd.Series([not r["block"] for r in entry_results], index=x.index)
+    x["Price Entry Gate Pass"] = raw_entry_pass & ~price_data_block
+    x["Entry Quality"] = np.where(
+        price_data_block,
+        "N/A — DATA ISSUE",
+        np.where(raw_entry_pass, "PRICE READY", [r["quality"] for r in entry_results]),
+    )
+    x["Entry Block Reason"] = [r["reason"] for r in entry_results]
+    x.loc[price_data_block, "Entry Block Reason"] = x.loc[price_data_block, "Price Data Note"].fillna(
+        "LOW price-data confidence"
+    ) if "Price Data Note" in x.columns else "LOW price-data confidence"
+    x["Scanner Action"] = np.where(
+        price_data_block,
+        "DATA BLOCK",
+        np.where(x["Price Entry Gate Pass"], "VERIFY EVENT + STOP", x["Price Entry State"]),
+    )
+
     # Explainability columns.
     x["Trend Check"] = np.where(long_trend | short_trend, "✅", "❌")
     x["Momentum Check"] = np.where(
@@ -1469,6 +1831,8 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
         for name, check in checks:
             (strengths if check == "✅" else weaknesses).append(name)
         note = f"{int(row['Quality Score'])}/100 quality score."
+        if not bool(row.get("Price Entry Gate Pass", False)) and row.get("Entry Block Reason"):
+            note += " Candidate quality is separate from entry quality: WAIT — " + str(row.get("Entry Block Reason"))
         if strengths:
             note += " Strengths: " + ", ".join(strengths) + "."
         if weaknesses:
@@ -1480,7 +1844,26 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
     # Regime alignment.
     x["Regime Aligned"] = x.apply(is_regime_aligned, axis=1)
 
-    # User filter reasons remain separate from the professional grade.
+
+    # Ranking is now dominated by the professional Quality Score.
+    # RS and volume are tie-breakers only.
+    x["Adjusted Score"] = (
+        x["Quality Score"]
+        + x["RS Edge"].fillna(0).clip(-10, 10) * 0.20
+        + (x["Volume Ratio"].fillna(1) - 1).clip(-0.5, 1.5) * 2.0
+    )
+    x["Adjusted Score"] = x["Adjusted Score"].replace([np.inf, -np.inf], np.nan).fillna(-9999.0)
+    ranks = x["Adjusted Score"].rank(method="min", ascending=False, na_option="bottom")
+    x["Rank"] = ranks.fillna(len(x) + 1).round().astype("Int64")
+    return x
+
+
+def apply_scanner_filters(ranked_df, min_composite, min_volume, rsi_low, rsi_high):
+    """Cheap UI-only filter layer applied to the cached/session-ranked master scan."""
+    if ranked_df.empty:
+        return ranked_df
+    x = ranked_df.copy()
+
     def reasons(row):
         out = []
         if not bool(row.get("Tradeable", False)):
@@ -1503,19 +1886,7 @@ def add_ranking_fields(df, min_composite, min_volume, rsi_low, rsi_high):
 
     x["Filter Reasons"] = x.apply(reasons, axis=1)
     x["Passes Filters"] = x["Filter Reasons"].eq("")
-
-    # Ranking is now dominated by the professional Quality Score.
-    # RS and volume are tie-breakers only.
-    x["Adjusted Score"] = (
-        x["Quality Score"]
-        + x["RS Edge"].fillna(0).clip(-10, 10) * 0.20
-        + (x["Volume Ratio"].fillna(1) - 1).clip(-0.5, 1.5) * 2.0
-    )
-    x["Adjusted Score"] = x["Adjusted Score"].replace([np.inf, -np.inf], np.nan).fillna(-9999.0)
-    ranks = x["Adjusted Score"].rank(method="min", ascending=False, na_option="bottom")
-    x["Rank"] = ranks.fillna(len(x) + 1).round().astype("Int64")
     return x
-
 
 
 def compute_search_diagnostic(symbol, company, df, metadata):
@@ -1665,16 +2036,19 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     sector = metadata.get("sector", "") or "N/A"
     industry = metadata.get("industry", "") or ""
 
+    next_earnings_date = metadata.get("next_earnings_date")
+    last_earnings_date = metadata.get("last_earnings_date")
     earnings_date = metadata.get("earnings_date")
-    earnings_text = "No date available"
-    earnings_risk = False
-    if earnings_date is not None and not pd.isna(earnings_date):
-        days = (pd.Timestamp(earnings_date).normalize() - pd.Timestamp.today().normalize()).days
-        if days >= 0:
-            earnings_risk = days <= 14
-            earnings_text = f"{days} days away" if days > 0 else "Today"
-        else:
-            earnings_text = "Recently reported"
+    fundamental_data_confidence = metadata.get("fundamental_data_confidence", "LOW") or "LOW"
+
+    earnings_event = evaluate_earnings_event(metadata)
+    earnings_text = earnings_event["text"]
+    earnings_risk = bool(earnings_event["risk"])
+    earnings_risk_state = earnings_event["state"]
+    earnings_event_block = bool(earnings_event["block"])
+    earnings_event_block_reason = earnings_event["block_reason"]
+    earnings_source = earnings_event["source"]
+    event_data_confidence = earnings_event["confidence"]
 
     high20 = float(x["High"].iloc[-21:-1].max()) if len(x) >= 21 else close
     low20 = float(x["Low"].iloc[-21:-1].min()) if len(x) >= 21 else close
@@ -1787,6 +2161,24 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         trade_state = "NO TRADE"
         trade_block_reason = "Momentum/trend alignment is mixed."
 
+    # Shared Phase-1 entry gate is authoritative for extension, stop geometry and event risk.
+    gate_direction = "LONG" if long_bias else "SHORT" if short_bias else ""
+    entry_gate = evaluate_entry_quality(
+        gate_direction,
+        dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
+        rsi14,
+        stop_pct=stop_pct,
+        event_block=earnings_event_block,
+        event_reason=earnings_event_block_reason,
+    )
+    if entry_gate["block"]:
+        if trade_state == "ACTIONABLE" or earnings_event_block:
+            bias = "WAIT"
+            trade_state = entry_gate["state"]
+            trade_block_reason = entry_gate["reason"]
+            entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+    entry_quality = "PASS" if trade_state == "ACTIONABLE" else "WAIT"
+
     points = 0
     points += 2 if bull_stack else 1 if bull_mid else -2 if bear_stack else -1 if bear_mid else 0
     points += 2 if composite >= 40 else 1 if composite >= 20 else -2 if composite <= -40 else -1 if composite <= -20 else 0
@@ -1800,7 +2192,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     elif bias == "SHORT":
         verdict = "A — ACTIONABLE SHORT" if points <= -5 else "B+ — SHORT WATCH" if points <= -3 else "B — CONDITIONAL SHORT" if points <= -1 else "C — WAIT"
     else:
-        verdict = "C — WAIT / MIXED"
+        verdict = "C — WAIT / EVENT RISK" if trade_state == "WAIT — EVENT RISK" else "C — WAIT / MIXED"
 
     # Plain-English interpretation for the UI.
     if composite >= 70:
@@ -1858,7 +2250,12 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Chase Risk": chase_risk,
         "Trade Comment": trade_comment,
         "Sector": sector, "Industry": industry, "Earnings": earnings_text,
-        "Earnings Risk": earnings_risk, "Bias": bias, "Verdict": verdict,
+        "Earnings Risk": earnings_risk, "Earnings Risk State": earnings_risk_state,
+        "Earnings Date": earnings_date, "Next Earnings Date": next_earnings_date,
+        "Last Earnings Date": last_earnings_date, "Earnings Source": earnings_source,
+        "Event Data Confidence": event_data_confidence,
+        "Fundamental Data Confidence": fundamental_data_confidence,
+        "Entry Quality": entry_quality, "Bias": bias, "Verdict": verdict,
         "Entry Low": entry_low, "Entry High": entry_high, "Stop": stop,
         "Target 1": target1, "Target 2": target2, "RR": rr,
         "Trade State": trade_state,
@@ -1949,22 +2346,23 @@ with ticker_tab:
 
             if confidence["level"] == "HIGH":
                 st.success(
-                    f"🟢 **Data Confidence: HIGH** — {confidence['message']} "
+                    f"🟢 **Price Data Confidence: HIGH** — {confidence['message']} "
                     f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
             elif confidence["level"] == "MEDIUM":
                 st.warning(
-                    f"🟠 **Data Confidence: MEDIUM** — {confidence['message']} "
+                    f"🟠 **Price Data Confidence: MEDIUM** — {confidence['message']} "
                     f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
             else:
                 st.error(
-                    f"🔴 **Data Confidence: LOW — DO NOT ACT.** {confidence['message']} "
+                    f"🔴 **Price Data Confidence: LOW — DO NOT ACT.** {confidence['message']} "
                     f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
                 diag["Trade State"] = "DATA ISSUE"
                 diag["Trade Block Reason"] = confidence["message"]
                 diag["Bias"] = "WAIT"
+                diag["Verdict"] = "C — DATA ISSUE / DO NOT ACT"
                 diag["Entry Low"] = diag["Entry High"] = diag["Stop"] = np.nan
                 diag["Target 1"] = diag["Target 2"] = diag["RR"] = np.nan
                 diag["Stop %"] = np.nan
@@ -2023,7 +2421,7 @@ with ticker_tab:
             cq1.metric("Candidate Quality", candidate_quality)
             cq2.metric("Entry Quality", entry_quality)
             cq3.metric("Action", action_label)
-            cq4.metric("Data Confidence", confidence["level"])
+            cq4.metric("Price Data Confidence", confidence["level"])
             st.caption(
                 "Quality Engine: **Candidate Quality** asks whether the stock is worth watching; "
                 "**Entry Quality** asks whether today's location/risk is acceptable; "
@@ -2137,19 +2535,40 @@ with ticker_tab:
                 missing_meta.append("trailing P/E")
             if pd.isna(diag["Forward PE"]):
                 missing_meta.append("forward P/E")
-            if diag["Earnings"] == "No date available":
-                missing_meta.append("earnings date")
+            if diag["Event Data Confidence"] == "LOW":
+                missing_meta.append("verified earnings date")
             if missing_meta:
                 st.warning(
-                    "Some fundamental metadata could not be retrieved from the current data provider: "
+                    "Some fundamental/event metadata could not be fully retrieved: "
                     + ", ".join(missing_meta)
                     + ". This is a data-availability issue, not an indication that the company has no such data."
                 )
 
-            if diag["Earnings Risk"]:
-                st.warning(f"⚠️ Earnings risk: {diag['Earnings']}. Consider reducing size or waiting.")
+            md1, md2 = st.columns(2)
+            md1.metric("Fundamental Data Confidence", diag["Fundamental Data Confidence"])
+            md2.metric("Event Data Confidence", diag["Event Data Confidence"])
+
+            event_state = diag.get("Earnings Risk State", "UNKNOWN")
+            source_text = diag.get("Earnings Source", "Unverified")
+            if event_state == "UNKNOWN":
+                st.error(
+                    f"🔴 **Earnings timing UNKNOWN** — {diag['Earnings']}. "
+                    "Unknown event risk is not treated as safe; actionable trade plans are blocked until the event is verified."
+                )
+            elif event_state == "HIGH":
+                st.warning(
+                    f"⚠️ **Earnings danger window** — {diag['Earnings']}. "
+                    f"Source: {source_text}. New swing entries are blocked inside {EARNINGS_HARD_BLOCK_DAYS} days."
+                )
+            elif event_state == "CAUTION":
+                st.warning(
+                    f"⚠️ **Upcoming earnings** — {diag['Earnings']}. Source: {source_text}. "
+                    "Event risk is inside the 14-day caution window."
+                )
+            elif event_state == "RECENT":
+                st.info(f"Earnings: {diag['Earnings']}. Source: {source_text}. Recent post-earnings volatility may remain elevated.")
             else:
-                st.info(f"Earnings: {diag['Earnings']}")
+                st.info(f"Earnings: {diag['Earnings']}. Source: {source_text}.")
 
             st.markdown("### Decision Summary")
             d1, d2 = st.columns(2)
@@ -2202,7 +2621,7 @@ with ticker_tab:
                         "(non-blocking; ≥1.0x preferred, ≥1.2x stronger)"
                     )
                 if confidence["level"] != "HIGH":
-                    risks.append(f"Data Confidence is {confidence['level']}")
+                    risks.append(f"Price Data Confidence is {confidence['level']}")
                 if diag["Trade State"] != "ACTIONABLE":
                     risks.append(diag.get("Trade Block Reason", diag["Trade State"]))
                 if risks:
@@ -2234,6 +2653,10 @@ with ticker_tab:
                 defects = []
                 if confidence["block"]:
                     defects.append("DATA")
+                if diag.get("Earnings Risk State") == "UNKNOWN":
+                    defects.append("EVENT VERIFICATION")
+                elif diag.get("Earnings Risk State") == "HIGH":
+                    defects.append("EARNINGS WINDOW")
                 if bullish_candidate and pd.notna(dist_now) and dist_now > 0.08:
                     defects.append("PRICE EXTENSION")
                 if bearish_candidate and pd.notna(dist_now) and dist_now < -0.08:
@@ -2256,6 +2679,10 @@ with ticker_tab:
 
                 if "DATA" in defects:
                     repair_mode = "DATA REPAIR"
+                elif "EVENT VERIFICATION" in defects:
+                    repair_mode = "EVENT VERIFICATION"
+                elif "EARNINGS WINDOW" in defects:
+                    repair_mode = "WAIT THROUGH EARNINGS"
                 elif "DIRECTIONAL ALIGNMENT" in defects:
                     repair_mode = "WAIT FOR STRUCTURE"
                 elif "PRICE EXTENSION" in defects or "RSI EXTENSION" in defects:
@@ -2276,6 +2703,10 @@ with ticker_tab:
                     st.caption("No major repair defect is currently identified.")
 
                 repair_items = []
+                if diag.get("Earnings Risk State") == "UNKNOWN":
+                    repair_items.append("Verify the next earnings date before any actionable swing entry is published.")
+                elif diag.get("Earnings Risk State") == "HIGH":
+                    repair_items.append(f"Wait until the confirmed earnings danger window has passed: {diag['Earnings']}.")
                 repair_boundary = invalidation = np.nan
                 preferred_low = preferred_high = np.nan
 
@@ -2363,7 +2794,7 @@ with ticker_tab:
                         "Maintain trend and relative-strength leadership while preserving acceptable entry location, stop distance and R:R."
                     )
                 if confidence["level"] == "MEDIUM":
-                    repair_items.append("Restore HIGH Data Confidence if the isolated data gap can be repaired.")
+                    repair_items.append("Restore HIGH Price Data Confidence if the isolated data gap can be repaired.")
                 for item in repair_items:
                     st.write(f"• {item}")
 
@@ -2393,7 +2824,7 @@ with ticker_tab:
 
                 if confidence["level"] != "HIGH":
                     considerations.append(
-                        f"Data Confidence is {confidence['level']}; use additional caution."
+                        f"Price Data Confidence is {confidence['level']}; use additional caution."
                     )
 
                 if considerations:
@@ -2513,10 +2944,9 @@ with scanner_tab:
         st.caption(f"Universe contains **{len(universe_df):,}** unique symbols.")
 
     st.info(
-        "**Professional Quality Engine:** first applies hard tradeability gates "
-        "(price, liquidity, history, ATR), then scores each stock from **0–100**. "
-        "A+ ≥90, A ≥82, B+ ≥74. Ranking emphasizes trend quality, relative strength, "
-        "persistent momentum, liquidity/volume, entry location, volatility, and market-regime fit."
+        "**Professional Quality Engine:** first applies hard tradeability/data gates, then scores each stock from **0–100**. "
+        "A+ ≥90, A ≥82, B+ ≥74. **Scanner grade is candidate quality, not permission to enter.** "
+        "Price-ready candidates must still verify earnings/event timing and stop geometry in Ticker Search before action."
     )
 
     st.caption(
@@ -2545,6 +2975,9 @@ with scanner_tab:
 
     if clear_scan:
         st.session_state.scan_df = pd.DataFrame()
+        st.session_state.scan_ranked_df = pd.DataFrame()
+        st.session_state.scan_ranked_regime_label = ""
+        st.session_state.scan_ranked_engine_version = ""
         st.session_state.scan_universe_name = ""
         st.session_state.scan_timestamp = None
         st.session_state.scan_errors = []
@@ -2552,8 +2985,7 @@ with scanner_tab:
 
     if run_scan:
         if universe_df.empty:
-            st.cache_data.clear()
-            universe_df = get_universe(universe_name, watchlist_text)
+            universe_df = refresh_universe(universe_name, watchlist_text)
         if universe_df.empty:
             st.error(
                 f"Could not load the {universe_name} constituent list. "
@@ -2580,6 +3012,9 @@ with scanner_tab:
             )
             if previous is not None and not previous.get("df", pd.DataFrame()).empty:
                 st.session_state.scan_df = previous["df"].copy()
+                st.session_state.scan_ranked_df = pd.DataFrame()
+                st.session_state.scan_ranked_regime_label = ""
+                st.session_state.scan_ranked_engine_version = ""
                 st.session_state.scan_universe_name = universe_name
                 st.session_state.scan_timestamp = previous["timestamp"]
                 st.session_state.scan_errors = previous.get("failures", [])
@@ -2594,6 +3029,9 @@ with scanner_tab:
                 )
         else:
             st.session_state.scan_df = results
+            st.session_state.scan_ranked_df = pd.DataFrame()
+            st.session_state.scan_ranked_regime_label = ""
+            st.session_state.scan_ranked_engine_version = ""
             st.session_state.scan_universe_name = universe_name
             st.session_state.scan_timestamp = datetime.now()
             st.session_state.scan_errors = failures
@@ -2616,7 +3054,21 @@ with scanner_tab:
 
     scan_df = st.session_state.scan_df
     if not scan_df.empty:
-        ranked = add_ranking_fields(scan_df, min_composite, min_volume, rsi_low, rsi_high)
+        needs_rank_rebuild = (
+            st.session_state.scan_ranked_df.empty
+            or st.session_state.scan_ranked_regime_label != regime["label"]
+            or st.session_state.scan_ranked_engine_version != PHASE1_ENGINE_VERSION
+        )
+        if needs_rank_rebuild:
+            with st.spinner("Building ranked master scan..."):
+                st.session_state.scan_ranked_df = build_ranked_master(scan_df)
+                st.session_state.scan_ranked_regime_label = regime["label"]
+                st.session_state.scan_ranked_engine_version = PHASE1_ENGINE_VERSION
+
+        ranked = apply_scanner_filters(
+            st.session_state.scan_ranked_df,
+            min_composite, min_volume, rsi_low, rsi_high,
+        )
 
         scan_time = st.session_state.scan_timestamp
         when = scan_time.strftime("%H:%M:%S") if scan_time else ""
@@ -2627,25 +3079,31 @@ with scanner_tab:
 
         a_plus_mask = ranked["Setup"].isin(["A+ Long", "A+ Short"])
         a_plus_count = int(a_plus_mask.sum())
-        st.caption("A+ = professional Quality Score ≥90 after tradeability gates. High score alone is not enough if liquidity/history/ATR gates fail.")
-        k1, k2, k3, k4 = st.columns(4)
+        quality_mask = ranked["Setup"].isin(["A+ Long","A Long","B+ Long","A+ Short","A Short","B+ Short"])
+        price_ready_mask = quality_mask & ranked["Price Entry Gate Pass"].fillna(False)
+        st.caption(
+            "A+ = candidate Quality Score ≥90 after tradeability/data gates. "
+            "A+ can correctly remain WAIT when current price location is poor; scanner price-readiness still requires event/stop verification."
+        )
+        k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Stocks analyzed", f"{len(ranked):,}")
-        k2.metric("Quality candidates", f"{int(ranked['Setup'].isin(['A+ Long','A Long','B+ Long','A+ Short','A Short','B+ Short']).sum()):,}")
-        k3.metric("Regime-aligned", f"{int(ranked['Regime Aligned'].sum()):,}")
+        k2.metric("Quality candidates", f"{int(quality_mask.sum()):,}")
+        k3.metric("Price-ready", f"{int(price_ready_mask.sum()):,}")
+        k4.metric("Regime-aligned", f"{int(ranked['Regime Aligned'].sum()):,}")
 
-        with k4:
-            st.caption("A+ setups")
+        with k5:
+            st.caption("A+ candidates")
             if st.button(
                 f"{a_plus_count:,}",
                 key="a_plus_count_button",
                 use_container_width=True,
-                help="Tap to show the exact A+ setup list.",
+                help="Tap to show the exact A+ candidate list, including WAIT states.",
             ):
                 st.session_state.show_a_plus = not st.session_state.show_a_plus
 
-        # A+ setup drilldown
+        # A+ candidate drilldown
         if st.session_state.show_a_plus:
-            st.markdown("### ⭐ A+ Setups")
+            st.markdown("### ⭐ A+ Quality Candidates")
             aplus = ranked[a_plus_mask].copy().sort_values(
                 ["Adjusted Score", "Volume Ratio"],
                 ascending=[False, False],
@@ -2655,12 +3113,13 @@ with scanner_tab:
                 st.info("There are currently no A+ setups in this scan.")
             else:
                 st.caption(
-                    f"Exact A+ count: **{len(aplus):,}**. "
-                    "Select a ticker below to open its chart."
+                    f"Exact A+ candidate count: **{len(aplus):,}**. "
+                    "WAIT states are preserved; select a ticker below to inspect price structure."
                 )
 
                 aplus_cols = [
                     "Ticker", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
+                    "Entry Quality", "Scanner Action", "Price Data Confidence",
                     "RS Rating", "RS Edge", "Momentum Score", "RSI14",
                     "Volume Ratio", "ATR %", "EMA20 Distance %", "20D High Distance %",
                     "Avg Dollar Volume 20", "Setup Note",
@@ -2728,12 +3187,13 @@ with scanner_tab:
                     d["EMA50"] = d["Close"].ewm(span=50, adjust=False).mean()
                     d["EMA200"] = d["Close"].ewm(span=200, adjust=False).mean()
 
-                    c1, c2, c3, c4, c5 = st.columns(5)
-                    c1.metric("Grade", selected_row["Setup"])
+                    c1, c2, c3, c4, c5, c6 = st.columns(6)
+                    c1.metric("Candidate Grade", selected_row["Setup"])
                     c2.metric("Quality Score", f"{selected_row['Quality Score']:.0f}/100")
-                    c3.metric("Setup Type", selected_row.get("Setup Type", "N/A"))
-                    c4.metric("RS Rating", f"{int(selected_row['RS Rating'])}" if pd.notna(selected_row.get("RS Rating")) else "N/A")
-                    c5.metric("Momentum Score", f"{selected_row['Momentum Score']:.1f}")
+                    c3.metric("Entry Quality", selected_row.get("Entry Quality", "N/A"))
+                    c4.metric("Scanner Action", selected_row.get("Scanner Action", "N/A"))
+                    c5.metric("RS Rating", f"{int(selected_row['RS Rating'])}" if pd.notna(selected_row.get("RS Rating")) else "N/A")
+                    c6.metric("Momentum Score", f"{selected_row['Momentum Score']:.1f}")
 
                     st.caption(selected_row.get("Setup Note", ""))
                     st.markdown(
@@ -2775,7 +3235,7 @@ with scanner_tab:
                         x=chart_df["Date"], y=chart_df["EMA200"], name="EMA200"
                     ))
                     fig_aplus.update_layout(
-                        title=f"{selected_aplus} — A+ Setup Chart ({timeframe})",
+                        title=f"{selected_aplus} — A+ Candidate Chart ({timeframe})",
                         height=480,
                         xaxis_rangeslider_visible=False,
                         margin=dict(l=5, r=5, t=45, b=5),
@@ -2784,14 +3244,13 @@ with scanner_tab:
 
         view_mode = st.segmented_control(
             "View",
-            ["Quality Candidates", "Passing Filters", "Regime-Aligned", "All"],
+            ["Quality Candidates", "Price-Ready Candidates", "Passing Filters", "Regime-Aligned", "All"],
             default="Quality Candidates",
         )
         if view_mode == "Quality Candidates":
-            shown = ranked[
-                ranked["Tradeable"]
-                & ranked["Setup"].isin(["A+ Long", "A Long", "B+ Long", "A+ Short", "A Short", "B+ Short"])
-            ].copy()
+            shown = ranked[quality_mask].copy()
+        elif view_mode == "Price-Ready Candidates":
+            shown = ranked[price_ready_mask].copy()
         elif view_mode == "Passing Filters":
             shown = ranked[ranked["Passes Filters"]].copy()
         elif view_mode == "Regime-Aligned":
@@ -2806,6 +3265,7 @@ with scanner_tab:
 
         display_cols = [
             "Rank", "Ticker", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
+            "Entry Quality", "Scanner Action", "Price Entry Gate Pass", "Price Data Confidence",
             "Tradeable", "Regime Aligned", "RS Rating", "RS Edge",
             "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
             "EMA20 Distance %", "20D High Distance %", "Avg Dollar Volume 20",
