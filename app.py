@@ -1,4 +1,4 @@
-# Quality Engine v7.0 — Phase 1 Final (Completed-Session + Event Risk Integrity)
+# Quality Engine v7.0 — Phase 1 Freeze (Direction-Aware + Event Certainty)
 
 import io
 import time
@@ -31,7 +31,7 @@ YAHOO_BATCH_SIZE = 120
 SCAN_CACHE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-PHASE1_ENGINE_VERSION = "v7.0-P1.2"
+PHASE1_ENGINE_VERSION = "v7.0-P1.3-FREEZE"
 EARNINGS_HARD_BLOCK_DAYS = 3
 EARNINGS_CAUTION_DAYS = 14
 RECENT_EARNINGS_GRACE_DAYS = 5
@@ -458,7 +458,8 @@ def get_company_snapshot(symbol):
         "next_earnings_date": None,
         "last_earnings_date": None,
         "earnings_source": "",
-        "event_data_confidence": "LOW",
+        "event_data_confidence": "LOW — UNKNOWN",
+        "earnings_certainty": "UNKNOWN",
         "fundamental_data_confidence": "LOW",
     }
     try:
@@ -553,13 +554,25 @@ def get_company_snapshot(symbol):
     today = us_market_today()
     if next_date is not None and not pd.isna(next_date):
         snapshot["earnings_date"] = pd.Timestamp(next_date)
-        snapshot["event_data_confidence"] = "HIGH"
+        # Phase 1.3: a future Yahoo date is useful for risk control, but it is not
+        # equivalent to a company/primary-source confirmation. Keep the schema
+        # ready for a future primary-source verifier via earnings_confirmed=True.
+        if bool(snapshot.get("earnings_confirmed", False)):
+            snapshot["earnings_certainty"] = "CONFIRMED"
+            snapshot["event_data_confidence"] = "HIGH — CONFIRMED"
+        else:
+            snapshot["earnings_certainty"] = "ESTIMATED"
+            snapshot["event_data_confidence"] = "MEDIUM — ESTIMATED"
     elif last_date is not None and not pd.isna(last_date):
         snapshot["earnings_date"] = pd.Timestamp(last_date)
         days_since = (today - pd.Timestamp(last_date).normalize()).days
-        # A very recent confirmed report is enough to know there is no same-day pre-earnings risk,
-        # but it does not verify the next quarter's scheduled date.
-        snapshot["event_data_confidence"] = "MEDIUM" if 0 <= days_since <= RECENT_EARNINGS_GRACE_DAYS else "LOW"
+        # A recent historical report can reduce immediate event ambiguity, but it
+        # does not verify the next quarter's date.
+        snapshot["earnings_certainty"] = "UNKNOWN"
+        snapshot["event_data_confidence"] = (
+            "MEDIUM — NEXT DATE UNKNOWN" if 0 <= days_since <= RECENT_EARNINGS_GRACE_DAYS
+            else "LOW — UNKNOWN"
+        )
         if not snapshot.get("earnings_source"):
             snapshot["earnings_source"] = "Yahoo earnings history"
 
@@ -577,52 +590,69 @@ def get_company_snapshot(symbol):
 def evaluate_earnings_event(metadata, today=None):
     """Convert earnings metadata into a conservative event-risk state.
 
-    Missing forward earnings timing is never treated as FALSE risk. A very recent
-    confirmed report gets a short grace period because another quarterly report
-    cannot reasonably occur immediately; otherwise an unverified next date blocks
-    an actionable swing plan.
+    Phase 1.3 separates *date availability* from *date certainty*:
+      CONFIRMED = explicitly verified by a primary/company source or override.
+      ESTIMATED = provider-supplied future date (Yahoo routes in this build).
+      UNKNOWN   = no usable next event date.
+
+    Estimated dates still protect the account: if an estimate falls inside the
+    hard danger window, the engine blocks new swing entries conservatively.
     """
     market_day = us_market_today() if today is None else pd.Timestamp(today).normalize()
     next_date = metadata.get("next_earnings_date")
     last_date = metadata.get("last_earnings_date")
     legacy_date = metadata.get("earnings_date")
     source = metadata.get("earnings_source", "") or "Unverified"
-    confidence = metadata.get("event_data_confidence", "LOW") or "LOW"
+    certainty = str(metadata.get("earnings_certainty", "UNKNOWN") or "UNKNOWN").upper()
+    if certainty not in {"CONFIRMED", "ESTIMATED", "UNKNOWN"}:
+        certainty = "UNKNOWN"
 
     def _fmt(ts):
         return pd.Timestamp(ts).normalize().strftime("%d-%b-%Y")
 
+    def _confidence_for(cert):
+        if cert == "CONFIRMED":
+            return "HIGH — CONFIRMED"
+        if cert == "ESTIMATED":
+            return "MEDIUM — ESTIMATED"
+        return "LOW — UNKNOWN"
+
     if next_date is not None and not pd.isna(next_date):
         event_date = pd.Timestamp(next_date).normalize()
         days = (event_date - market_day).days
+        confidence = _confidence_for(certainty)
         if days < 0:
             return {
                 "text": f"{_fmt(event_date)} — provider date has passed; next date needs re-verification",
                 "risk": False, "state": "UNKNOWN", "block": True,
                 "block_reason": "The stored earnings date has passed and the next earnings date is not verified.",
-                "event_date": event_date, "source": source, "confidence": "LOW",
+                "event_date": event_date, "source": source, "confidence": "LOW — UNKNOWN",
+                "certainty": "UNKNOWN",
             }
-        if days == 0:
-            text = f"{_fmt(event_date)} — Today"
-        else:
-            text = f"{_fmt(event_date)} — {days} days away"
+
+        text = f"{_fmt(event_date)} — Today" if days == 0 else f"{_fmt(event_date)} — {days} days away"
+        label = "Confirmed earnings" if certainty == "CONFIRMED" else "Estimated earnings date"
+
         if days <= EARNINGS_HARD_BLOCK_DAYS:
             return {
                 "text": text, "risk": True, "state": "HIGH", "block": True,
                 "block_reason": (
-                    f"Confirmed earnings are {text}. New swing entries are blocked inside the "
+                    f"{label} is {text}. New swing entries are blocked inside the "
                     f"{EARNINGS_HARD_BLOCK_DAYS}-day earnings danger window."
                 ),
-                "event_date": event_date, "source": source, "confidence": "HIGH",
+                "event_date": event_date, "source": source, "confidence": confidence,
+                "certainty": certainty,
             }
         if days <= EARNINGS_CAUTION_DAYS:
             return {
                 "text": text, "risk": True, "state": "CAUTION", "block": False,
-                "block_reason": "", "event_date": event_date, "source": source, "confidence": "HIGH",
+                "block_reason": "", "event_date": event_date, "source": source,
+                "confidence": confidence, "certainty": certainty,
             }
         return {
             "text": text, "risk": False, "state": "CLEAR", "block": False,
-            "block_reason": "", "event_date": event_date, "source": source, "confidence": "HIGH",
+            "block_reason": "", "event_date": event_date, "source": source,
+            "confidence": confidence, "certainty": certainty,
         }
 
     if last_date is not None and not pd.isna(last_date):
@@ -636,13 +666,14 @@ def evaluate_earnings_event(metadata, today=None):
             return {
                 "text": text, "risk": False, "state": "RECENT", "block": False,
                 "block_reason": "", "event_date": event_date, "source": source,
-                "confidence": "MEDIUM" if confidence != "HIGH" else "HIGH",
+                "confidence": "MEDIUM — NEXT DATE UNKNOWN", "certainty": "UNKNOWN",
             }
         return {
             "text": f"Last verified report: {_fmt(event_date)} — next earnings date not verified",
             "risk": False, "state": "UNKNOWN", "block": True,
             "block_reason": "The next earnings date could not be verified. Unknown event risk is not treated as safe.",
-            "event_date": event_date, "source": source, "confidence": "LOW",
+            "event_date": event_date, "source": source, "confidence": "LOW — UNKNOWN",
+            "certainty": "UNKNOWN",
         }
 
     # Compatibility path for metadata created by an older cached app version.
@@ -653,6 +684,7 @@ def evaluate_earnings_event(metadata, today=None):
             temp = dict(metadata)
             temp["next_earnings_date"] = event_date
             temp["last_earnings_date"] = None
+            temp.setdefault("earnings_certainty", "ESTIMATED")
             return evaluate_earnings_event(temp, today=market_day)
         if -delta <= RECENT_EARNINGS_GRACE_DAYS:
             temp = dict(metadata)
@@ -664,9 +696,9 @@ def evaluate_earnings_event(metadata, today=None):
         "text": "Unknown — earnings date not verified",
         "risk": False, "state": "UNKNOWN", "block": True,
         "block_reason": "Earnings timing could not be verified. Unknown event risk is not treated as safe.",
-        "event_date": pd.NaT, "source": source, "confidence": "LOW",
+        "event_date": pd.NaT, "source": source, "confidence": "LOW — UNKNOWN",
+        "certainty": "UNKNOWN",
     }
-
 
 def sanitize_ohlcv(df):
     """Return clean OHLCV rows or an empty frame if the structure is unusable."""
@@ -966,7 +998,146 @@ def data_confidence(df, recent_lookback=14):
     }
 
 
-def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan, event_block=False, event_reason=""):
+def trend_side(trend):
+    """Map display trend labels to LONG/SHORT structural direction."""
+    t = str(trend or "")
+    if t in {"Strong bullish", "Bullish"}:
+        return "LONG"
+    if t in {"Strong bearish", "Bearish"}:
+        return "SHORT"
+    return ""
+
+
+def directional_alignment(trend, momentum_score, rs_edge):
+    """Return the strict directional state used by the actionability gate.
+
+    Price structure, momentum and relative strength must point the same way.
+    This prevents a bullish EMA structure with negative momentum/RS (or the
+    inverse for shorts) from being treated as entry-ready.
+    """
+    side = trend_side(trend)
+    mom = finite_or_nan(momentum_score)
+    rs = finite_or_nan(rs_edge)
+
+    if side == "LONG":
+        if not np.isfinite(mom) or mom < 15:
+            return "", "Bullish price structure lacks sufficient positive momentum (need Momentum Score ≥ +15)."
+        if not np.isfinite(rs) or rs <= 0:
+            return "", "Bullish price structure lacks positive relative strength versus SPY (RS Edge must be > 0)."
+        return "LONG", ""
+
+    if side == "SHORT":
+        if not np.isfinite(mom) or mom > -15:
+            return "", "Bearish price structure lacks sufficient negative momentum (need Momentum Score ≤ -15)."
+        if not np.isfinite(rs) or rs >= 0:
+            return "", "Bearish price structure lacks negative relative strength versus SPY (RS Edge must be < 0)."
+        return "SHORT", ""
+
+    return "", "EMA trend structure is mixed; directional structure must form before entry-location repair is actionable."
+
+
+def assess_candidate_quality(trend, momentum_score, rs_edge, volume_ratio=np.nan, acceleration=""):
+    """Direction-aware candidate-quality model used by ticker diagnostics.
+
+    Candidate quality asks whether the name is worth watching; it does not
+    override entry/actionability gates. Momentum and RS only earn points when
+    they support the candidate direction. Opposing momentum/RS are penalties.
+    """
+    trend_dir = trend_side(trend)
+    mom = finite_or_nan(momentum_score)
+    rs = finite_or_nan(rs_edge)
+    vol = finite_or_nan(volume_ratio)
+
+    # For mixed price structure, strong momentum + RS may still make a watchlist
+    # candidate, but it cannot become action-ready until structure aligns.
+    candidate_dir = trend_dir
+    if not candidate_dir:
+        if np.isfinite(mom) and np.isfinite(rs) and mom >= 15 and rs > 0:
+            candidate_dir = "LONG"
+        elif np.isfinite(mom) and np.isfinite(rs) and mom <= -15 and rs < 0:
+            candidate_dir = "SHORT"
+
+    points = 0
+    if str(trend) in {"Strong bullish", "Strong bearish"}:
+        points += 2
+    elif trend_dir:
+        points += 1
+
+    if candidate_dir == "LONG":
+        if np.isfinite(mom):
+            points += 2 if mom >= 70 else 1 if mom >= 40 else -2 if mom <= -15 else -1 if mom < 15 else 0
+        if np.isfinite(rs):
+            points += 2 if rs >= 15 else 1 if rs >= 5 else -2 if rs <= -10 else -1 if rs < 0 else 0
+    elif candidate_dir == "SHORT":
+        if np.isfinite(mom):
+            points += 2 if mom <= -70 else 1 if mom <= -40 else -2 if mom >= 15 else -1 if mom > -15 else 0
+        if np.isfinite(rs):
+            points += 2 if rs <= -15 else 1 if rs <= -5 else -2 if rs >= 10 else -1 if rs > 0 else 0
+
+    if np.isfinite(vol) and vol >= 1.2:
+        points += 1
+    if str(acceleration) == "Decelerating":
+        points -= 1
+
+    quality = "A+" if points >= 6 else "A" if points >= 5 else "B+" if points >= 4 else "B" if points >= 3 else "C"
+    return {"quality": quality, "points": int(points), "direction": candidate_dir}
+
+
+def candidate_strengths_and_risks(diag):
+    """Canonical direction-aware explainability for the Decision Summary."""
+    trend = diag.get("Trend", "Mixed")
+    mom = finite_or_nan(diag.get("Momentum Score"))
+    rs = finite_or_nan(diag.get("RS Edge"))
+    vol = finite_or_nan(diag.get("Volume Ratio"))
+    candidate_dir = diag.get("Candidate Direction") or assess_candidate_quality(
+        trend, mom, rs, vol, diag.get("Acceleration", "")
+    )["direction"]
+
+    strengths, risks = [], []
+    if trend in {"Strong bullish", "Strong bearish"}:
+        strengths.append(f"Strong trend: {trend}")
+    elif trend in {"Bullish", "Bearish"}:
+        strengths.append(f"Directional trend: {trend}")
+    else:
+        risks.append("EMA trend structure is mixed.")
+
+    if candidate_dir == "LONG":
+        if np.isfinite(rs):
+            if rs >= 5:
+                strengths.append(f"Relative strength edge vs SPY: {rs:+.1f} pp")
+            elif rs <= 0:
+                risks.append(f"Relative strength is not supporting the bullish setup: {rs:+.1f} pp vs SPY.")
+        if np.isfinite(mom):
+            if mom >= 40:
+                strengths.append(f"Momentum Score: {mom:.1f}")
+            elif mom < 15:
+                risks.append(f"Momentum is insufficient for bullish alignment: {mom:.1f} (need ≥ +15).")
+    elif candidate_dir == "SHORT":
+        if np.isfinite(rs):
+            if rs <= -5:
+                strengths.append(f"Relative weakness vs SPY supports the short: {rs:+.1f} pp")
+            elif rs >= 0:
+                risks.append(f"Relative strength is not supporting the bearish setup: {rs:+.1f} pp vs SPY.")
+        if np.isfinite(mom):
+            if mom <= -40:
+                strengths.append(f"Bearish Momentum Score: {mom:.1f}")
+            elif mom > -15:
+                risks.append(f"Momentum is insufficient for bearish alignment: {mom:.1f} (need ≤ -15).")
+    else:
+        if np.isfinite(mom) and abs(mom) >= 15:
+            risks.append(f"Momentum ({mom:.1f}) is not aligned with a confirmed EMA trend structure.")
+        if np.isfinite(rs) and abs(rs) >= 5:
+            risks.append(f"RS Edge ({rs:+.1f} pp) is not yet paired with confirmed directional structure.")
+
+    if np.isfinite(vol) and vol >= 1.2:
+        strengths.append(f"Volume confirmation: {vol:.2f}x")
+    elif np.isfinite(vol) and vol < 0.75:
+        risks.append(f"Volume is weak: {vol:.2f}x")
+
+    return strengths, risks
+
+
+def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan, event_block=False, event_reason="", event_unknown=False, structure_reason=""):
     """Canonical price-entry gate shared by scanner and ticker diagnostics.
 
     `ema20_distance_pct` is expressed in percentage points (e.g. +8.5, not 0.085).
@@ -977,20 +1148,23 @@ def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan
     rsi_value = finite_or_nan(rsi14)
     stop_value = finite_or_nan(stop_pct)
 
+    # Gate priority: event risk precedes directional structure; data confidence
+    # is handled one layer above this function.
+    if event_block:
+        return {
+            "state": "WAIT — VERIFY EVENT" if event_unknown else "WAIT — EVENT RISK",
+            "quality": "WAIT", "block": True,
+            "reason": event_reason or "Earnings/event timing is not safely verified.",
+        }
+
     if direction not in {"LONG", "SHORT"}:
-        return {"state": "NO TRADE", "quality": "N/A", "block": True, "reason": "Momentum/trend alignment is mixed."}
+        return {
+            "state": "WAIT FOR STRUCTURE", "quality": "WAIT", "block": True,
+            "reason": structure_reason or "Trend, momentum and relative strength are not directionally aligned.",
+        }
 
     if not np.isfinite(dist) or not np.isfinite(rsi_value):
         return {"state": "NO TRADE", "quality": "UNKNOWN", "block": True, "reason": "Entry location could not be validated."}
-
-    # Confirmed/unknown earnings risk is the primary hard gate for a directional
-    # swing setup. Price defects are still diagnosed separately and are
-    # recalculated after the event has passed or been verified.
-    if event_block:
-        return {
-            "state": "WAIT — EVENT RISK", "quality": "WAIT", "block": True,
-            "reason": event_reason or "Earnings/event timing is not safely verified.",
-        }
 
     if direction == "LONG" and (dist > 8.0 or rsi_value >= 75):
         return {
@@ -1691,6 +1865,10 @@ def build_ranked_master(df):
     long_rs = (x["RS Rating"] >= 70) & (x["RS Edge"] > 0)
     short_rs = (x["RS Rating"] <= 31) & (x["RS Edge"] < 0)
 
+    # Strict directional alignment used by scanner grading/actionability.
+    aligned_long = long_trend & (x["Momentum Score"] >= 15) & (x["RS Edge"] > 0)
+    aligned_short = short_trend & (x["Momentum Score"] <= -15) & (x["RS Edge"] < 0)
+
     long_location = (
         x["EMA20 Distance %"].between(-2.5, 8.0, inclusive="both")
         & (x["RSI14"] < 75)
@@ -1756,10 +1934,13 @@ def build_ranked_master(df):
         + np.where(short_regime, 5, 0)
     )
 
+    # Candidate quality is direction-aware. Trend structure determines which
+    # side's score is relevant; mixed structure is capped below watchlist grade.
+    mixed_score = np.minimum(np.maximum(long_score, short_score), 64)
     x["Quality Score"] = np.where(
-        long_direction,
+        long_trend,
         long_score,
-        np.where(short_direction, short_score, 0),
+        np.where(short_trend, short_score, mixed_score),
     ).astype(float)
 
     # Hard-gate failures cannot be quality candidates.
@@ -1786,8 +1967,8 @@ def build_ranked_master(df):
     short_breakdown = short_trend & (x["Close"] <= x["Low20"] * 1.03) & volume_strong & short_rs
 
     x["Setup Type"] = "Watch"
-    x.loc[long_direction & long_trend, "Setup Type"] = "Trend Continuation"
-    x.loc[short_direction & short_trend, "Setup Type"] = "Trend Continuation Short"
+    x.loc[aligned_long, "Setup Type"] = "Trend Continuation"
+    x.loc[aligned_short, "Setup Type"] = "Trend Continuation Short"
     x.loc[long_pullback, "Setup Type"] = "Pullback to Trend"
     x.loc[short_pullback, "Setup Type"] = "Rally into Resistance"
     x.loc[long_breakout, "Setup Type"] = "Breakout"
@@ -1797,33 +1978,48 @@ def build_ranked_master(df):
     # Professional grade
     # ---------------------------
     x["Setup"] = "Avoid"
-    x.loc[x["Tradeable"] & long_direction & (x["Quality Score"] >= 90), "Setup"] = "A+ Long"
-    x.loc[x["Tradeable"] & long_direction & x["Quality Score"].between(82, 89.999), "Setup"] = "A Long"
-    x.loc[x["Tradeable"] & long_direction & x["Quality Score"].between(74, 81.999), "Setup"] = "B+ Long"
-    x.loc[x["Tradeable"] & long_direction & x["Quality Score"].between(65, 73.999), "Setup"] = "Long Watch"
+    x.loc[x["Tradeable"] & aligned_long & (x["Quality Score"] >= 90), "Setup"] = "A+ Long"
+    x.loc[x["Tradeable"] & aligned_long & x["Quality Score"].between(82, 89.999), "Setup"] = "A Long"
+    x.loc[x["Tradeable"] & aligned_long & x["Quality Score"].between(74, 81.999), "Setup"] = "B+ Long"
+    x.loc[x["Tradeable"] & aligned_long & x["Quality Score"].between(65, 73.999), "Setup"] = "Long Watch"
 
-    x.loc[x["Tradeable"] & short_direction & (x["Quality Score"] >= 90), "Setup"] = "A+ Short"
-    x.loc[x["Tradeable"] & short_direction & x["Quality Score"].between(82, 89.999), "Setup"] = "A Short"
-    x.loc[x["Tradeable"] & short_direction & x["Quality Score"].between(74, 81.999), "Setup"] = "B+ Short"
-    x.loc[x["Tradeable"] & short_direction & x["Quality Score"].between(65, 73.999), "Setup"] = "Short Watch"
+    x.loc[x["Tradeable"] & aligned_short & (x["Quality Score"] >= 90), "Setup"] = "A+ Short"
+    x.loc[x["Tradeable"] & aligned_short & x["Quality Score"].between(82, 89.999), "Setup"] = "A Short"
+    x.loc[x["Tradeable"] & aligned_short & x["Quality Score"].between(74, 81.999), "Setup"] = "B+ Short"
+    x.loc[x["Tradeable"] & aligned_short & x["Quality Score"].between(65, 73.999), "Setup"] = "Short Watch"
 
     x.loc[x["Momentum Score"].abs() < 15, "Setup"] = "Neutral"
 
     # Canonical price-entry gate. Scanner does not fetch earnings metadata for every
     # symbol; final event verification remains part of the ticker diagnostic.
     entry_results = []
-    for _, row in x.iterrows():
-        if row.get("Momentum Score", 0) >= 15 and row.get("Close", np.nan) > row.get("EMA20", np.nan):
+    for idx, row in x.iterrows():
+        if bool(aligned_long.loc[idx]):
             direction = "LONG"
-        elif row.get("Momentum Score", 0) <= -15 and row.get("Close", np.nan) < row.get("EMA20", np.nan):
+            structure_reason = ""
+        elif bool(aligned_short.loc[idx]):
             direction = "SHORT"
+            structure_reason = ""
         else:
             direction = ""
+            if bool(long_trend.loc[idx]):
+                if row.get("Momentum Score", 0) < 15:
+                    structure_reason = "Bullish trend lacks sufficient positive momentum (need ≥ +15)."
+                else:
+                    structure_reason = "Bullish trend lacks positive RS Edge versus SPY."
+            elif bool(short_trend.loc[idx]):
+                if row.get("Momentum Score", 0) > -15:
+                    structure_reason = "Bearish trend lacks sufficient negative momentum (need ≤ -15)."
+                else:
+                    structure_reason = "Bearish trend lacks negative RS Edge versus SPY."
+            else:
+                structure_reason = "EMA trend structure is mixed; wait for directional structure."
         entry_results.append(
             evaluate_entry_quality(
                 direction,
                 row.get("EMA20 Distance %", np.nan),
                 row.get("RSI14", np.nan),
+                structure_reason=structure_reason,
             )
         )
     x["Price Entry State"] = [r["state"] for r in entry_results]
@@ -1848,10 +2044,10 @@ def build_ranked_master(df):
     # Explainability columns.
     x["Trend Check"] = np.where(long_trend | short_trend, "✅", "❌")
     x["Momentum Check"] = np.where(
-        ((long_direction & (x["Momentum Score"] >= 25)) | (short_direction & (x["Momentum Score"] <= -25))),
+        ((aligned_long & (x["Momentum Score"] >= 25)) | (aligned_short & (x["Momentum Score"] <= -25))),
         "✅", "❌"
     )
-    x["RS Check"] = np.where(long_rs | short_rs, "✅", "❌")
+    x["RS Check"] = np.where((aligned_long & long_rs) | (aligned_short & short_rs), "✅", "❌")
     x["Volume Check"] = np.where(volume_healthy, "✅", "❌")
     x["Extension Check"] = np.where(long_location | short_location, "✅", "❌")
     x["Liquidity Check"] = np.where(liquidity_ok, "✅", "❌")
@@ -1893,9 +2089,14 @@ def build_ranked_master(df):
 
     # Ranking is now dominated by the professional Quality Score.
     # RS and volume are tie-breakers only.
+    directional_rs_tiebreak = np.where(
+        long_trend,
+        x["RS Edge"].fillna(0).clip(-10, 10),
+        np.where(short_trend, -x["RS Edge"].fillna(0).clip(-10, 10), 0),
+    )
     x["Adjusted Score"] = (
         x["Quality Score"]
-        + x["RS Edge"].fillna(0).clip(-10, 10) * 0.20
+        + directional_rs_tiebreak * 0.20
         + (x["Volume Ratio"].fillna(1) - 1).clip(-0.5, 1.5) * 2.0
     )
     x["Adjusted Score"] = x["Adjusted Score"].replace([np.inf, -np.inf], np.nan).fillna(-9999.0)
@@ -2095,12 +2296,15 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     earnings_event_block_reason = earnings_event["block_reason"]
     earnings_source = earnings_event["source"]
     event_data_confidence = earnings_event["confidence"]
+    earnings_certainty = earnings_event.get("certainty", "UNKNOWN")
 
     high20 = float(x["High"].iloc[-21:-1].max()) if len(x) >= 21 else close
     low20 = float(x["Low"].iloc[-21:-1].min()) if len(x) >= 21 else close
 
-    long_bias = composite >= 15 and close > ema20
-    short_bias = composite <= -15 and close < ema20
+    # Phase 1.3 strict alignment: structure + momentum + RS must point together.
+    aligned_direction, alignment_reason = directional_alignment(trend, composite, rs_score)
+    long_bias = aligned_direction == "LONG"
+    short_bias = aligned_direction == "SHORT"
 
     # v6.9 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
@@ -2216,13 +2420,15 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         stop_pct=stop_pct,
         event_block=earnings_event_block,
         event_reason=earnings_event_block_reason,
+        event_unknown=earnings_risk_state == "UNKNOWN",
+        structure_reason=alignment_reason,
     )
     if entry_gate["block"]:
-        if trade_state == "ACTIONABLE" or earnings_event_block:
-            bias = "WAIT"
-            trade_state = entry_gate["state"]
-            trade_block_reason = entry_gate["reason"]
-            entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        # Canonical gate result is authoritative: Event → Structure → Location → Stop.
+        bias = "WAIT"
+        trade_state = entry_gate["state"]
+        trade_block_reason = entry_gate["reason"]
+        entry_low = entry_high = stop = target1 = target2 = rr = np.nan
     entry_quality = "PASS" if trade_state == "ACTIONABLE" else "WAIT"
 
     points = 0
@@ -2258,27 +2464,36 @@ def compute_search_diagnostic(symbol, company, df, metadata):
 
     chase_risk = "Normal"
     trade_comment = ""
-    if long_bias and extension == "Extended":
+    if extension == "Extended" and (composite > 0 or trend_side(trend) == "LONG"):
         chase_risk = "Elevated"
-        trade_comment = (
-            "Technical direction is bullish, but chase risk is elevated. "
-            "Prefer a pullback toward EMA20 / support or fresh confirmation rather than chasing."
-        )
-    elif short_bias and extension == "Oversold":
+    elif extension == "Oversold" and (composite < 0 or trend_side(trend) == "SHORT"):
         chase_risk = "Elevated"
-        trade_comment = (
-            "Technical direction is bearish, but the stock is stretched lower. "
-            "Prefer a bounce/rejection setup rather than chasing weakness."
-        )
-    elif long_bias:
-        trade_comment = "Trend, momentum and relative strength are constructive on completed daily bars."
-    elif short_bias:
-        trade_comment = "Trend, momentum and relative strength are constructive for shorts on completed daily bars."
-    else:
-        trade_comment = "Momentum/trend alignment is mixed. Waiting for confirmation is preferable."
 
-    if trade_state != "ACTIONABLE" and trade_block_reason and (long_bias or short_bias):
+    if aligned_direction == "LONG":
+        trade_comment = "Trend, momentum and relative strength are constructive on completed daily bars."
+    elif aligned_direction == "SHORT":
+        trade_comment = "Trend, momentum and relative weakness are constructive for shorts on completed daily bars."
+    elif trend_side(trend) == "LONG":
+        trade_comment = "Price trend is bullish, but momentum and/or relative strength are not sufficiently aligned."
+    elif trend_side(trend) == "SHORT":
+        trade_comment = "Price trend is bearish, but momentum and/or relative weakness are not sufficiently aligned."
+    elif composite >= 15 and np.isfinite(rs_score) and rs_score > 0:
+        trade_comment = "Momentum and relative strength are constructive, but EMA trend structure is not yet fully aligned."
+    elif composite <= -15 and np.isfinite(rs_score) and rs_score < 0:
+        trade_comment = "Bearish momentum and relative weakness are constructive, but EMA trend structure is not yet fully aligned."
+    else:
+        trade_comment = "Trend, momentum and relative strength are not sufficiently aligned. Waiting for structure is preferable."
+
+    if chase_risk == "Elevated":
+        if extension == "Extended":
+            trade_comment += " Price is extended versus EMA20; do not chase while the higher-priority gate remains unresolved."
+        else:
+            trade_comment += " Price is stretched lower; do not chase weakness while the higher-priority gate remains unresolved."
+
+    if trade_state != "ACTIONABLE" and trade_block_reason:
         trade_comment += f" Current action remains WAIT because: {trade_block_reason}"
+
+    candidate_assessment = assess_candidate_quality(trend, composite, rs_score, vol_ratio, acceleration)
 
     return {
         "Data Valid": True,
@@ -2287,6 +2502,9 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "In-Progress Session Excluded": bool(x.attrs.get("excluded_incomplete_session", False)),
         "Raw Latest Date": x.attrs.get("raw_latest_date", pd.NaT),
         "Ticker": symbol, "Company": company, "Close": close,
+        "Candidate Quality": candidate_assessment["quality"],
+        "Candidate Points": candidate_assessment["points"],
+        "Candidate Direction": candidate_assessment["direction"],
         "Daily": daily, "Weekly": weekly, "Monthly": monthly, "Momentum Score": composite,
         "Momentum Grade": momentum_grade,
         "Acceleration": acceleration, "Acceleration Delta": acceleration_delta,
@@ -2305,8 +2523,11 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Earnings Risk": earnings_risk, "Earnings Risk State": earnings_risk_state,
         "Earnings Date": earnings_date, "Next Earnings Date": next_earnings_date,
         "Last Earnings Date": last_earnings_date, "Earnings Source": earnings_source,
+        "Earnings Certainty": earnings_certainty,
         "Event Data Confidence": event_data_confidence,
         "Fundamental Data Confidence": fundamental_data_confidence,
+        "Directional Alignment": aligned_direction,
+        "Directional Alignment Reason": alignment_reason,
         "Entry Quality": entry_quality, "Bias": bias, "Verdict": verdict,
         "Entry Low": entry_low, "Entry High": entry_high, "Stop": stop,
         "Target 1": target1, "Target 2": target2, "RR": rr,
@@ -2421,28 +2642,8 @@ with ticker_tab:
 
             st.markdown(f"### {selected_ticker} — {selected_company}")
 
-            # Phase 1: separate stock quality from entry quality and current action.
-            candidate_points = 0
-            candidate_points += 2 if diag["Trend"] in ("Strong bullish", "Strong bearish") else (1 if diag["Trend"] in ("Bullish", "Bearish") else 0)
-            candidate_points += 2 if abs(diag["Momentum Score"]) >= 70 else (1 if abs(diag["Momentum Score"]) >= 40 else 0)
-            candidate_points += 2 if pd.notna(diag["RS Edge"]) and abs(diag["RS Edge"]) >= 15 else (1 if pd.notna(diag["RS Edge"]) and abs(diag["RS Edge"]) >= 5 else 0)
-            candidate_points += 1 if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] >= 1.2 else 0
-
-            # Near-term momentum deterioration matters, but does not contaminate Entry Quality.
-            # One-point penalty prevents stale 3M/6M RS leadership from preserving A+ indefinitely.
-            if diag["Acceleration"] == "Decelerating":
-                candidate_points -= 1
-
-            if candidate_points >= 6:
-                candidate_quality = "A+"
-            elif candidate_points >= 5:
-                candidate_quality = "A"
-            elif candidate_points >= 4:
-                candidate_quality = "B+"
-            elif candidate_points >= 3:
-                candidate_quality = "B"
-            else:
-                candidate_quality = "C"
+            # Phase 1.3: one canonical direction-aware candidate-quality result.
+            candidate_quality = diag.get("Candidate Quality", "C")
 
             if confidence["block"]:
                 headline_action = "DO NOT ACT / DATA ISSUE"
@@ -2450,8 +2651,8 @@ with ticker_tab:
                 headline_action = f"{diag['Bias']} / ACTIONABLE"
             elif diag["Trade State"] == "WAIT — EVENT RISK":
                 headline_action = "WAIT / EVENT RISK"
-            elif diag["Trade State"] == "WAIT — VERIFY EARNINGS":
-                headline_action = "WAIT / VERIFY EARNINGS"
+            elif diag["Trade State"] == "WAIT — VERIFY EVENT":
+                headline_action = "WAIT / VERIFY EVENT"
             else:
                 headline_action = str(diag["Trade State"]).replace(" — ", " / ")
 
@@ -2606,7 +2807,7 @@ with ticker_tab:
                 missing_meta.append("trailing P/E")
             if pd.isna(diag["Forward PE"]):
                 missing_meta.append("forward P/E")
-            if diag["Event Data Confidence"] == "LOW":
+            if str(diag["Event Data Confidence"]).startswith("LOW"):
                 missing_meta.append("verified earnings date")
             if missing_meta:
                 st.warning(
@@ -2621,54 +2822,54 @@ with ticker_tab:
 
             event_state = diag.get("Earnings Risk State", "UNKNOWN")
             source_text = diag.get("Earnings Source", "Unverified")
+            event_certainty = diag.get("Earnings Certainty", "UNKNOWN")
             if event_state == "UNKNOWN":
                 st.error(
                     f"🔴 **Earnings timing UNKNOWN** — {diag['Earnings']}. "
                     "Unknown event risk is not treated as safe; actionable trade plans are blocked until the event is verified."
                 )
             elif event_state == "HIGH":
+                certainty_text = "Confirmed" if event_certainty == "CONFIRMED" else "Estimated"
                 st.warning(
                     f"⚠️ **Earnings danger window** — {diag['Earnings']}. "
-                    f"Source: {source_text}. New swing entries are blocked inside {EARNINGS_HARD_BLOCK_DAYS} days."
+                    f"Certainty: **{event_certainty}** • Source: {source_text}. "
+                    f"{certainty_text} timing is inside the {EARNINGS_HARD_BLOCK_DAYS}-day hard block window."
                 )
             elif event_state == "CAUTION":
                 st.warning(
-                    f"⚠️ **Upcoming earnings** — {diag['Earnings']}. Source: {source_text}. "
+                    f"⚠️ **Upcoming earnings** — {diag['Earnings']}. "
+                    f"Certainty: **{event_certainty}** • Source: {source_text}. "
                     "Event risk is inside the 14-day caution window."
                 )
             elif event_state == "RECENT":
-                st.info(f"Earnings: {diag['Earnings']}. Source: {source_text}. Recent post-earnings volatility may remain elevated.")
+                st.info(
+                    f"Earnings: {diag['Earnings']}. Source: {source_text}. "
+                    "Recent post-earnings volatility may remain elevated; the next event date is not yet verified."
+                )
             else:
-                st.info(f"Earnings: {diag['Earnings']}. Source: {source_text}.")
+                qualifier = "Confirmed" if event_certainty == "CONFIRMED" else "Estimated" if event_certainty == "ESTIMATED" else "Unverified"
+                st.info(f"{qualifier} earnings date: {diag['Earnings']}. Source: {source_text}.")
 
             st.markdown("### Decision Summary")
             d1, d2 = st.columns(2)
 
+            base_strengths, base_risks = candidate_strengths_and_risks(diag)
+
             with d1:
                 st.markdown("**Why it qualifies / strengths**")
-                strengths = []
-                if diag["Trend"] in ("Strong bullish", "Strong bearish"):
-                    strengths.append(f"Strong trend: {diag['Trend']}")
-                elif diag["Trend"] in ("Bullish", "Bearish"):
-                    strengths.append(f"Directional trend: {diag['Trend']}")
-                if pd.notna(diag["RS Edge"]) and abs(diag["RS Edge"]) >= 5:
-                    strengths.append(f"Relative strength edge vs SPY: {diag['RS Edge']:+.1f} pp")
-                if abs(diag["Momentum Score"]) >= 40:
-                    strengths.append(f"Momentum Score: {diag['Momentum Score']:.1f}")
-                if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] >= 1.2:
-                    strengths.append(f"Volume confirmation: {diag['Volume Ratio']:.2f}x")
+                strengths = list(base_strengths)
                 if strengths:
                     for item in strengths:
                         st.write(f"• {item}")
                 else:
-                    st.write("• No major quality edge is currently confirmed.")
+                    st.write("• No major direction-aligned quality edge is currently confirmed.")
 
             with d2:
                 if diag["Trade State"] == "ACTIONABLE":
                     st.markdown("**Key risks / entry considerations**")
                 else:
                     st.markdown("**Why to wait / key risks**")
-                risks = []
+                risks = list(base_risks)
                 if diag["Extension"] in ("Extended", "Oversold"):
                     risks.append(f"Entry location: {diag['Extension']}")
                 if diag["Acceleration"] == "Decelerating":
@@ -2717,8 +2918,8 @@ with ticker_tab:
                 dist_now = diag.get("Distance EMA20", np.nan)
                 stop_now = diag.get("Stop %", np.nan)
 
-                bullish_candidate = diag["Trend"] in ("Strong bullish", "Bullish") and diag["Momentum Score"] > 0
-                bearish_candidate = diag["Trend"] in ("Strong bearish", "Bearish") and diag["Momentum Score"] < 0
+                bullish_candidate = diag.get("Directional Alignment") == "LONG"
+                bearish_candidate = diag.get("Directional Alignment") == "SHORT"
 
                 # Failure-specific diagnosis.
                 defects = []
@@ -2728,13 +2929,9 @@ with ticker_tab:
                     defects.append("EVENT VERIFICATION")
                 elif diag.get("Earnings Risk State") == "HIGH":
                     defects.append("EARNINGS WINDOW")
-                if bullish_candidate and pd.notna(dist_now) and dist_now > 0.08:
+                if diag.get("Extension") in {"Extended", "Oversold"}:
                     defects.append("PRICE EXTENSION")
-                if bearish_candidate and pd.notna(dist_now) and dist_now < -0.08:
-                    defects.append("PRICE EXTENSION")
-                if bullish_candidate and pd.notna(rsi_now) and rsi_now >= 75:
-                    defects.append("RSI EXTENSION")
-                if bearish_candidate and pd.notna(rsi_now) and rsi_now <= 25:
+                if pd.notna(rsi_now) and (rsi_now >= 75 or rsi_now <= 25):
                     defects.append("RSI EXTENSION")
                 if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
                     defects.append("STOP GEOMETRY")
@@ -2777,7 +2974,14 @@ with ticker_tab:
                 if diag.get("Earnings Risk State") == "UNKNOWN":
                     repair_items.append("Verify the next earnings date before any actionable swing entry is published.")
                 elif diag.get("Earnings Risk State") == "HIGH":
-                    repair_items.append(f"Wait until the confirmed earnings danger window has passed: {diag['Earnings']}.")
+                    certainty_word = "confirmed" if diag.get("Earnings Certainty") == "CONFIRMED" else "estimated"
+                    repair_items.append(f"Wait until the {certainty_word} earnings danger window has passed: {diag['Earnings']}.")
+                if "DIRECTIONAL ALIGNMENT" in defects:
+                    repair_items.append(diag.get("Directional Alignment Reason") or "Restore aligned trend, momentum and relative strength before evaluating entry location.")
+                    if diag.get("Extension") == "Extended" and pd.notna(dist_now):
+                        repair_items.append(f"Secondary no-chase condition: price is {dist_now:+.1%} vs EMA20; it must return to ≤ +8.0% before a long entry can qualify.")
+                    elif diag.get("Extension") == "Oversold" and pd.notna(dist_now):
+                        repair_items.append(f"Secondary no-chase condition: price is {dist_now:+.1%} vs EMA20; it must recover to ≥ -8.0% before a short entry can qualify.")
                 repair_boundary = invalidation = np.nan
                 preferred_low = preferred_high = np.nan
 
@@ -2838,9 +3042,10 @@ with ticker_tab:
 
                 if event_primary_block:
                     if diag.get("Earnings Risk State") == "HIGH":
+                        certainty_word = "confirmed" if diag.get("Earnings Certainty") == "CONFIRMED" else "estimated"
                         st.info(
-                            "**No pre-earnings price repair area is published.** The confirmed earnings event is the primary blocker. "
-                            "Wait through the event, then rerun the ticker so price structure, volume, ATR, momentum, RSI and EMA location "
+                            f"**No pre-earnings price repair area is published.** The {certainty_word} earnings window is the primary blocker. "
+                            "Wait through/verify the event, then rerun the ticker so price structure, volume, ATR, momentum, RSI and EMA location "
                             "are recalculated from completed post-event daily bars."
                         )
                     else:
@@ -2870,14 +3075,14 @@ with ticker_tab:
                     )
                 else:
                     st.info(
-                        "No price repair area is published because trend and momentum direction are not sufficiently aligned. "
-                        "Directional structure must form first."
+                        "No price repair area is published because trend, momentum and relative strength are not sufficiently aligned. "
+                        "Directional structure must form first; extension remains a secondary no-chase gate if present."
                     )
 
                 st.markdown("**Conditions required to improve the setup**")
                 if not repair_items:
                     repair_items.append(
-                        "Maintain trend and relative-strength leadership while preserving acceptable entry location, stop distance and R:R."
+                        "Require aligned trend, momentum and relative strength while preserving acceptable entry location, stop distance and R:R."
                     )
                 if confidence["level"] == "MEDIUM":
                     repair_items.append("Restore HIGH Price Data Confidence if the isolated data gap can be repaired.")
@@ -2929,10 +3134,20 @@ with ticker_tab:
                 st.warning(
                     f"**{diag['Trade State']}** — {diag.get('Trade Block Reason', '')}"
                 )
-                st.info(
-                    "The stock can still be a high-quality candidate, but the current entry is not acceptable. "
-                    "Candidate quality and entry quality are intentionally scored separately."
-                )
+                if candidate_quality in {"A+", "A", "B+"}:
+                    st.info(
+                        "Candidate quality remains high, but the current entry/actionability gate is not acceptable. "
+                        "Candidate quality and entry quality are intentionally scored separately."
+                    )
+                elif candidate_quality == "B":
+                    st.info(
+                        "The stock remains a watchlist candidate, but current quality/alignment is not strong enough for an actionable swing entry."
+                    )
+                else:
+                    st.info(
+                        "Candidate quality and entry quality are currently insufficient for an actionable swing setup. "
+                        "Reassess only after the identified defects repair."
+                    )
             else:
                 p1, p2, p3, p4, p5 = st.columns(5)
                 p1.metric("Bias", diag["Bias"])
