@@ -1,4 +1,4 @@
-# Quality Engine v7.0 — Phase 1 Freeze (Direction-Aware + Event Certainty)
+# Quality Engine v7.0 — Phase 1 FINAL FROZEN (Risk-Gated + Transparent R:R)
 
 import io
 import time
@@ -31,7 +31,10 @@ YAHOO_BATCH_SIZE = 120
 SCAN_CACHE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-PHASE1_ENGINE_VERSION = "v7.0-P1.3-FREEZE"
+PHASE1_ENGINE_VERSION = "v7.0-P1.4-FINAL-FROZEN"
+MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
+NEAR_EXTENSION_CAUTION_PCT = 6.0
+NEAR_STOP_CAUTION_PCT = 0.07
 EARNINGS_HARD_BLOCK_DAYS = 3
 EARNINGS_CAUTION_DAYS = 14
 RECENT_EARNINGS_GRACE_DAYS = 5
@@ -1083,6 +1086,126 @@ def assess_candidate_quality(trend, momentum_score, rs_edge, volume_ratio=np.nan
     return {"quality": quality, "points": int(points), "direction": candidate_dir}
 
 
+def unique_text_items(items):
+    """De-duplicate explanatory bullets while preserving order."""
+    out = []
+    seen = set()
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def directional_repair_requirements(trend, momentum_score, rs_edge):
+    """Return every failed directional condition, not just the first one."""
+    side = trend_side(trend)
+    mom = finite_or_nan(momentum_score)
+    rs = finite_or_nan(rs_edge)
+    items = []
+
+    if side == "LONG":
+        if not np.isfinite(mom) or mom < 15:
+            mom_text = "unavailable" if not np.isfinite(mom) else f"{mom:.1f}"
+            items.append(f"Bullish price structure needs Momentum Score ≥ +15; current score is {mom_text}.")
+        if not np.isfinite(rs) or rs <= 0:
+            rs_text = "unavailable" if not np.isfinite(rs) else f"{rs:+.1f} pp"
+            items.append(f"Bullish price structure needs positive RS Edge versus SPY; current RS Edge is {rs_text}.")
+    elif side == "SHORT":
+        if not np.isfinite(mom) or mom > -15:
+            mom_text = "unavailable" if not np.isfinite(mom) else f"{mom:.1f}"
+            items.append(f"Bearish price structure needs Momentum Score ≤ -15; current score is {mom_text}.")
+        if not np.isfinite(rs) or rs >= 0:
+            rs_text = "unavailable" if not np.isfinite(rs) else f"{rs:+.1f} pp"
+            items.append(f"Bearish price structure needs negative RS Edge versus SPY; current RS Edge is {rs_text}.")
+    else:
+        items.append("EMA trend structure is mixed; directional price structure must align before an entry can qualify.")
+
+    return unique_text_items(items)
+
+
+def entry_caution_items(direction, ema20_distance_pct, stop_pct):
+    """Soft caution bands inside the hard entry limits."""
+    direction = str(direction or "").upper()
+    dist = finite_or_nan(ema20_distance_pct)
+    stop_value = finite_or_nan(stop_pct)
+    items = []
+
+    if direction == "LONG" and np.isfinite(dist) and NEAR_EXTENSION_CAUTION_PCT <= dist <= 8.0:
+        items.append(
+            f"Entry is near the no-chase limit: price is {dist:+.1f}% vs EMA20 "
+            f"(hard block above +8.0%)."
+        )
+    elif direction == "SHORT" and np.isfinite(dist) and -8.0 <= dist <= -NEAR_EXTENSION_CAUTION_PCT:
+        items.append(
+            f"Entry is near the downside no-chase limit: price is {dist:+.1f}% vs EMA20 "
+            f"(hard block below -8.0%)."
+        )
+
+    if np.isfinite(stop_value) and NEAR_STOP_CAUTION_PCT <= stop_value <= 0.10:
+        items.append(
+            f"Stop geometry is on the wide side: {stop_value:.1%} from the midpoint entry "
+            f"(10% hard cap)."
+        )
+    return unique_text_items(items)
+
+
+def entry_geometry_grade(stop_pct, rr_midpoint, cautions=None):
+    """Grade price/risk geometry independently from candidate quality/actionability."""
+    stop_value = finite_or_nan(stop_pct)
+    rr_value = finite_or_nan(rr_midpoint)
+    if not np.isfinite(stop_value):
+        return "C — NOT READY"
+    if stop_value <= 0.06 and np.isfinite(rr_value) and rr_value >= 2:
+        grade = "A"
+    elif stop_value <= 0.08:
+        grade = "B+"
+    else:
+        grade = "B"
+    if cautions:
+        if grade == "A":
+            grade = "B+"
+        return f"{grade} — CAUTION"
+    return grade
+
+
+def trade_plan_r_metrics(direction, entry_low, entry_high, stop, target1, target2):
+    """Return midpoint and full-entry-zone R multiples for transparent execution math."""
+    vals = [finite_or_nan(v) for v in [entry_low, entry_high, stop, target1, target2]]
+    if not all(np.isfinite(v) for v in vals):
+        return {"mid": np.nan, "t1": np.nan, "t2": np.nan, "zone_min": np.nan, "zone_max": np.nan}
+    lo, hi, stop_v, t1_v, t2_v = vals
+    mid = (lo + hi) / 2.0
+    d = str(direction or "").upper()
+
+    def rr_for(entry, target):
+        if d == "LONG":
+            risk = entry - stop_v
+            reward = target - entry
+        elif d == "SHORT":
+            risk = stop_v - entry
+            reward = entry - target
+        else:
+            return np.nan
+        if risk <= 0:
+            return np.nan
+        return reward / risk
+
+    t1_r = rr_for(mid, t1_v)
+    t2_r = rr_for(mid, t2_v)
+    zone = [rr_for(lo, t2_v), rr_for(hi, t2_v)]
+    zone = [v for v in zone if np.isfinite(v)]
+    return {
+        "mid": t2_r,
+        "t1": t1_r,
+        "t2": t2_r,
+        "zone_min": min(zone) if zone else np.nan,
+        "zone_max": max(zone) if zone else np.nan,
+    }
+
+
 def candidate_strengths_and_risks(diag):
     """Canonical direction-aware explainability for the Decision Summary."""
     trend = diag.get("Trend", "Mixed")
@@ -1134,7 +1257,7 @@ def candidate_strengths_and_risks(diag):
     elif np.isfinite(vol) and vol < 0.75:
         risks.append(f"Volume is weak: {vol:.2f}x")
 
-    return strengths, risks
+    return unique_text_items(strengths), unique_text_items(risks)
 
 
 def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan, event_block=False, event_reason="", event_unknown=False, structure_reason=""):
@@ -2026,6 +2149,11 @@ def build_ranked_master(df):
     price_data_block = x.get("Price Data Block", pd.Series(False, index=x.index)).fillna(True).astype(bool)
     raw_entry_pass = pd.Series([not r["block"] for r in entry_results], index=x.index)
     x["Price Entry Gate Pass"] = raw_entry_pass & ~price_data_block
+
+    # Scanner candidate gate: only graded A+/A/B+ setups can advance to the
+    # final VERIFY EVENT + STOP stage. Lower-quality/watch setups stay WAIT.
+    scanner_candidate_ok = x["Setup"].astype(str).str.startswith(("A+ ", "A ", "B+ "))
+    x["Candidate Quality Gate Pass"] = scanner_candidate_ok & x["Tradeable"].fillna(False).astype(bool)
     x["Entry Quality"] = np.where(
         price_data_block,
         "N/A — DATA ISSUE",
@@ -2038,7 +2166,11 @@ def build_ranked_master(df):
     x["Scanner Action"] = np.where(
         price_data_block,
         "DATA BLOCK",
-        np.where(x["Price Entry Gate Pass"], "VERIFY EVENT + STOP", x["Price Entry State"]),
+        np.where(
+            ~x["Candidate Quality Gate Pass"],
+            "WAIT FOR QUALITY",
+            np.where(x["Price Entry Gate Pass"], "VERIFY EVENT + STOP", x["Price Entry State"]),
+        ),
     )
 
     # Explainability columns.
@@ -2305,6 +2437,8 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     aligned_direction, alignment_reason = directional_alignment(trend, composite, rs_score)
     long_bias = aligned_direction == "LONG"
     short_bias = aligned_direction == "SHORT"
+    candidate_assessment = assess_candidate_quality(trend, composite, rs_score, vol_ratio, acceleration)
+    candidate_quality = candidate_assessment["quality"]
 
     # v6.9 Tradeability & Risk Engine
     # Candidate quality and current entry quality are separate.
@@ -2423,12 +2557,40 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         event_unknown=earnings_risk_state == "UNKNOWN",
         structure_reason=alignment_reason,
     )
-    if entry_gate["block"]:
-        # Canonical gate result is authoritative: Event → Structure → Location → Stop.
+    # Preserve the independent price/risk geometry assessment even when candidate
+    # quality later blocks actionability. This allows e.g. C Candidate + B+ entry
+    # geometry to display honestly while still producing NO TRADE / WAIT FOR QUALITY.
+    entry_geometry_pass = not entry_gate["block"]
+    entry_cautions = entry_caution_items(
+        gate_direction,
+        dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
+        stop_pct,
+    ) if gate_direction else []
+    entry_geometry_quality = entry_geometry_grade(stop_pct, rr, entry_cautions) if entry_geometry_pass else "C — NOT READY"
+
+    # Canonical action gate priority:
+    # Event → Candidate Quality → Directional Structure → Location → Stop/R:R.
+    if earnings_event_block:
+        authoritative_gate = entry_gate
+    elif candidate_quality not in MIN_ACTIONABLE_CANDIDATE_GRADES:
+        authoritative_gate = {
+            "state": "WAIT FOR QUALITY",
+            "quality": "WAIT",
+            "block": True,
+            "reason": (
+                f"Candidate Quality is {candidate_quality}; minimum B+ quality is required "
+                "before a new swing entry can become actionable."
+            ),
+        }
+    else:
+        authoritative_gate = entry_gate
+
+    if authoritative_gate["block"]:
         bias = "WAIT"
-        trade_state = entry_gate["state"]
-        trade_block_reason = entry_gate["reason"]
-        entry_low = entry_high = stop = target1 = target2 = rr = np.nan
+        trade_state = authoritative_gate["state"]
+        trade_block_reason = authoritative_gate["reason"]
+        # Do not publish actionable levels when any higher-level gate blocks.
+        entry_low = entry_high = stop = target1 = target2 = np.nan
     entry_quality = "PASS" if trade_state == "ACTIONABLE" else "WAIT"
 
     points = 0
@@ -2493,7 +2655,8 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     if trade_state != "ACTIONABLE" and trade_block_reason:
         trade_comment += f" Current action remains WAIT because: {trade_block_reason}"
 
-    candidate_assessment = assess_candidate_quality(trend, composite, rs_score, vol_ratio, acceleration)
+    # Transparent R multiples are calculated from published actionable levels only.
+    r_metrics = trade_plan_r_metrics(bias, entry_low, entry_high, stop, target1, target2)
 
     return {
         "Data Valid": True,
@@ -2529,8 +2692,13 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Directional Alignment": aligned_direction,
         "Directional Alignment Reason": alignment_reason,
         "Entry Quality": entry_quality, "Bias": bias, "Verdict": verdict,
+        "Entry Geometry Pass": entry_geometry_pass,
+        "Entry Geometry Quality": entry_geometry_quality,
+        "Entry Cautions": entry_cautions,
         "Entry Low": entry_low, "Entry High": entry_high, "Stop": stop,
         "Target 1": target1, "Target 2": target2, "RR": rr,
+        "RR Midpoint": r_metrics["mid"], "T1 R": r_metrics["t1"], "T2 R": r_metrics["t2"],
+        "RR Zone Min": r_metrics["zone_min"], "RR Zone Max": r_metrics["zone_max"],
         "Trade State": trade_state,
         "Trade Block Reason": trade_block_reason,
         "Stop %": stop_pct,
@@ -2662,19 +2830,20 @@ with ticker_tab:
                 entry_quality = "N/A — DATA ISSUE"
                 action_label = "DO NOT ACT"
             elif diag["Trade State"] == "ACTIONABLE":
-                sp = diag.get("Stop %", np.nan)
-                if pd.notna(sp) and sp <= 0.06 and pd.notna(diag["RR"]) and diag["RR"] >= 2:
-                    entry_quality = "A"
-                elif pd.notna(sp) and sp <= 0.08:
-                    entry_quality = "B+"
-                else:
-                    entry_quality = "B"
+                entry_quality = diag.get("Entry Geometry Quality", "B+")
 
                 if confidence["level"] == "MEDIUM":
-                    entry_quality = {"A": "B+", "B+": "B", "B": "C"}.get(entry_quality, entry_quality)
+                    base_grade = entry_quality.replace(" — CAUTION", "")
+                    downgraded = {"A": "B+", "B+": "B", "B": "C"}.get(base_grade, base_grade)
+                    entry_quality = downgraded + (" — CAUTION" if "CAUTION" in entry_quality else "")
                     action_label = f"{diag['Bias']} — REDUCED CONFIDENCE"
                 else:
                     action_label = diag["Bias"]
+            elif diag["Trade State"] == "WAIT FOR QUALITY" and diag.get("Entry Geometry Pass", False):
+                # Candidate quality blocks the trade, but price/risk geometry is
+                # still reported independently rather than falsely marked bad.
+                entry_quality = diag.get("Entry Geometry Quality", "B+")
+                action_label = "WAIT FOR QUALITY"
             elif diag["Extension"] in ("Extended", "Oversold"):
                 entry_quality = "D — EXTENDED" if diag["Extension"] == "Extended" else "D — OVERSOLD"
                 action_label = diag["Trade State"]
@@ -2892,10 +3061,18 @@ with ticker_tab:
                         f"Volume participation is slightly below ideal: {diag['Volume Ratio']:.2f}x "
                         "(non-blocking; ≥1.0x preferred, ≥1.2x stronger)"
                     )
+                for caution in diag.get("Entry Cautions", []):
+                    risks.append(caution)
+                if diag.get("Earnings Risk State") == "CAUTION":
+                    certainty_word = "Confirmed" if diag.get("Earnings Certainty") == "CONFIRMED" else "Estimated"
+                    risks.append(
+                        f"{certainty_word} earnings timing is inside the {EARNINGS_CAUTION_DAYS}-day caution window: {diag['Earnings']}."
+                    )
                 if confidence["level"] != "HIGH":
                     risks.append(f"Price Data Confidence is {confidence['level']}")
                 if diag["Trade State"] != "ACTIONABLE":
                     risks.append(diag.get("Trade Block Reason", diag["Trade State"]))
+                risks = unique_text_items(risks)
                 if risks:
                     for item in risks:
                         st.write(f"• {item}")
@@ -2939,6 +3116,8 @@ with ticker_tab:
                     defects.append("MOMENTUM DECELERATION")
                 if pd.notna(vol_now) and vol_now < 1.0:
                     defects.append("WEAK VOLUME")
+                if candidate_quality not in MIN_ACTIONABLE_CANDIDATE_GRADES:
+                    defects.append("CANDIDATE QUALITY")
                 if not bullish_candidate and not bearish_candidate:
                     defects.append("DIRECTIONAL ALIGNMENT")
 
@@ -2951,6 +3130,8 @@ with ticker_tab:
                     repair_mode = "EVENT VERIFICATION"
                 elif "EARNINGS WINDOW" in defects:
                     repair_mode = "WAIT THROUGH EARNINGS"
+                elif "CANDIDATE QUALITY" in defects:
+                    repair_mode = "WAIT FOR QUALITY"
                 elif "DIRECTIONAL ALIGNMENT" in defects:
                     repair_mode = "WAIT FOR STRUCTURE"
                 elif "PRICE EXTENSION" in defects or "RSI EXTENSION" in defects:
@@ -2976,8 +3157,16 @@ with ticker_tab:
                 elif diag.get("Earnings Risk State") == "HIGH":
                     certainty_word = "confirmed" if diag.get("Earnings Certainty") == "CONFIRMED" else "estimated"
                     repair_items.append(f"Wait until the {certainty_word} earnings danger window has passed: {diag['Earnings']}.")
+                if "CANDIDATE QUALITY" in defects:
+                    repair_items.append(
+                        f"Candidate Quality is {candidate_quality}; improve to at least B+ before a new swing entry can become actionable."
+                    )
                 if "DIRECTIONAL ALIGNMENT" in defects:
-                    repair_items.append(diag.get("Directional Alignment Reason") or "Restore aligned trend, momentum and relative strength before evaluating entry location.")
+                    repair_items.extend(
+                        directional_repair_requirements(
+                            diag.get("Trend"), diag.get("Momentum Score"), diag.get("RS Edge")
+                        )
+                    )
                     if diag.get("Extension") == "Extended" and pd.notna(dist_now):
                         repair_items.append(f"Secondary no-chase condition: price is {dist_now:+.1%} vs EMA20; it must return to ≤ +8.0% before a long entry can qualify.")
                     elif diag.get("Extension") == "Oversold" and pd.notna(dist_now):
@@ -3038,7 +3227,12 @@ with ticker_tab:
                         repair_items.append(f"Volume is {vol_now:.2f}x; prefer ≥1.0x, with ≥1.2x stronger.")
 
                 event_primary_block = diag.get("Earnings Risk State") in {"HIGH", "UNKNOWN"}
-                publish_price_repair = (bullish_candidate or bearish_candidate) and not event_primary_block and not confidence["block"]
+                publish_price_repair = (
+                    (bullish_candidate or bearish_candidate)
+                    and candidate_quality in MIN_ACTIONABLE_CANDIDATE_GRADES
+                    and not event_primary_block
+                    and not confidence["block"]
+                )
 
                 if event_primary_block:
                     if diag.get("Earnings Risk State") == "HIGH":
@@ -3074,9 +3268,17 @@ with ticker_tab:
                         "volume, stop distance and the new local price structure before publishing an actionable trade plan."
                     )
                 else:
+                    exact_failures = directional_repair_requirements(
+                        diag.get("Trend"), diag.get("Momentum Score"), diag.get("RS Edge")
+                    ) if "DIRECTIONAL ALIGNMENT" in defects else []
+                    if "CANDIDATE QUALITY" in defects:
+                        exact_failures.insert(0, f"Candidate Quality {candidate_quality} is below the minimum B+ actionability threshold.")
+                    message = " ".join(unique_text_items(exact_failures))
+                    if diag.get("Extension") in {"Extended", "Oversold"}:
+                        message += " Entry extension remains a secondary no-chase condition until the higher-priority gate repairs."
                     st.info(
-                        "No price repair area is published because trend, momentum and relative strength are not sufficiently aligned. "
-                        "Directional structure must form first; extension remains a secondary no-chase gate if present."
+                        "**No price repair area is published while higher-priority quality/structure gates are unresolved.** "
+                        + (message or "Recalculate after the failed gates repair.")
                     )
 
                 st.markdown("**Conditions required to improve the setup**")
@@ -3086,6 +3288,12 @@ with ticker_tab:
                     )
                 if confidence["level"] == "MEDIUM":
                     repair_items.append("Restore HIGH Price Data Confidence if the isolated data gap can be repaired.")
+                if diag.get("Earnings Risk State") == "CAUTION":
+                    certainty_word = "confirmed" if diag.get("Earnings Certainty") == "CONFIRMED" else "estimated"
+                    repair_items.append(
+                        f"Secondary event caution: {certainty_word} earnings timing is inside the {EARNINGS_CAUTION_DAYS}-day caution window ({diag['Earnings']})."
+                    )
+                repair_items = unique_text_items(repair_items)
                 for item in repair_items:
                     st.write(f"• {item}")
 
@@ -3113,11 +3321,20 @@ with ticker_tab:
                     else:
                         considerations.append("Momentum is decelerating; monitor follow-through.")
 
+                considerations.extend(diag.get("Entry Cautions", []))
+
+                if diag.get("Earnings Risk State") == "CAUTION":
+                    certainty_word = "Confirmed" if diag.get("Earnings Certainty") == "CONFIRMED" else "Estimated"
+                    considerations.append(
+                        f"{certainty_word} earnings timing is inside the {EARNINGS_CAUTION_DAYS}-day caution window: {diag['Earnings']}."
+                    )
+
                 if confidence["level"] != "HIGH":
                     considerations.append(
                         f"Price Data Confidence is {confidence['level']}; use additional caution."
                     )
 
+                considerations = unique_text_items(considerations)
                 if considerations:
                     for item in considerations:
                         st.write(f"• {item}")
@@ -3126,7 +3343,7 @@ with ticker_tab:
 
             st.markdown("### Trade Plan")
             st.caption(
-                "Trade plan is shown only when entry quality passes the risk gate. "
+                "Trade plan is shown only when candidate quality and entry quality both pass the risk gates. "
                 "Hard stop-distance cap: **10%**. Extended/oversold names are blocked from actionable entries."
             )
 
@@ -3134,7 +3351,13 @@ with ticker_tab:
                 st.warning(
                     f"**{diag['Trade State']}** — {diag.get('Trade Block Reason', '')}"
                 )
-                if candidate_quality in {"A+", "A", "B+"}:
+                if diag["Trade State"] == "WAIT FOR QUALITY" and diag.get("Entry Geometry Pass", False):
+                    st.info(
+                        f"Price/risk geometry is independently graded {diag.get('Entry Geometry Quality', 'acceptable')}, "
+                        f"but Candidate Quality {candidate_quality} is below the minimum B+ actionability threshold. "
+                        "A technically acceptable entry does not override insufficient candidate edge."
+                    )
+                elif candidate_quality in {"A+", "A", "B+"}:
                     st.info(
                         "Candidate quality remains high, but the current entry/actionability gate is not acceptable. "
                         "Candidate quality and entry quality are intentionally scored separately."
@@ -3160,13 +3383,27 @@ with ticker_tab:
                     "Stop Distance",
                     "N/A" if pd.isna(diag["Stop %"]) else f"{diag['Stop %']:.1%}"
                 )
-                p5.metric("R:R", fmt_ratio(diag["RR"]))
+                p5.metric("R:R @ midpoint", fmt_ratio(diag.get("RR Midpoint", diag["RR"])))
 
                 t1, t2 = st.columns(2)
                 t1.metric("Target 1", fmt_price(diag["Target 1"]))
                 t2.metric("Target 2", fmt_price(diag["Target 2"]))
 
-                if pd.notna(diag["Stop %"]) and diag["Stop %"] > 0.08:
+                rr1, rr2, rr3 = st.columns(3)
+                rr1.metric("T1 R @ midpoint", fmt_ratio(diag.get("T1 R", np.nan)))
+                rr2.metric("T2 R @ midpoint", fmt_ratio(diag.get("T2 R", np.nan)))
+                zone_min = diag.get("RR Zone Min", np.nan)
+                zone_max = diag.get("RR Zone Max", np.nan)
+                zone_text = (
+                    f"{zone_min:.1f}R – {zone_max:.1f}R"
+                    if pd.notna(zone_min) and pd.notna(zone_max) else "N/A"
+                )
+                rr3.metric("T2 R across entry zone", zone_text)
+
+                if diag.get("Entry Cautions"):
+                    for caution in diag["Entry Cautions"]:
+                        st.warning(caution)
+                elif pd.notna(diag["Stop %"]) and diag["Stop %"] > 0.08:
                     st.warning(
                         "Stop distance is above 8%. This is still inside the 10% hard cap, "
                         "but risk is on the wide side for a typical swing trade."
@@ -3185,7 +3422,7 @@ with ticker_tab:
                     ("RS vs SPY", "1M / 3M / 6M excess return vs SPY; RS Edge weights 20% / 35% / 45%"),
                     ("Volume Ratio", "Current volume ÷ 20-day average volume"),
                     ("Extension", ">8% above EMA20 or RSI≥75 = Extended; >8% below EMA20 or RSI≤25 = Oversold"),
-                    ("Trade Plan", "ATR(14), EMA structure and 20-day highs/lows; blocked if extended/oversold or stop distance exceeds 10%"),
+                    ("Trade Plan", "Requires candidate-quality gate + entry-quality gate; R:R uses midpoint entry and also shows T1/T2 plus the full entry-zone T2 range"),
                 ]
                 st.dataframe(pd.DataFrame(rows, columns=["Signal", "Rule"]), hide_index=True, use_container_width=True)
 
