@@ -1,4 +1,4 @@
-# Quality Engine v7.0 — Phase 1 FINAL FROZEN (Risk-Gated + Transparent R:R)
+# Quality Engine v7.1 — Phase 2A WORKING (Exchange Calendar + Targeted Recovery)
 
 import io
 import time
@@ -10,6 +10,11 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+
+try:
+    import exchange_calendars as xcals
+except Exception:
+    xcals = None
 
 st.set_page_config(
     page_title="Regime-Aware Swing Scanner",
@@ -31,7 +36,7 @@ YAHOO_BATCH_SIZE = 120
 SCAN_CACHE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-PHASE1_ENGINE_VERSION = "v7.0-P1.4-FINAL-FROZEN"
+ENGINE_VERSION = "v7.1-P2A-WORKING"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -39,6 +44,14 @@ EARNINGS_HARD_BLOCK_DAYS = 3
 EARNINGS_CAUTION_DAYS = 14
 RECENT_EARNINGS_GRACE_DAYS = 5
 COMPANY_SNAPSHOT_TTL = 30 * 60
+
+# Phase 2A market-session / targeted-recovery controls.
+NYSE_CALENDAR_NAME = "XNYS"
+MARKET_DATA_PUBLICATION_BUFFER_MINUTES = 120
+SCAN_TARGETED_RETRY_MAX_FRACTION = 0.25
+SCAN_TARGETED_RETRY_MAX_SYMBOLS = 30
+SCAN_INDIVIDUAL_REPAIR_MAX_PER_BATCH = 6
+SCAN_INDIVIDUAL_REPAIR_MAX_TOTAL = 24
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 IWM_HOLDINGS_URL = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/latest-holdings.csv"
@@ -764,30 +777,73 @@ def price_data_status(df, min_rows=80):
 
 
 
-def expected_latest_completed_us_session(now=None):
-    """
-    Best-effort freshness guard for US daily bars.
-    Uses weekdays (not the full exchange holiday calendar) and a conservative
-    18:00 New York cutoff so Yahoo has time to publish the completed bar.
-    """
+@st.cache_resource(show_spinner=False)
+def get_nyse_calendar():
+    """Return the XNYS exchange calendar when the optional dependency is available."""
+    if xcals is None:
+        return None
+    try:
+        return xcals.get_calendar(NYSE_CALENDAR_NAME)
+    except Exception:
+        return None
+
+
+def market_calendar_source():
+    """Human-readable source for diagnostics and provider-health reporting."""
+    return "exchange_calendars/XNYS" if get_nyse_calendar() is not None else "weekday fallback"
+
+
+def _now_new_york(now=None):
     try:
         if now is None:
-            now_ny = pd.Timestamp.now(tz="America/New_York")
-        else:
-            now_ny = pd.Timestamp(now)
-            if now_ny.tzinfo is None:
-                now_ny = now_ny.tz_localize("America/New_York")
-            else:
-                now_ny = now_ny.tz_convert("America/New_York")
+            return pd.Timestamp.now(tz="America/New_York")
+        ts = pd.Timestamp(now)
+        if ts.tzinfo is None:
+            return ts.tz_localize("America/New_York")
+        return ts.tz_convert("America/New_York")
     except Exception:
-        now_ny = pd.Timestamp.now(tz="America/New_York")
+        return pd.Timestamp.now(tz="America/New_York")
 
+
+def expected_latest_completed_us_session(now=None):
+    """Return the latest US equity session safe to use for completed-daily signals.
+
+    Phase 2A uses the XNYS exchange calendar when available, so weekends, exchange
+    holidays and early closes are handled by the exchange schedule itself. A two-hour
+    publication buffer is applied after the official session close before a same-day
+    Yahoo daily bar is accepted as completed. If exchange_calendars is unavailable,
+    the prior conservative weekday/18:00 ET behavior remains as a deployment-safe
+    fallback and is surfaced through ``market_calendar_source()``.
+    """
+    now_ny = _now_new_york(now)
+    session_date = now_ny.tz_localize(None).normalize()
+    cal = get_nyse_calendar()
+
+    if cal is not None:
+        try:
+            if cal.is_session(session_date):
+                close_utc = cal.session_close(session_date)
+                close_ny = pd.Timestamp(close_utc).tz_convert("America/New_York")
+                ready_at = close_ny + pd.Timedelta(minutes=MARKET_DATA_PUBLICATION_BUFFER_MINUTES)
+                if now_ny >= ready_at:
+                    return session_date
+                previous = cal.previous_session(session_date)
+                return pd.Timestamp(previous).tz_localize(None).normalize()
+
+            previous = cal.date_to_session(session_date, direction="previous")
+            return pd.Timestamp(previous).tz_localize(None).normalize()
+        except Exception:
+            # Fall through to conservative legacy behavior if the calendar itself
+            # cannot answer an out-of-range or malformed date request.
+            pass
+
+    # Deployment-safe fallback. This is intentionally conservative and is no longer
+    # the preferred path once exchange_calendars is installed in the app environment.
     d = now_ny.normalize()
     if now_ny.weekday() < 5 and now_ny.hour >= 18:
         expected = d
     else:
         expected = d - pd.Timedelta(days=1)
-
     while expected.weekday() >= 5:
         expected -= pd.Timedelta(days=1)
     return expected.tz_localize(None).normalize()
@@ -825,6 +881,7 @@ def completed_session_frame(df, now=None):
     x.attrs["signal_session_cutoff"] = cutoff
     x.attrs["raw_latest_date"] = raw_latest
     x.attrs["excluded_incomplete_session"] = bool(pd.notna(raw_latest) and raw_latest > cutoff)
+    x.attrs["market_calendar_source"] = market_calendar_source()
     return x
 
 
@@ -840,26 +897,32 @@ def market_data_freshness(df):
     latest = pd.Timestamp(latest).tz_localize(None).normalize()
     expected = expected_latest_completed_us_session()
     fresh = latest >= expected
+    source = market_calendar_source()
     reason = (
-        f"Latest completed daily bar: {latest:%d-%b-%Y}. Expected latest session: {expected:%d-%b-%Y}."
+        f"Latest completed daily bar: {latest:%d-%b-%Y}. Expected latest XNYS session: {expected:%d-%b-%Y} ({source})."
         if fresh else
-        f"Latest completed daily bar: {latest:%d-%b-%Y}; expected at least {expected:%d-%b-%Y}."
+        f"Latest completed daily bar: {latest:%d-%b-%Y}; expected at least {expected:%d-%b-%Y} ({source})."
     )
     return fresh, latest, expected, reason
 
 
-
 def expected_recent_us_sessions(lookback_days=14):
-    """
-    Best-effort recent US business-day calendar.
-    This intentionally uses weekdays only; exchange holidays are tolerated
-    during continuity checks if neither provider supplies a bar.
-    """
+    """Return the latest expected XNYS sessions, with a conservative fallback."""
     end = expected_latest_completed_us_session()
+    cal = get_nyse_calendar()
+    if cal is not None:
+        try:
+            # Use a generous calendar window, then take the exact number of exchange
+            # sessions requested. This naturally excludes weekends and NYSE holidays.
+            start = end - pd.Timedelta(days=max(45, lookback_days * 4))
+            sessions = cal.sessions_in_range(start, end)
+            return pd.DatetimeIndex([pd.Timestamp(d).tz_localize(None).normalize() for d in sessions[-lookback_days:]])
+        except Exception:
+            pass
+
     start = end - pd.Timedelta(days=lookback_days * 2)
     days = pd.date_range(start=start, end=end, freq="B")
     return pd.DatetimeIndex(days[-lookback_days:])
-
 
 def missing_recent_sessions(df, lookback_days=14):
     x = completed_session_frame(df)
@@ -909,14 +972,10 @@ def merge_price_sources(primary_df, fallback_df):
 
 
 def continuity_status(df, lookback_days=14):
-    """
-    Return (ok, missing_dates, message) for recent-session continuity.
-    Weekend/holiday false positives are minimized by looking only at weekdays;
-    unresolved dates are reported explicitly.
-    """
+    """Return continuity status against expected exchange sessions."""
     missing = missing_recent_sessions(df, lookback_days=lookback_days)
     if not missing:
-        return True, [], f"No missing weekday sessions in the last {lookback_days} expected sessions."
+        return True, [], f"No missing XNYS sessions in the last {lookback_days} expected sessions ({market_calendar_source()})."
 
     formatted = ", ".join(pd.Timestamp(d).strftime("%d-%b-%Y") for d in missing)
     return False, missing, f"Missing recent session(s): {formatted}."
@@ -929,11 +988,11 @@ def data_confidence(df, recent_lookback=14):
 
     HIGH:
       - latest completed session is current
-      - no recent weekday gaps
+      - no recent expected exchange-session gaps
 
     MEDIUM:
       - latest session is current
-      - exactly one recent missing weekday session
+      - exactly one recent missing exchange session
       - sufficient valid history remains
 
     LOW:
@@ -971,7 +1030,7 @@ def data_confidence(df, recent_lookback=14):
             "level": "HIGH",
             "score": 100,
             "block": False,
-            "message": "Latest completed session is current and no recent weekday gaps were detected.",
+            "message": f"Latest completed XNYS session is current and no recent exchange-session gaps were detected ({market_calendar_source()}).",
             "missing": [],
         }
 
@@ -1575,6 +1634,33 @@ def split_batch_result(data, symbol):
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     return sanitize_ohlcv(df)
 
+def scanner_frame_quality(df):
+    """Return a comparable quality tuple for bulk-scan repair decisions.
+
+    Higher is better: usable/non-blocked data, confidence score, latest completed
+    session, then history length. This lets a targeted retry replace the primary
+    frame only when it actually improves data quality.
+    """
+    valid, _ = price_data_status(df, min_rows=126)
+    if not valid:
+        return (0, 0, -1, 0)
+    x = completed_session_frame(df)
+    confidence = data_confidence(x, recent_lookback=14)
+    latest = pd.to_datetime(x["Date"], errors="coerce").max() if "Date" in x.columns else pd.NaT
+    latest_ord = int(pd.Timestamp(latest).value) if pd.notna(latest) else -1
+    usable = 0 if bool(confidence.get("block", True)) else 1
+    return (usable, int(confidence.get("score", 0)), latest_ord, int(len(x)))
+
+
+def scanner_frame_usable(df):
+    return scanner_frame_quality(df)[0] == 1
+
+
+def better_scanner_frame(current_df, candidate_df):
+    """Keep a repaired frame only when it improves scanner data quality."""
+    return candidate_df if scanner_frame_quality(candidate_df) > scanner_frame_quality(current_df) else current_df
+
+
 def compute_record(symbol, company, sector, df):
     valid, _ = price_data_status(df, min_rows=126)
     if not valid:
@@ -1660,18 +1746,26 @@ def compute_record(symbol, company, sector, df):
     return record
 
 def run_market_scan(universe_df, progress_bar, status_box):
-    """
-    Bulk scan with provider-health detection.
+    """Bulk scan with provider-health detection and targeted recovery.
 
-    A provider outage is NOT treated as hundreds of failed stocks.
-    If Yahoo coverage collapses, abort the scan and preserve the last good result.
+    Phase 2A recovery policy:
+      1) Download the normal Yahoo batch.
+      2) If only a minority of symbols are bad/stale, retry only that subset.
+      3) If a whole batch appears unhealthy, perform one conservative provider-level
+         retry rather than hammering every ticker individually.
+      4) Only a small remaining tail is eligible for individual Yahoo->Stooq repair.
+
+    This preserves provider friendliness while rescuing isolated failures and stale
+    bars that would otherwise unnecessarily lower scanner coverage.
     """
     if universe_df.empty:
         return pd.DataFrame(), [], {
             "status": "NO_UNIVERSE",
             "provider": "Yahoo",
             "coverage": 0.0,
+            "usable_coverage": 0.0,
             "message": "Universe is empty.",
+            "calendar_source": market_calendar_source(),
         }
 
     universe_df = universe_df.drop_duplicates("Ticker").reset_index(drop=True)
@@ -1683,6 +1777,11 @@ def run_market_scan(universe_df, progress_bar, status_box):
     provider_batches_failed = 0
     total_batches = max(1, int(np.ceil(len(tickers) / YAHOO_BATCH_SIZE)))
 
+    targeted_retry_symbols = 0
+    targeted_retry_repaired = 0
+    individual_repair_attempts = 0
+    individual_repair_repaired = 0
+
     for batch_no, start_i in enumerate(range(0, len(tickers), YAHOO_BATCH_SIZE), start=1):
         batch = tickers[start_i : start_i + YAHOO_BATCH_SIZE]
         status_box.info(
@@ -1691,27 +1790,70 @@ def run_market_scan(universe_df, progress_bar, status_box):
         )
 
         raw = download_batch_cached(tuple(batch), conservative=False)
+        frames = {symbol: split_batch_result(raw, symbol) for symbol in batch}
+        problem_symbols = [symbol for symbol in batch if not scanner_frame_usable(frames[symbol])]
 
-        # Provider-level retry: one conservative retry, not per-stock hammering.
-        valid_in_batch = sum(
-            1 for symbol in batch
-            if price_data_status(split_batch_result(raw, symbol), min_rows=126)[0]
+        broad_problem_threshold = max(2, int(np.ceil(len(batch) * 0.20)))
+        broad_problem = len(problem_symbols) >= broad_problem_threshold
+
+        if problem_symbols:
+            if broad_problem:
+                # Provider-level retry: one conservative full-batch request. This is
+                # preferable to launching many individual requests during an outage.
+                status_box.info(
+                    f"Yahoo batch {batch_no}/{total_batches} is broadly degraded; "
+                    "running one conservative provider retry."
+                )
+                raw_retry = download_batch_cached(tuple(batch), conservative=True)
+                for symbol in batch:
+                    retry_df = split_batch_result(raw_retry, symbol)
+                    frames[symbol] = better_scanner_frame(frames[symbol], retry_df)
+            else:
+                # Isolated failures: retry only the affected subset.
+                retry_subset = problem_symbols[:SCAN_TARGETED_RETRY_MAX_SYMBOLS]
+                max_fraction = max(1, int(np.ceil(len(batch) * SCAN_TARGETED_RETRY_MAX_FRACTION)))
+                retry_subset = retry_subset[:max_fraction]
+                if retry_subset:
+                    targeted_retry_symbols += len(retry_subset)
+                    status_box.info(
+                        f"Repairing {len(retry_subset)} isolated Yahoo symbol(s) in batch "
+                        f"{batch_no}/{total_batches}."
+                    )
+                    retry_raw = download_batch_cached(tuple(retry_subset), conservative=True)
+                    for symbol in retry_subset:
+                        before = scanner_frame_quality(frames[symbol])
+                        retry_df = split_batch_result(retry_raw, symbol)
+                        frames[symbol] = better_scanner_frame(frames[symbol], retry_df)
+                        if scanner_frame_quality(frames[symbol]) > before:
+                            targeted_retry_repaired += 1
+
+        # After Yahoo retry, allow only a small tail of unresolved symbols to use
+        # the independent individual route (Yahoo primary + Stooq gap repair).
+        remaining = [symbol for symbol in batch if not scanner_frame_usable(frames[symbol])]
+        remaining_total_capacity = max(0, SCAN_INDIVIDUAL_REPAIR_MAX_TOTAL - individual_repair_attempts)
+        individual_subset = remaining[: min(SCAN_INDIVIDUAL_REPAIR_MAX_PER_BATCH, remaining_total_capacity)]
+
+        # Never perform individual fallback when a large fraction of the provider
+        # batch is still broken; that condition is treated as provider degradation.
+        individual_tail_limit = min(
+            SCAN_INDIVIDUAL_REPAIR_MAX_PER_BATCH,
+            max(1, int(np.ceil(len(batch) * 0.10))),
         )
-        if valid_in_batch < max(2, int(len(batch) * 0.20)):
-            raw_retry = download_batch_cached(tuple(batch), conservative=True)
-            retry_valid = sum(
-                1 for symbol in batch
-                if price_data_status(split_batch_result(raw_retry, symbol), min_rows=126)[0]
-            )
-            if retry_valid > valid_in_batch:
-                raw = raw_retry
-                valid_in_batch = retry_valid
+        if len(remaining) <= individual_tail_limit:
+            for symbol in individual_subset:
+                individual_repair_attempts += 1
+                before = scanner_frame_quality(frames[symbol])
+                repaired_df = download_one(symbol, "1y")
+                frames[symbol] = better_scanner_frame(frames[symbol], repaired_df)
+                if scanner_frame_quality(frames[symbol]) > before:
+                    individual_repair_repaired += 1
 
-        if valid_in_batch < max(2, int(len(batch) * 0.20)):
+        usable_in_batch = sum(1 for symbol in batch if scanner_frame_usable(frames[symbol]))
+        if usable_in_batch < max(2, int(len(batch) * 0.20)):
             provider_batches_failed += 1
 
         for symbol in batch:
-            df = split_batch_result(raw, symbol)
+            df = frames[symbol]
             meta = metadata.get(symbol, {})
             rec = compute_record(
                 symbol,
@@ -1726,46 +1868,66 @@ def run_market_scan(universe_df, progress_bar, status_box):
 
         progress_bar.progress(min(batch_no / total_batches, 1.0))
 
-        # Fail fast when the first two large batches are essentially empty.
+        # Fail fast when the first two large batches are essentially unusable even
+        # after the controlled recovery sequence.
         if batch_no >= 2 and provider_batches_failed == batch_no and len(records) < 5:
             break
 
     coverage = len(records) / max(len(tickers), 1)
     usable_records = [r for r in records if not bool(r.get("Price Data Block", True))]
     usable_coverage = len(usable_records) / max(len(tickers), 1)
+    repair_summary = (
+        f"Targeted Yahoo retry: {targeted_retry_repaired}/{targeted_retry_symbols} improved; "
+        f"individual repair: {individual_repair_repaired}/{individual_repair_attempts} improved."
+    )
 
     if coverage < 0.20 or usable_coverage < 0.20:
         health = {
             "status": "PROVIDER_FAILURE",
-            "provider": "Yahoo",
+            "provider": "Yahoo + targeted repair",
             "coverage": coverage,
             "usable_coverage": usable_coverage,
+            "calendar_source": market_calendar_source(),
+            "targeted_retry_symbols": targeted_retry_symbols,
+            "targeted_retry_repaired": targeted_retry_repaired,
+            "individual_repair_attempts": individual_repair_attempts,
+            "individual_repair_repaired": individual_repair_repaired,
             "message": (
-                f"Yahoo bulk data integrity collapsed: raw coverage {len(records)}/{len(tickers)} "
+                f"Bulk data integrity collapsed: raw coverage {len(records)}/{len(tickers)} "
                 f"({coverage:.0%}); fresh/usable coverage {len(usable_records)}/{len(tickers)} "
-                f"({usable_coverage:.0%}). Scan aborted to protect data integrity."
+                f"({usable_coverage:.0%}). Scan aborted to protect data integrity. {repair_summary}"
             ),
         }
     elif coverage < 0.80 or usable_coverage < 0.80:
         health = {
             "status": "DEGRADED",
-            "provider": "Yahoo",
+            "provider": "Yahoo + targeted repair",
             "coverage": coverage,
             "usable_coverage": usable_coverage,
+            "calendar_source": market_calendar_source(),
+            "targeted_retry_symbols": targeted_retry_symbols,
+            "targeted_retry_repaired": targeted_retry_repaired,
+            "individual_repair_attempts": individual_repair_attempts,
+            "individual_repair_repaired": individual_repair_repaired,
             "message": (
-                f"Yahoo data is degraded: raw coverage {len(records)}/{len(tickers)} ({coverage:.0%}); "
-                f"fresh/usable {len(usable_records)}/{len(tickers)} ({usable_coverage:.0%})."
+                f"Bulk data is degraded: raw coverage {len(records)}/{len(tickers)} ({coverage:.0%}); "
+                f"fresh/usable {len(usable_records)}/{len(tickers)} ({usable_coverage:.0%}). {repair_summary}"
             ),
         }
     else:
         health = {
             "status": "HEALTHY",
-            "provider": "Yahoo",
+            "provider": "Yahoo + targeted repair",
             "coverage": coverage,
             "usable_coverage": usable_coverage,
+            "calendar_source": market_calendar_source(),
+            "targeted_retry_symbols": targeted_retry_symbols,
+            "targeted_retry_repaired": targeted_retry_repaired,
+            "individual_repair_attempts": individual_repair_attempts,
+            "individual_repair_repaired": individual_repair_repaired,
             "message": (
-                f"Yahoo coverage healthy: {len(records)}/{len(tickers)} ({coverage:.0%}); "
-                f"fresh/usable {len(usable_records)}/{len(tickers)} ({usable_coverage:.0%})."
+                f"Bulk coverage healthy: {len(records)}/{len(tickers)} ({coverage:.0%}); "
+                f"fresh/usable {len(usable_records)}/{len(tickers)} ({usable_coverage:.0%}). {repair_summary}"
             ),
         }
 
@@ -3457,6 +3619,11 @@ with scanner_tab:
     else:
         st.info("🔵 **Data Health:** Run a scan to test current bulk-provider coverage.")
 
+    st.caption(
+        f"Market-session calendar: **{health.get('calendar_source', market_calendar_source())}** • "
+        f"Signal bars require a {MARKET_DATA_PUBLICATION_BUFFER_MINUTES}-minute post-close publication buffer."
+    )
+
     c1, c2 = st.columns([1, 2])
     with c1:
         universe_name = st.selectbox(
@@ -3595,13 +3762,13 @@ with scanner_tab:
         needs_rank_rebuild = (
             st.session_state.scan_ranked_df.empty
             or st.session_state.scan_ranked_regime_label != regime["label"]
-            or st.session_state.scan_ranked_engine_version != PHASE1_ENGINE_VERSION
+            or st.session_state.scan_ranked_engine_version != ENGINE_VERSION
         )
         if needs_rank_rebuild:
             with st.spinner("Building ranked master scan..."):
                 st.session_state.scan_ranked_df = build_ranked_master(scan_df)
                 st.session_state.scan_ranked_regime_label = regime["label"]
-                st.session_state.scan_ranked_engine_version = PHASE1_ENGINE_VERSION
+                st.session_state.scan_ranked_engine_version = ENGINE_VERSION
 
         ranked = apply_scanner_filters(
             st.session_state.scan_ranked_df,
