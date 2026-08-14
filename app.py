@@ -1,5 +1,6 @@
-# Quality Engine v7.1 — Phase 2A WORKING (Exchange Calendar + Targeted Recovery)
+# Quality Engine v7.1 — Phase 2A.1 WORKING (Exchange Calendar + Targeted Recovery + Fast Scan Reuse)
 
+import hashlib
 import io
 import time
 from datetime import datetime
@@ -34,9 +35,10 @@ st.caption(
 
 YAHOO_BATCH_SIZE = 120
 SCAN_CACHE_TTL = 15 * 60
+SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.1-P2A-WORKING"
+ENGINE_VERSION = "v7.1-P2A.1-WORKING"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -88,6 +90,12 @@ if "scan_ranked_regime_label" not in st.session_state:
     st.session_state.scan_ranked_regime_label = ""
 if "scan_ranked_engine_version" not in st.session_state:
     st.session_state.scan_ranked_engine_version = ""
+if "scan_universe_signature" not in st.session_state:
+    st.session_state.scan_universe_signature = ""
+if "scan_signal_session" not in st.session_state:
+    st.session_state.scan_signal_session = None
+if "scan_data_engine_version" not in st.session_state:
+    st.session_state.scan_data_engine_version = ""
 
 # ---------------------------
 # Helpers
@@ -102,6 +110,60 @@ def clean_symbol(symbol: str) -> str:
     if not s or s in {"-", "NAN", "CASH", "USD"}:
         return ""
     return yahoo_symbol(s)
+
+def scan_universe_signature(universe_df):
+    """Stable hash of the ticker set used by a scanner run.
+
+    A same-name universe is not assumed to be identical: watchlists can change and
+    index constituent sources can update. The signature prevents reuse when the
+    actual symbol set differs from the cached scan.
+    """
+    if universe_df is None or universe_df.empty or "Ticker" not in universe_df.columns:
+        return ""
+    tickers = sorted({clean_symbol(v) for v in universe_df["Ticker"].tolist() if clean_symbol(v)})
+    payload = "\n".join(tickers).encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()
+
+
+def reusable_session_scan(universe_name, universe_df, now=None):
+    """Return (reusable, age_seconds, signal_session, reason).
+
+    Phase 2A.1 reuses the finished scan only when all material cache keys match:
+    same universe name, same ticker-set signature, same completed XNYS session,
+    same data-engine version, and age within the scanner result TTL.
+    """
+    cached = st.session_state.get("scan_df", pd.DataFrame())
+    if cached is None or cached.empty:
+        return False, np.nan, pd.NaT, "no cached scan"
+    if st.session_state.get("scan_universe_name", "") != universe_name:
+        return False, np.nan, pd.NaT, "different universe"
+
+    current_signature = scan_universe_signature(universe_df)
+    if not current_signature or st.session_state.get("scan_universe_signature", "") != current_signature:
+        return False, np.nan, pd.NaT, "universe constituents changed"
+
+    current_session = expected_latest_completed_us_session(now=now)
+    stored_session = st.session_state.get("scan_signal_session")
+    if stored_session is None or pd.isna(stored_session):
+        return False, np.nan, current_session, "cached signal session unavailable"
+    stored_session = pd.Timestamp(stored_session).tz_localize(None).normalize()
+    if stored_session != pd.Timestamp(current_session).tz_localize(None).normalize():
+        return False, np.nan, current_session, "new completed XNYS session available"
+
+    if st.session_state.get("scan_data_engine_version", "") != ENGINE_VERSION:
+        return False, np.nan, current_session, "scanner engine version changed"
+
+    timestamp = st.session_state.get("scan_timestamp")
+    if timestamp is None:
+        return False, np.nan, current_session, "cached scan timestamp unavailable"
+    try:
+        age_seconds = max(0.0, (datetime.now() - pd.Timestamp(timestamp).to_pydatetime()).total_seconds())
+    except Exception:
+        return False, np.nan, current_session, "cached scan age unavailable"
+
+    if age_seconds > SCAN_RESULT_REUSE_TTL:
+        return False, age_seconds, current_session, "cached scan expired"
+    return True, age_seconds, current_session, "same universe/session within TTL"
 
 def us_market_today(now=None):
     """Return the current New York calendar date as a naive normalized Timestamp."""
@@ -3678,6 +3740,19 @@ with scanner_tab:
     with clear_col:
         clear_scan = st.button("Clear results", use_container_width=True)
 
+    force_refresh_scan = st.button(
+        "Force refresh market data",
+        use_container_width=True,
+        help=(
+            "Bypass the valid same-session finished-scan cache and force a fresh Yahoo batch download. "
+            "Use this when you explicitly want to retest the provider or refresh market data before the normal TTL expires."
+        ),
+    )
+    st.caption(
+        f"Repeat Run requests reuse a valid same-universe / same-completed-XNYS-session scan for up to "
+        f"{SCAN_RESULT_REUSE_TTL // 60} minutes. Force refresh bypasses that reuse cache."
+    )
+
     if clear_scan:
         st.session_state.scan_df = pd.DataFrame()
         st.session_state.scan_ranked_df = pd.DataFrame()
@@ -3686,9 +3761,13 @@ with scanner_tab:
         st.session_state.scan_universe_name = ""
         st.session_state.scan_timestamp = None
         st.session_state.scan_errors = []
+        st.session_state.scan_universe_signature = ""
+        st.session_state.scan_signal_session = None
+        st.session_state.scan_data_engine_version = ""
         st.rerun()
 
-    if run_scan:
+    scan_requested = run_scan or force_refresh_scan
+    if scan_requested:
         if universe_df.empty:
             universe_df = refresh_universe(universe_name, watchlist_text)
         if universe_df.empty:
@@ -3698,64 +3777,100 @@ with scanner_tab:
             )
             st.stop()
 
-        progress = st.progress(0.0)
-        status = st.empty()
-        started = time.time()
+        reuse_ok = False
+        cache_age = np.nan
+        signal_session = expected_latest_completed_us_session()
+        if not force_refresh_scan:
+            reuse_ok, cache_age, signal_session, _ = reusable_session_scan(universe_name, universe_df)
 
-        results, failures, health = run_market_scan(universe_df, progress, status)
-        progress.empty()
-        status.empty()
-
-        st.session_state.provider_health = health
-        elapsed = time.time() - started
-
-        if health["status"] == "PROVIDER_FAILURE":
-            previous = st.session_state.last_good_scans.get(universe_name)
-            st.error(
-                f"🔴 **DATA PROVIDER FAILURE** — {health['message']} "
-                "The failed scan has NOT replaced your last valid results."
+        if reuse_ok:
+            st.success(
+                f"Reused current {universe_name} scan: {len(st.session_state.scan_df):,}/{len(universe_df):,} symbols • "
+                f"signal session {pd.Timestamp(signal_session):%d-%b-%Y} • cache age {cache_age:.0f}s. "
+                "No Yahoo re-download or per-symbol recomputation was needed."
             )
-            if previous is not None and not previous.get("df", pd.DataFrame()).empty:
-                st.session_state.scan_df = previous["df"].copy()
+        else:
+            if force_refresh_scan:
+                # Targeted cache invalidation only: do not clear unrelated Streamlit caches.
+                try:
+                    download_batch_cached.clear()
+                except Exception:
+                    pass
+                try:
+                    download_one.clear()
+                except Exception:
+                    pass
+                st.info("Force refresh requested: scanner market-data caches were invalidated for this run.")
+
+            progress = st.progress(0.0)
+            status = st.empty()
+            started = time.time()
+
+            results, failures, health = run_market_scan(universe_df, progress, status)
+            progress.empty()
+            status.empty()
+
+            st.session_state.provider_health = health
+            elapsed = time.time() - started
+            current_signature = scan_universe_signature(universe_df)
+            current_signal_session = expected_latest_completed_us_session()
+
+            if health["status"] == "PROVIDER_FAILURE":
+                previous = st.session_state.last_good_scans.get(universe_name)
+                st.error(
+                    f"🔴 **DATA PROVIDER FAILURE** — {health['message']} "
+                    "The failed scan has NOT replaced your last valid results."
+                )
+                if previous is not None and not previous.get("df", pd.DataFrame()).empty:
+                    st.session_state.scan_df = previous["df"].copy()
+                    st.session_state.scan_ranked_df = pd.DataFrame()
+                    st.session_state.scan_ranked_regime_label = ""
+                    st.session_state.scan_ranked_engine_version = ""
+                    st.session_state.scan_universe_name = universe_name
+                    st.session_state.scan_timestamp = previous["timestamp"]
+                    st.session_state.scan_errors = previous.get("failures", [])
+                    st.session_state.scan_universe_signature = previous.get("universe_signature", "")
+                    st.session_state.scan_signal_session = previous.get("signal_session")
+                    st.session_state.scan_data_engine_version = previous.get("engine_version", "")
+                    st.warning(
+                        f"Showing the last good {universe_name} scan from "
+                        f"{previous['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} instead."
+                    )
+                else:
+                    st.warning(
+                        "No last-good scan is available in this session. "
+                        "Please retry later rather than using an empty/partial scan."
+                    )
+            else:
+                st.session_state.scan_df = results
                 st.session_state.scan_ranked_df = pd.DataFrame()
                 st.session_state.scan_ranked_regime_label = ""
                 st.session_state.scan_ranked_engine_version = ""
                 st.session_state.scan_universe_name = universe_name
-                st.session_state.scan_timestamp = previous["timestamp"]
-                st.session_state.scan_errors = previous.get("failures", [])
-                st.warning(
-                    f"Showing the last good {universe_name} scan from "
-                    f"{previous['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} instead."
-                )
-            else:
-                st.warning(
-                    "No last-good scan is available in this session. "
-                    "Please retry later rather than using an empty/partial scan."
-                )
-        else:
-            st.session_state.scan_df = results
-            st.session_state.scan_ranked_df = pd.DataFrame()
-            st.session_state.scan_ranked_regime_label = ""
-            st.session_state.scan_ranked_engine_version = ""
-            st.session_state.scan_universe_name = universe_name
-            st.session_state.scan_timestamp = datetime.now()
-            st.session_state.scan_errors = failures
+                st.session_state.scan_timestamp = datetime.now()
+                st.session_state.scan_errors = failures
+                st.session_state.scan_universe_signature = current_signature
+                st.session_state.scan_signal_session = current_signal_session
+                st.session_state.scan_data_engine_version = ENGINE_VERSION
 
-            if health["status"] == "HEALTHY":
-                st.session_state.last_good_scans[universe_name] = {
-                    "df": results.copy(),
-                    "timestamp": st.session_state.scan_timestamp,
-                    "failures": list(failures),
-                }
-                st.success(
-                    f"Scan complete: {len(results):,}/{len(universe_df):,} symbols analyzed "
-                    f"in {elapsed:.0f}s."
-                )
-            else:
-                st.warning(
-                    f"⚠️ Scan completed with degraded coverage: "
-                    f"{len(results):,}/{len(universe_df):,} in {elapsed:.0f}s."
-                )
+                if health["status"] == "HEALTHY":
+                    st.session_state.last_good_scans[universe_name] = {
+                        "df": results.copy(),
+                        "timestamp": st.session_state.scan_timestamp,
+                        "failures": list(failures),
+                        "universe_signature": current_signature,
+                        "signal_session": current_signal_session,
+                        "engine_version": ENGINE_VERSION,
+                    }
+                    st.success(
+                        f"Scan complete: {len(results):,}/{len(universe_df):,} symbols analyzed "
+                        f"in {elapsed:.0f}s."
+                    )
+                else:
+                    st.warning(
+                        f"⚠️ Scan completed with degraded coverage: "
+                        f"{len(results):,}/{len(universe_df):,} in {elapsed:.0f}s."
+                    )
 
     scan_df = st.session_state.scan_df
     if not scan_df.empty:
