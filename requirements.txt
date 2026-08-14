@@ -5,3 +5,4 @@ yfinance>=0.2.40
 plotly>=5.20
 requests>=2.31
 lxml>=5.0
+exchange_calendars>=4.13.2,<5
