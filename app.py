@@ -1,4 +1,4 @@
-# Quality Engine v7.4.4 — Phase 2C CONTROLLED FALLBACK TEST v3 (Independent Nasdaq + SEC Tertiary Fallback)
+# Quality Engine v7.4.5 — Phase 2C FREEZE (Event/Fundamental Reliability)
 
 import base64
 import hashlib
@@ -47,7 +47,7 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.4.4-P2C-CONTROLLED-FALLBACK-TEST-V3"
+ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -1577,10 +1577,9 @@ def sec_company_fallback(symbol):
 def sec_market_cap_from_fallback(sec_payload, fallback_close):
     """Return a conservative SEC shares × completed-session close market-cap fallback.
 
-    This helper is shared by the production fallback path and the Phase 2C controlled
-    verification tool so the test exercises the same calculation semantics used live.
-    Foreign issuers are intentionally excluded because ADR/share-unit relationships can
-    make a simple reported-shares × US close calculation misleading.
+    This helper implements the tertiary production fallback semantics. Foreign issuers are
+    intentionally excluded because ADR/share-unit relationships can make a simple reported-
+    shares × US close calculation misleading.
     """
     sec_payload = sec_payload or {}
     if bool(sec_payload.get("foreign_issuer", False)):
@@ -1617,55 +1616,6 @@ def sec_market_cap_from_fallback(sec_payload, fallback_close):
         "share_source": sec_payload.get("shares_source", "SEC shares outstanding"),
         "share_filing_date": sec_payload.get("shares_filing_date", ""),
         "reason": "",
-    }
-
-
-@st.cache_data(ttl=5 * 60, show_spinner=False)
-def phase2c_controlled_market_cap_fallback_test(symbol, fallback_close):
-    """Deterministically exercise the production independent market-cap fallback chain.
-
-    Diagnostic only: both Yahoo market-cap routes are deliberately ignored. The test first
-    tries the same Nasdaq quote-summary repair used in production. SEC shares × completed-
-    session close remains the tertiary route if Nasdaq is unavailable.
-    """
-    ticker = clean_symbol(symbol)
-    nasdaq = nasdaq_direct_fundamentals(ticker)
-    nasdaq_mc = _provider_number(nasdaq.get("market_cap"))
-    if pd.notna(nasdaq_mc) and nasdaq_mc > 0:
-        return {
-            "status": "PASS", "ticker": ticker, "field": "Market Cap",
-            "control": "Yahoo/yfinance + Yahoo direct market-cap values intentionally suppressed for this diagnostic.",
-            "source": "Nasdaq quote summary fallback",
-            "route": "NASDAQ", "value": float(nasdaq_mc),
-            "shares": np.nan, "close": np.nan, "share_source": "",
-            "share_filing_date": "", "cik": "", "industry": nasdaq.get("industry", ""),
-            "foreign_issuer": False, "reason": "",
-            "route_detail": nasdaq.get("route_note", "Nasdaq quote summary"),
-        }
-
-    # Tertiary SEC route: retained in production, but no longer the single point of failure.
-    sec_payload = sec_company_fallback(ticker)
-    calc = sec_market_cap_from_fallback(sec_payload, fallback_close)
-    return {
-        "status": "PASS" if calc.get("ok") else "FAIL",
-        "ticker": ticker, "field": "Market Cap",
-        "control": "Yahoo/yfinance + Yahoo direct market-cap values intentionally suppressed for this diagnostic.",
-        "source": (
-            f"{calc.get('share_source') or 'SEC reported shares'} × completed-session close"
-            if calc.get("ok") else "Independent fallback unavailable"
-        ),
-        "route": "SEC" if calc.get("ok") else "NONE",
-        "share_source": calc.get("share_source", ""),
-        "share_filing_date": calc.get("share_filing_date", ""),
-        "shares_recovery_note": sec_payload.get("shares_recovery_note", ""),
-        "value": calc.get("value", np.nan), "shares": calc.get("shares", np.nan),
-        "close": calc.get("close", np.nan), "reason": (
-            f"Nasdaq repair unavailable ({nasdaq.get('route_note', 'no usable market cap')}); "
-            f"SEC tertiary repair also failed: {calc.get('reason', '')}"
-        ),
-        "cik": sec_payload.get("cik", ""), "industry": sec_payload.get("industry", ""),
-        "foreign_issuer": bool(sec_payload.get("foreign_issuer", False)),
-        "route_detail": nasdaq.get("route_note", ""),
     }
 
 
@@ -3410,7 +3360,7 @@ def run_market_scan(universe_df, progress_bar, status_box):
         progress_bar.progress(min(batch_no / total_batches, 1.0))
 
         # Fail fast when the first two large batches are essentially unusable even
-        # after the controlled recovery sequence.
+        # after the bounded recovery sequence.
         if batch_no >= 2 and provider_batches_failed == batch_no and len(records) < 5:
             break
 
@@ -5223,79 +5173,6 @@ with ticker_tab:
                     st.warning(f"Event estimate window: {diag['Event Window Note']}")
                 if diag.get("Event Conflict"):
                     st.error(f"Event-source conflict: {diag['Event Conflict']}")
-
-            # Temporary Phase 2C final-verification tool. It is deliberately isolated from
-            # production metadata/decision state and can be removed after the live fallback
-            # sanity test passes.
-            with st.expander("Phase 2C controlled independent fallback verification (temporary)", expanded=False):
-                st.caption(
-                    "Diagnostic only — this does not alter Candidate Quality, Entry Quality, Action, "
-                    "or the production Fundamental Data Confidence. It deliberately ignores Yahoo "
-                    "market-cap values and exercises the independent non-Yahoo fallback chain (Nasdaq first, SEC tertiary)."
-                )
-                if st.button(
-                    "Run controlled independent market-cap fallback test",
-                    key=f"phase2c_independent_mc_test_{selected_ticker}",
-                    use_container_width=True,
-                ):
-                    with st.spinner(f"Testing independent SEC fallback for {selected_ticker}..."):
-                        fallback_test = phase2c_controlled_market_cap_fallback_test(selected_ticker, fallback_close)
-                    if fallback_test.get("status") == "PASS":
-                        test_value = fallback_test.get("value", np.nan)
-                        production_value = diag.get("Market Cap", np.nan)
-                        st.success(
-                            f"✅ CONTROLLED FALLBACK PASS — {selected_ticker} Market Cap recovered via "
-                            f"{fallback_test.get('source', 'independent fallback')}: ${test_value/1e9:,.1f}B."
-                        )
-                        if fallback_test.get("route") == "SEC":
-                            t1, t2, t3 = st.columns(3)
-                            t1.metric("SEC shares", f"{fallback_test.get('shares', np.nan)/1e9:,.3f}B")
-                            t2.metric("Completed-session close", f"${fallback_test.get('close', np.nan):,.2f}")
-                            t3.metric("Fallback market cap", f"${test_value/1e9:,.1f}B")
-                            if fallback_test.get("share_filing_date"):
-                                st.caption(
-                                    f"SEC share source: {fallback_test.get('share_source', '')} • "
-                                    f"filing/as-of reference: {fallback_test.get('share_filing_date', '')}."
-                                )
-                        else:
-                            t1, t2 = st.columns(2)
-                            t1.metric("Independent route", "Nasdaq")
-                            t2.metric("Fallback market cap", f"${test_value/1e9:,.1f}B")
-                        if pd.notna(production_value) and production_value > 0:
-                            diff_pct = ((test_value / float(production_value)) - 1.0) * 100.0
-                            st.caption(
-                                f"Production market cap: ${float(production_value)/1e9:,.1f}B • "
-                                f"controlled fallback difference: {diff_pct:+.1f}%. "
-                                "The comparison is informational because SEC-reported shares can have a different as-of date."
-                            )
-                        st.dataframe(
-                            pd.DataFrame([
-                                {
-                                    "Field": "Market Cap",
-                                    "Primary route": "Suppressed by controlled test",
-                                    "Yahoo direct repair": "Suppressed by controlled test",
-                                    "Fallback source": fallback_test.get("source", ""),
-                                    "Route": fallback_test.get("route", ""),
-                                    "Share filing/reference date": fallback_test.get("share_filing_date", ""),
-                                    "CIK": fallback_test.get("cik", ""),
-                                    "Result": "PASS",
-                                }
-                            ]),
-                            hide_index=True,
-                            use_container_width=True,
-                        )
-                    else:
-                        st.error(
-                            f"❌ CONTROLLED FALLBACK NOT VERIFIED — {fallback_test.get('reason') or 'SEC fallback did not return a usable market-cap estimate.'}"
-                        )
-                        if fallback_test.get("shares_recovery_note"):
-                            st.caption(f"SEC recovery detail: {fallback_test.get('shares_recovery_note')}")
-                        if fallback_test.get("foreign_issuer"):
-                            st.info(
-                                "This ticker was intentionally protected by the foreign-issuer/ADR guard. "
-                                "Use a US domestic issuer such as MSFT for this controlled verification."
-                            )
-
 
             st.caption(
                 "Trade plan levels are heuristic decision-support estimates based on ATR, trend and recent highs/lows. "
