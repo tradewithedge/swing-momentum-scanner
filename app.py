@@ -1,4 +1,4 @@
-# Quality Engine v7.4.3 — Phase 2C CONTROLLED FALLBACK TEST v2 (SEC Filing-Level Shares Repair)
+# Quality Engine v7.4.4 — Phase 2C CONTROLLED FALLBACK TEST v3 (Independent Nasdaq + SEC Tertiary Fallback)
 
 import base64
 import hashlib
@@ -47,7 +47,7 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.4.3-P2C-CONTROLLED-FALLBACK-TEST-V2"
+ENGINE_VERSION = "v7.4.4-P2C-CONTROLLED-FALLBACK-TEST-V3"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -86,6 +86,7 @@ SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
 NASDAQ_EARNINGS_API = "https://api.nasdaq.com/api/calendar/earnings"
+NASDAQ_QUOTE_SUMMARY_API = "https://api.nasdaq.com/api/quote/{symbol}/summary"
 YAHOO_QUOTE_API = "https://query1.finance.yahoo.com/v7/finance/quote"
 YAHOO_QUOTE_SUMMARY_API = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 IWM_HOLDINGS_URL = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/latest-holdings.csv"
@@ -1308,6 +1309,55 @@ def yahoo_direct_fundamentals(symbol):
     return result
 
 
+
+@st.cache_data(ttl=COMPANY_SNAPSHOT_TTL, show_spinner=False)
+def nasdaq_direct_fundamentals(symbol):
+    """Independent non-Yahoo repair for profile fields and market cap.
+
+    Nasdaq's public quote-summary payload exposes Sector, Industry and MarketCap.
+    This route is used only to fill fields still missing after the two Yahoo routes.
+    """
+    result = {
+        "sector": "", "industry": "", "market_cap": np.nan,
+        "route_note": "", "http_status": None,
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.nasdaq.com/market-activity/stocks",
+        "Origin": "https://www.nasdaq.com",
+    }
+    try:
+        url = NASDAQ_QUOTE_SUMMARY_API.format(symbol=requests.utils.quote(clean_symbol(symbol), safe="-"))
+        response = requests.get(
+            url, params={"assetclass": "stocks"}, headers=headers, timeout=METADATA_HTTP_TIMEOUT
+        )
+        result["http_status"] = response.status_code
+        response.raise_for_status()
+        payload = response.json() or {}
+        data = payload.get("data") or {}
+        summary = data.get("summaryData") or {}
+
+        def summary_value(key):
+            item = summary.get(key) or {}
+            return item.get("value") if isinstance(item, dict) else item
+
+        result["sector"] = str(summary_value("Sector") or "").strip()
+        result["industry"] = str(summary_value("Industry") or "").strip()
+        mc_text = str(summary_value("MarketCap") or "").strip()
+        if mc_text:
+            cleaned = re.sub(r"[^0-9.\-]", "", mc_text)
+            try:
+                mc = float(cleaned)
+                if np.isfinite(mc) and mc > 0:
+                    result["market_cap"] = mc
+            except Exception:
+                pass
+        result["route_note"] = "Nasdaq quote summary"
+    except Exception as exc:
+        result["route_note"] = f"Nasdaq quote summary unavailable: {type(exc).__name__}"
+    return result
+
 def _sec_numeric_text(value):
     """Parse a positive share-count value from SEC inline-XBRL/display text."""
     text = html_lib.unescape(str(value or ""))
@@ -1571,36 +1621,52 @@ def sec_market_cap_from_fallback(sec_payload, fallback_close):
 
 
 @st.cache_data(ttl=5 * 60, show_spinner=False)
-def phase2c_controlled_sec_market_cap_test(symbol, fallback_close):
-    """Deterministically exercise the independent SEC market-cap fallback.
+def phase2c_controlled_market_cap_fallback_test(symbol, fallback_close):
+    """Deterministically exercise the production independent market-cap fallback chain.
 
-    Diagnostic only: Yahoo/yfinance and Yahoo-direct market-cap values are deliberately
-    ignored for this test. The returned result never feeds the trading diagnostic, grade,
-    action, or production metadata snapshot.
+    Diagnostic only: both Yahoo market-cap routes are deliberately ignored. The test first
+    tries the same Nasdaq quote-summary repair used in production. SEC shares × completed-
+    session close remains the tertiary route if Nasdaq is unavailable.
     """
-    sec_payload = sec_company_fallback(symbol)
+    ticker = clean_symbol(symbol)
+    nasdaq = nasdaq_direct_fundamentals(ticker)
+    nasdaq_mc = _provider_number(nasdaq.get("market_cap"))
+    if pd.notna(nasdaq_mc) and nasdaq_mc > 0:
+        return {
+            "status": "PASS", "ticker": ticker, "field": "Market Cap",
+            "control": "Yahoo/yfinance + Yahoo direct market-cap values intentionally suppressed for this diagnostic.",
+            "source": "Nasdaq quote summary fallback",
+            "route": "NASDAQ", "value": float(nasdaq_mc),
+            "shares": np.nan, "close": np.nan, "share_source": "",
+            "share_filing_date": "", "cik": "", "industry": nasdaq.get("industry", ""),
+            "foreign_issuer": False, "reason": "",
+            "route_detail": nasdaq.get("route_note", "Nasdaq quote summary"),
+        }
+
+    # Tertiary SEC route: retained in production, but no longer the single point of failure.
+    sec_payload = sec_company_fallback(ticker)
     calc = sec_market_cap_from_fallback(sec_payload, fallback_close)
-    result = {
+    return {
         "status": "PASS" if calc.get("ok") else "FAIL",
-        "ticker": clean_symbol(symbol),
-        "field": "Market Cap",
+        "ticker": ticker, "field": "Market Cap",
         "control": "Yahoo/yfinance + Yahoo direct market-cap values intentionally suppressed for this diagnostic.",
         "source": (
             f"{calc.get('share_source') or 'SEC reported shares'} × completed-session close"
-            if calc.get("ok") else "SEC fallback unavailable"
+            if calc.get("ok") else "Independent fallback unavailable"
         ),
+        "route": "SEC" if calc.get("ok") else "NONE",
         "share_source": calc.get("share_source", ""),
         "share_filing_date": calc.get("share_filing_date", ""),
         "shares_recovery_note": sec_payload.get("shares_recovery_note", ""),
-        "value": calc.get("value", np.nan),
-        "shares": calc.get("shares", np.nan),
-        "close": calc.get("close", np.nan),
-        "reason": calc.get("reason", ""),
-        "cik": sec_payload.get("cik", ""),
-        "industry": sec_payload.get("industry", ""),
+        "value": calc.get("value", np.nan), "shares": calc.get("shares", np.nan),
+        "close": calc.get("close", np.nan), "reason": (
+            f"Nasdaq repair unavailable ({nasdaq.get('route_note', 'no usable market cap')}); "
+            f"SEC tertiary repair also failed: {calc.get('reason', '')}"
+        ),
+        "cik": sec_payload.get("cik", ""), "industry": sec_payload.get("industry", ""),
         "foreign_issuer": bool(sec_payload.get("foreign_issuer", False)),
+        "route_detail": nasdaq.get("route_note", ""),
     }
-    return result
 
 
 @st.cache_data(ttl=NASDAQ_EARNINGS_CACHE_TTL, show_spinner=False)
@@ -1838,8 +1904,24 @@ def get_company_snapshot(symbol, fallback_close=None):
         if pd.isna(snapshot.get("trailing_eps", np.nan)) and pd.notna(direct.get("trailing_eps", np.nan)):
             snapshot["trailing_eps"] = direct.get("trailing_eps")
 
-    # Independent SEC fallback is invoked when profile/market-cap metadata is still incomplete,
-    # or when a recent results filing can reduce post-event ambiguity.
+    # Independent repair route 3: Nasdaq quote summary. This is deliberately non-Yahoo
+    # and fills only profile/market-cap fields that remain unresolved after both Yahoo routes.
+    needs_nasdaq_repair = (
+        not snapshot["sector"] or not snapshot["industry"] or pd.isna(snapshot["market_cap"])
+    )
+    if needs_nasdaq_repair:
+        nasdaq_fund = nasdaq_direct_fundamentals(symbol)
+        for key, label in [("sector", "Sector"), ("industry", "Industry")]:
+            if not snapshot[key] and nasdaq_fund.get(key):
+                snapshot[key] = str(nasdaq_fund[key])
+                snapshot["fundamental_sources"][label] = "Nasdaq quote summary fallback"
+        if pd.isna(snapshot["market_cap"]) and pd.notna(nasdaq_fund.get("market_cap", np.nan)):
+            snapshot["market_cap"] = float(nasdaq_fund["market_cap"])
+            snapshot["fundamental_sources"]["Market Cap"] = "Nasdaq quote summary fallback"
+
+    # Independent SEC fallback is tertiary when profile/market-cap metadata is still incomplete,
+    # or when a recent results filing can reduce post-event ambiguity. SEC access is best-effort
+    # because hosted-cloud IPs can occasionally be rate-limited or classified by SEC fair-access controls.
     need_sec_fallback = (
         not snapshot["industry"]
         or pd.isna(snapshot["market_cap"])
@@ -5145,36 +5227,40 @@ with ticker_tab:
             # Temporary Phase 2C final-verification tool. It is deliberately isolated from
             # production metadata/decision state and can be removed after the live fallback
             # sanity test passes.
-            with st.expander("Phase 2C controlled fallback verification (temporary)", expanded=False):
+            with st.expander("Phase 2C controlled independent fallback verification (temporary)", expanded=False):
                 st.caption(
                     "Diagnostic only — this does not alter Candidate Quality, Entry Quality, Action, "
                     "or the production Fundamental Data Confidence. It deliberately ignores Yahoo "
-                    "market-cap values and exercises the independent SEC shares × completed-session-close fallback."
+                    "market-cap values and exercises the independent non-Yahoo fallback chain (Nasdaq first, SEC tertiary)."
                 )
                 if st.button(
-                    "Run controlled SEC market-cap fallback test",
-                    key=f"phase2c_sec_mc_test_{selected_ticker}",
+                    "Run controlled independent market-cap fallback test",
+                    key=f"phase2c_independent_mc_test_{selected_ticker}",
                     use_container_width=True,
                 ):
                     with st.spinner(f"Testing independent SEC fallback for {selected_ticker}..."):
-                        fallback_test = phase2c_controlled_sec_market_cap_test(selected_ticker, fallback_close)
+                        fallback_test = phase2c_controlled_market_cap_fallback_test(selected_ticker, fallback_close)
                     if fallback_test.get("status") == "PASS":
                         test_value = fallback_test.get("value", np.nan)
                         production_value = diag.get("Market Cap", np.nan)
                         st.success(
-                            f"✅ CONTROLLED FALLBACK PASS — {selected_ticker} Market Cap recovered from "
-                            f"{fallback_test.get('share_source') or 'SEC shares outstanding'} × completed-session close: "
-                            f"${test_value/1e9:,.1f}B."
+                            f"✅ CONTROLLED FALLBACK PASS — {selected_ticker} Market Cap recovered via "
+                            f"{fallback_test.get('source', 'independent fallback')}: ${test_value/1e9:,.1f}B."
                         )
-                        t1, t2, t3 = st.columns(3)
-                        t1.metric("SEC shares", f"{fallback_test.get('shares', np.nan)/1e9:,.3f}B")
-                        t2.metric("Completed-session close", f"${fallback_test.get('close', np.nan):,.2f}")
-                        t3.metric("Fallback market cap", f"${test_value/1e9:,.1f}B")
-                        if fallback_test.get("share_filing_date"):
-                            st.caption(
-                                f"SEC share source: {fallback_test.get('share_source', '')} • "
-                                f"filing/as-of reference: {fallback_test.get('share_filing_date', '')}."
-                            )
+                        if fallback_test.get("route") == "SEC":
+                            t1, t2, t3 = st.columns(3)
+                            t1.metric("SEC shares", f"{fallback_test.get('shares', np.nan)/1e9:,.3f}B")
+                            t2.metric("Completed-session close", f"${fallback_test.get('close', np.nan):,.2f}")
+                            t3.metric("Fallback market cap", f"${test_value/1e9:,.1f}B")
+                            if fallback_test.get("share_filing_date"):
+                                st.caption(
+                                    f"SEC share source: {fallback_test.get('share_source', '')} • "
+                                    f"filing/as-of reference: {fallback_test.get('share_filing_date', '')}."
+                                )
+                        else:
+                            t1, t2 = st.columns(2)
+                            t1.metric("Independent route", "Nasdaq")
+                            t2.metric("Fallback market cap", f"${test_value/1e9:,.1f}B")
                         if pd.notna(production_value) and production_value > 0:
                             diff_pct = ((test_value / float(production_value)) - 1.0) * 100.0
                             st.caption(
@@ -5189,6 +5275,7 @@ with ticker_tab:
                                     "Primary route": "Suppressed by controlled test",
                                     "Yahoo direct repair": "Suppressed by controlled test",
                                     "Fallback source": fallback_test.get("source", ""),
+                                    "Route": fallback_test.get("route", ""),
                                     "Share filing/reference date": fallback_test.get("share_filing_date", ""),
                                     "CIK": fallback_test.get("cik", ""),
                                     "Result": "PASS",
