@@ -1,4 +1,4 @@
-# Quality Engine v7.4.1 — Phase 2C FINAL-CANDIDATE (Event/Fundamental Reliability Semantics)
+# Quality Engine v7.4.2 — Phase 2C CONTROLLED FALLBACK TEST (Final Verification Candidate)
 
 import base64
 import hashlib
@@ -45,7 +45,7 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.4.1-P2C-FINAL-CANDIDATE"
+ENGINE_VERSION = "v7.4.2-P2C-CONTROLLED-FALLBACK-TEST"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -1379,6 +1379,71 @@ def sec_company_fallback(symbol):
     return result
 
 
+def sec_market_cap_from_fallback(sec_payload, fallback_close):
+    """Return a conservative SEC shares × completed-session close market-cap fallback.
+
+    This helper is shared by the production fallback path and the Phase 2C controlled
+    verification tool so the test exercises the same calculation semantics used live.
+    Foreign issuers are intentionally excluded because ADR/share-unit relationships can
+    make a simple reported-shares × US close calculation misleading.
+    """
+    sec_payload = sec_payload or {}
+    if bool(sec_payload.get("foreign_issuer", False)):
+        return {
+            "ok": False, "value": np.nan, "shares": np.nan, "close": np.nan,
+            "reason": "Foreign issuer/ADR protection blocked a simple SEC shares × US close estimate.",
+        }
+    shares = _provider_number(sec_payload.get("shares_outstanding"))
+    try:
+        close_value = float(fallback_close)
+    except Exception:
+        close_value = np.nan
+    if pd.isna(shares) or shares <= 0:
+        return {
+            "ok": False, "value": np.nan, "shares": shares, "close": close_value,
+            "reason": "SEC shares outstanding were unavailable or invalid.",
+        }
+    if pd.isna(close_value) or close_value <= 0:
+        return {
+            "ok": False, "value": np.nan, "shares": shares, "close": close_value,
+            "reason": "Completed-session close was unavailable or invalid.",
+        }
+    return {
+        "ok": True,
+        "value": float(shares) * close_value,
+        "shares": float(shares),
+        "close": float(close_value),
+        "reason": "",
+    }
+
+
+@st.cache_data(ttl=5 * 60, show_spinner=False)
+def phase2c_controlled_sec_market_cap_test(symbol, fallback_close):
+    """Deterministically exercise the independent SEC market-cap fallback.
+
+    Diagnostic only: Yahoo/yfinance and Yahoo-direct market-cap values are deliberately
+    ignored for this test. The returned result never feeds the trading diagnostic, grade,
+    action, or production metadata snapshot.
+    """
+    sec_payload = sec_company_fallback(symbol)
+    calc = sec_market_cap_from_fallback(sec_payload, fallback_close)
+    result = {
+        "status": "PASS" if calc.get("ok") else "FAIL",
+        "ticker": clean_symbol(symbol),
+        "field": "Market Cap",
+        "control": "Yahoo/yfinance + Yahoo direct market-cap values intentionally suppressed for this diagnostic.",
+        "source": "SEC reported shares × completed-session close" if calc.get("ok") else "SEC fallback unavailable",
+        "value": calc.get("value", np.nan),
+        "shares": calc.get("shares", np.nan),
+        "close": calc.get("close", np.nan),
+        "reason": calc.get("reason", ""),
+        "cik": sec_payload.get("cik", ""),
+        "industry": sec_payload.get("industry", ""),
+        "foreign_issuer": bool(sec_payload.get("foreign_issuer", False)),
+    }
+    return result
+
+
 @st.cache_data(ttl=NASDAQ_EARNINGS_CACHE_TTL, show_spinner=False)
 def nasdaq_earnings_rows(date_value):
     """Fetch one Nasdaq earnings-calendar date. Nasdaq states this calendar is Zacks-derived/estimated."""
@@ -1630,17 +1695,9 @@ def get_company_snapshot(symbol, fallback_close=None):
         snapshot["industry"] = sec["industry"]
         snapshot["fundamental_sources"]["Industry"] = "SEC SIC description"
     if pd.isna(snapshot["market_cap"]):
-        shares = sec.get("shares_outstanding", np.nan)
-        try:
-            close_value = float(fallback_close)
-        except Exception:
-            close_value = np.nan
-        if (
-            not bool(sec.get("foreign_issuer", False))
-            and pd.notna(shares) and shares > 0
-            and pd.notna(close_value) and close_value > 0
-        ):
-            snapshot["market_cap"] = float(shares) * close_value
+        sec_mc = sec_market_cap_from_fallback(sec, fallback_close)
+        if sec_mc.get("ok"):
+            snapshot["market_cap"] = sec_mc["value"]
             snapshot["fundamental_sources"]["Market Cap"] = (
                 "SEC reported shares × completed-session close (fallback estimate)"
             )
@@ -4923,6 +4980,64 @@ with ticker_tab:
                     st.warning(f"Event estimate window: {diag['Event Window Note']}")
                 if diag.get("Event Conflict"):
                     st.error(f"Event-source conflict: {diag['Event Conflict']}")
+
+            # Temporary Phase 2C final-verification tool. It is deliberately isolated from
+            # production metadata/decision state and can be removed after the live fallback
+            # sanity test passes.
+            with st.expander("Phase 2C controlled fallback verification (temporary)", expanded=False):
+                st.caption(
+                    "Diagnostic only — this does not alter Candidate Quality, Entry Quality, Action, "
+                    "or the production Fundamental Data Confidence. It deliberately ignores Yahoo "
+                    "market-cap values and exercises the independent SEC shares × completed-session-close fallback."
+                )
+                if st.button(
+                    "Run controlled SEC market-cap fallback test",
+                    key=f"phase2c_sec_mc_test_{selected_ticker}",
+                    use_container_width=True,
+                ):
+                    with st.spinner(f"Testing independent SEC fallback for {selected_ticker}..."):
+                        fallback_test = phase2c_controlled_sec_market_cap_test(selected_ticker, fallback_close)
+                    if fallback_test.get("status") == "PASS":
+                        test_value = fallback_test.get("value", np.nan)
+                        production_value = diag.get("Market Cap", np.nan)
+                        st.success(
+                            f"✅ CONTROLLED FALLBACK PASS — {selected_ticker} Market Cap recovered from "
+                            f"SEC reported shares × completed-session close: ${test_value/1e9:,.1f}B."
+                        )
+                        t1, t2, t3 = st.columns(3)
+                        t1.metric("SEC shares", f"{fallback_test.get('shares', np.nan)/1e9:,.3f}B")
+                        t2.metric("Completed-session close", f"${fallback_test.get('close', np.nan):,.2f}")
+                        t3.metric("Fallback market cap", f"${test_value/1e9:,.1f}B")
+                        if pd.notna(production_value) and production_value > 0:
+                            diff_pct = ((test_value / float(production_value)) - 1.0) * 100.0
+                            st.caption(
+                                f"Production market cap: ${float(production_value)/1e9:,.1f}B • "
+                                f"controlled fallback difference: {diff_pct:+.1f}%. "
+                                "The comparison is informational because SEC-reported shares can have a different as-of date."
+                            )
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "Field": "Market Cap",
+                                    "Primary route": "Suppressed by controlled test",
+                                    "Yahoo direct repair": "Suppressed by controlled test",
+                                    "Fallback source": fallback_test.get("source", ""),
+                                    "CIK": fallback_test.get("cik", ""),
+                                    "Result": "PASS",
+                                }
+                            ]),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                    else:
+                        st.error(
+                            f"❌ CONTROLLED FALLBACK NOT VERIFIED — {fallback_test.get('reason') or 'SEC fallback did not return a usable market-cap estimate.'}"
+                        )
+                        if fallback_test.get("foreign_issuer"):
+                            st.info(
+                                "This ticker was intentionally protected by the foreign-issuer/ADR guard. "
+                                "Use a US domestic issuer such as MSFT for this controlled verification."
+                            )
 
 
             st.caption(
