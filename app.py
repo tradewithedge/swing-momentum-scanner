@@ -1,10 +1,12 @@
-# Quality Engine v7.4.2 — Phase 2C CONTROLLED FALLBACK TEST (Final Verification Candidate)
+# Quality Engine v7.4.3 — Phase 2C CONTROLLED FALLBACK TEST v2 (SEC Filing-Level Shares Repair)
 
 import base64
 import hashlib
+import html as html_lib
 import io
 import json
 import os
+import re
 import pickle
 import sqlite3
 import time
@@ -45,7 +47,7 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.4.2-P2C-CONTROLLED-FALLBACK-TEST"
+ENGINE_VERSION = "v7.4.3-P2C-CONTROLLED-FALLBACK-TEST-V2"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -82,6 +84,7 @@ DURABLE_REQUEST_TIMEOUT = 15
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+SEC_ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
 NASDAQ_EARNINGS_API = "https://api.nasdaq.com/api/calendar/earnings"
 YAHOO_QUOTE_API = "https://query1.finance.yahoo.com/v7/finance/quote"
 YAHOO_QUOTE_SUMMARY_API = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
@@ -1305,11 +1308,136 @@ def yahoo_direct_fundamentals(symbol):
     return result
 
 
+def _sec_numeric_text(value):
+    """Parse a positive share-count value from SEC inline-XBRL/display text."""
+    text = html_lib.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("\xa0", " ")
+    # Preserve decimal point/sign for generic IXBRL handling; remove thousands separators.
+    text = text.replace(",", "")
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return np.nan
+    try:
+        number = float(match.group(0))
+        return number if np.isfinite(number) else np.nan
+    except Exception:
+        return np.nan
+
+
+def _sec_extract_shares_from_filing_html(document_text):
+    """Extract exact common shares outstanding from an SEC filing/R1 HTML document.
+
+    CompanyFacts can omit some dimensionally-qualified cover-page DEI facts. Filing-level
+    inline XBRL is therefore a necessary secondary SEC route, not a different provider.
+    """
+    text = str(document_text or "")
+    concepts = ("EntityCommonStockSharesOutstanding", "CommonStockSharesOutstanding")
+
+    # Preferred path: the actual inline-XBRL fact, including optional scale/sign attributes.
+    for concept in concepts:
+        pattern = re.compile(
+            rf'<ix:nonfraction\b(?P<attrs>[^>]*\bname=["\'][^"\']*{concept}["\'][^>]*)>'
+            rf'(?P<body>.*?)</ix:nonfraction>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in pattern.finditer(text):
+            attrs = match.group("attrs") or ""
+            value = _sec_numeric_text(match.group("body"))
+            if pd.isna(value) or value <= 0:
+                continue
+            scale_match = re.search(r'\bscale=["\'](-?\d+)["\']', attrs, re.IGNORECASE)
+            if scale_match:
+                try:
+                    value *= 10 ** int(scale_match.group(1))
+                except Exception:
+                    pass
+            sign_match = re.search(r'\bsign=["\'](-)["\']', attrs, re.IGNORECASE)
+            if sign_match:
+                value = -abs(value)
+            if np.isfinite(value) and value >= 1_000_000:
+                return float(value), f"SEC filing inline XBRL: {concept}"
+
+    # R1 / rendered filing fallback. This is constrained to the explicit cover-page label
+    # and requires a plausible public-company share count to avoid harvesting unrelated values.
+    plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", text))
+    plain = re.sub(r"\s+", " ", plain)
+    label_patterns = [
+        r"Entity Common Stock\s*,?\s*Shares Outstanding",
+        r"number of shares outstanding of each of the issuer.{0,120}?common stock",
+    ]
+    for label_pattern in label_patterns:
+        label_match = re.search(label_pattern, plain, re.IGNORECASE)
+        if not label_match:
+            continue
+        window = plain[label_match.end(): label_match.end() + 420]
+        for raw in re.findall(r"\d[\d, ]{5,}", window):
+            value = _sec_numeric_text(raw)
+            if pd.notna(value) and 1_000_000 <= value <= 1_000_000_000_000:
+                return float(value), "SEC filing cover-page rendered fact"
+    return np.nan, ""
+
+
+def _sec_recent_filing_shares(cik, recent):
+    """Try recent 10-Q/10-K filing-level documents when CompanyFacts lacks shares."""
+    result = {"shares": np.nan, "source": "", "filing_date": "", "form": "", "url": "", "note": ""}
+    recent = recent or {}
+    forms = recent.get("form") or []
+    accessions = recent.get("accessionNumber") or []
+    primary_docs = recent.get("primaryDocument") or []
+    filing_dates = recent.get("filingDate") or []
+    candidates = []
+    for idx, form in enumerate(forms):
+        form_text = str(form or "").upper()
+        if not (form_text.startswith("10-Q") or form_text.startswith("10-K")):
+            continue
+        if idx >= len(accessions):
+            continue
+        try:
+            filed = pd.Timestamp(filing_dates[idx]).normalize() if idx < len(filing_dates) else pd.Timestamp("1900-01-01")
+        except Exception:
+            filed = pd.Timestamp("1900-01-01")
+        candidates.append((filed, idx, form_text))
+    candidates.sort(reverse=True, key=lambda x: x[0])
+
+    cik_path = str(int(str(cik)))
+    for filed, idx, form_text in candidates[:4]:
+        accession = re.sub(r"\D", "", str(accessions[idx] or ""))
+        if not accession:
+            continue
+        primary_doc = str(primary_docs[idx] if idx < len(primary_docs) else "").strip()
+        docs = ["R1.htm"]
+        if primary_doc and primary_doc not in docs:
+            docs.append(primary_doc)
+        for document in docs:
+            url = f"{SEC_ARCHIVES_BASE}/{cik_path}/{accession}/{document}"
+            try:
+                response = requests.get(url, headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT)
+                if response.status_code != 200:
+                    continue
+                shares, source = _sec_extract_shares_from_filing_html(response.text)
+                if pd.notna(shares) and shares > 0:
+                    result.update({
+                        "shares": float(shares),
+                        "source": f"{source} ({form_text})",
+                        "filing_date": str(filed.date()),
+                        "form": form_text,
+                        "url": url,
+                        "note": "Recovered from filing-level SEC data because CompanyFacts did not expose a usable shares-outstanding fact.",
+                    })
+                    return result
+            except Exception:
+                continue
+    result["note"] = "No usable shares-outstanding fact was found in recent SEC 10-Q/10-K filing-level documents."
+    return result
+
+
 @st.cache_data(ttl=SEC_REFERENCE_CACHE_TTL, show_spinner=False)
 def sec_company_fallback(symbol):
     """Independent SEC fallback: SIC industry, shares outstanding, and recent 8-K 2.02 event evidence."""
     result = {
         "cik": "", "industry": "", "shares_outstanding": np.nan,
+        "shares_source": "", "shares_filing_date": "", "shares_recovery_note": "",
         "recent_results_date": None, "recent_results_source": "",
         "foreign_issuer": False,
     }
@@ -1317,6 +1445,7 @@ def sec_company_fallback(symbol):
     if not cik:
         return result
     result["cik"] = cik
+    recent = {}
 
     # Submissions: SIC description + recent 8-K Item 2.02 (results of operations).
     try:
@@ -1373,9 +1502,25 @@ def sec_company_fallback(symbol):
                     end_date = pd.Timestamp("1900-01-01")
                 candidates.append((end_date, value))
         if candidates:
-            result["shares_outstanding"] = max(candidates, key=lambda x: x[0])[1]
+            best_end, best_value = max(candidates, key=lambda x: x[0])
+            result["shares_outstanding"] = best_value
+            result["shares_source"] = "SEC CompanyFacts XBRL shares outstanding"
+            result["shares_filing_date"] = str(best_end.date()) if best_end.year > 1900 else ""
     except Exception:
         pass
+
+    # CompanyFacts is intentionally not treated as authoritative coverage for every filing fact.
+    # Some cover-page DEI facts can be absent from the aggregate API. Fall back to the latest
+    # 10-Q/10-K filing-level XBRL/rendered cover page before declaring shares unavailable.
+    if pd.isna(result.get("shares_outstanding", np.nan)) or result.get("shares_outstanding", 0) <= 0:
+        filing_shares = _sec_recent_filing_shares(cik, recent)
+        if pd.notna(filing_shares.get("shares", np.nan)) and filing_shares.get("shares", 0) > 0:
+            result["shares_outstanding"] = float(filing_shares["shares"])
+            result["shares_source"] = filing_shares.get("source", "SEC filing-level shares outstanding")
+            result["shares_filing_date"] = filing_shares.get("filing_date", "")
+            result["shares_recovery_note"] = filing_shares.get("note", "")
+        else:
+            result["shares_recovery_note"] = filing_shares.get("note", "")
     return result
 
 
@@ -1391,6 +1536,8 @@ def sec_market_cap_from_fallback(sec_payload, fallback_close):
     if bool(sec_payload.get("foreign_issuer", False)):
         return {
             "ok": False, "value": np.nan, "shares": np.nan, "close": np.nan,
+            "share_source": sec_payload.get("shares_source", ""),
+            "share_filing_date": sec_payload.get("shares_filing_date", ""),
             "reason": "Foreign issuer/ADR protection blocked a simple SEC shares × US close estimate.",
         }
     shares = _provider_number(sec_payload.get("shares_outstanding"))
@@ -1401,11 +1548,15 @@ def sec_market_cap_from_fallback(sec_payload, fallback_close):
     if pd.isna(shares) or shares <= 0:
         return {
             "ok": False, "value": np.nan, "shares": shares, "close": close_value,
-            "reason": "SEC shares outstanding were unavailable or invalid.",
+            "share_source": sec_payload.get("shares_source", ""),
+            "share_filing_date": sec_payload.get("shares_filing_date", ""),
+            "reason": "SEC shares outstanding were unavailable or invalid after CompanyFacts + filing-level recovery.",
         }
     if pd.isna(close_value) or close_value <= 0:
         return {
             "ok": False, "value": np.nan, "shares": shares, "close": close_value,
+            "share_source": sec_payload.get("shares_source", ""),
+            "share_filing_date": sec_payload.get("shares_filing_date", ""),
             "reason": "Completed-session close was unavailable or invalid.",
         }
     return {
@@ -1413,6 +1564,8 @@ def sec_market_cap_from_fallback(sec_payload, fallback_close):
         "value": float(shares) * close_value,
         "shares": float(shares),
         "close": float(close_value),
+        "share_source": sec_payload.get("shares_source", "SEC shares outstanding"),
+        "share_filing_date": sec_payload.get("shares_filing_date", ""),
         "reason": "",
     }
 
@@ -1432,7 +1585,13 @@ def phase2c_controlled_sec_market_cap_test(symbol, fallback_close):
         "ticker": clean_symbol(symbol),
         "field": "Market Cap",
         "control": "Yahoo/yfinance + Yahoo direct market-cap values intentionally suppressed for this diagnostic.",
-        "source": "SEC reported shares × completed-session close" if calc.get("ok") else "SEC fallback unavailable",
+        "source": (
+            f"{calc.get('share_source') or 'SEC reported shares'} × completed-session close"
+            if calc.get("ok") else "SEC fallback unavailable"
+        ),
+        "share_source": calc.get("share_source", ""),
+        "share_filing_date": calc.get("share_filing_date", ""),
+        "shares_recovery_note": sec_payload.get("shares_recovery_note", ""),
         "value": calc.get("value", np.nan),
         "shares": calc.get("shares", np.nan),
         "close": calc.get("close", np.nan),
@@ -1688,6 +1847,7 @@ def get_company_snapshot(symbol, fallback_close=None):
     )
     sec = sec_company_fallback(symbol) if need_sec_fallback else {
         "industry": "", "shares_outstanding": np.nan,
+        "shares_source": "", "shares_filing_date": "", "shares_recovery_note": "",
         "recent_results_date": None, "recent_results_source": "",
         "foreign_issuer": False,
     }
@@ -1698,8 +1858,9 @@ def get_company_snapshot(symbol, fallback_close=None):
         sec_mc = sec_market_cap_from_fallback(sec, fallback_close)
         if sec_mc.get("ok"):
             snapshot["market_cap"] = sec_mc["value"]
+            share_source = sec_mc.get("share_source") or "SEC reported shares"
             snapshot["fundamental_sources"]["Market Cap"] = (
-                "SEC reported shares × completed-session close (fallback estimate)"
+                f"{share_source} × completed-session close (fallback estimate)"
             )
 
     # Recent SEC 8-K Item 2.02 is primary filing evidence that results were released.
@@ -5002,12 +5163,18 @@ with ticker_tab:
                         production_value = diag.get("Market Cap", np.nan)
                         st.success(
                             f"✅ CONTROLLED FALLBACK PASS — {selected_ticker} Market Cap recovered from "
-                            f"SEC reported shares × completed-session close: ${test_value/1e9:,.1f}B."
+                            f"{fallback_test.get('share_source') or 'SEC shares outstanding'} × completed-session close: "
+                            f"${test_value/1e9:,.1f}B."
                         )
                         t1, t2, t3 = st.columns(3)
                         t1.metric("SEC shares", f"{fallback_test.get('shares', np.nan)/1e9:,.3f}B")
                         t2.metric("Completed-session close", f"${fallback_test.get('close', np.nan):,.2f}")
                         t3.metric("Fallback market cap", f"${test_value/1e9:,.1f}B")
+                        if fallback_test.get("share_filing_date"):
+                            st.caption(
+                                f"SEC share source: {fallback_test.get('share_source', '')} • "
+                                f"filing/as-of reference: {fallback_test.get('share_filing_date', '')}."
+                            )
                         if pd.notna(production_value) and production_value > 0:
                             diff_pct = ((test_value / float(production_value)) - 1.0) * 100.0
                             st.caption(
@@ -5022,6 +5189,7 @@ with ticker_tab:
                                     "Primary route": "Suppressed by controlled test",
                                     "Yahoo direct repair": "Suppressed by controlled test",
                                     "Fallback source": fallback_test.get("source", ""),
+                                    "Share filing/reference date": fallback_test.get("share_filing_date", ""),
                                     "CIK": fallback_test.get("cik", ""),
                                     "Result": "PASS",
                                 }
@@ -5033,6 +5201,8 @@ with ticker_tab:
                         st.error(
                             f"❌ CONTROLLED FALLBACK NOT VERIFIED — {fallback_test.get('reason') or 'SEC fallback did not return a usable market-cap estimate.'}"
                         )
+                        if fallback_test.get("shares_recovery_note"):
+                            st.caption(f"SEC recovery detail: {fallback_test.get('shares_recovery_note')}")
                         if fallback_test.get("foreign_issuer"):
                             st.info(
                                 "This ticker was intentionally protected by the foreign-issuer/ADR guard. "
