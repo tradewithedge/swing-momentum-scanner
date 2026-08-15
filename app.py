@@ -1,5 +1,6 @@
-# Quality Engine v7.2 — Phase 2B WORKING (Recovery Snapshots + Structured Provider Diagnostics)
+# Quality Engine v7.3 — Phase 2B.2 WORKING (Durable Recovery + Structured Provider Diagnostics)
 
+import base64
 import hashlib
 import io
 import json
@@ -44,7 +45,7 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.2-P2B-WORKING"
+ENGINE_VERSION = "v7.3-P2B.2-WORKING"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -62,12 +63,18 @@ SCAN_INDIVIDUAL_REPAIR_MAX_PER_BATCH = 6
 SCAN_INDIVIDUAL_REPAIR_MAX_TOTAL = 24
 
 # Phase 2B recovery snapshot / diagnostics controls.
-# Community Cloud local storage is best-effort only; an external durable backend can
-# be added later without changing the scanner decision engine.
+# Layer 1: local SQLite is fast but best-effort on Streamlit Community Cloud.
+# Layer 2 (Phase 2B.2): an optional GitHub Contents durable store survives container
+# replacement/reboot. Credentials are read only from Streamlit secrets.
 STATE_DB_DIR = Path(os.getenv("SWING_SCANNER_STATE_DIR", ".scanner_state"))
 STATE_DB_PATH = STATE_DB_DIR / "phase2b_scanner_state.sqlite3"
 PERSIST_MIN_USABLE_COVERAGE = 0.95
 PERSISTENT_RUN_LOG_LIMIT = 50
+DURABLE_SNAPSHOT_SCHEMA = 1
+DURABLE_DEFAULT_BRANCH = "scanner-state"
+DURABLE_DEFAULT_SOURCE_BRANCH = "main"
+DURABLE_DEFAULT_PREFIX = "scanner_snapshots"
+DURABLE_REQUEST_TIMEOUT = 15
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 IWM_HOLDINGS_URL = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/latest-holdings.csv"
@@ -120,6 +127,10 @@ if "last_scan_execution_seconds" not in st.session_state:
     st.session_state.last_scan_execution_seconds = np.nan
 if "persistence_last_message" not in st.session_state:
     st.session_state.persistence_last_message = ""
+if "durable_persistence_last_message" not in st.session_state:
+    st.session_state.durable_persistence_last_message = ""
+if "persistence_restore_source" not in st.session_state:
+    st.session_state.persistence_restore_source = ""
 
 # ---------------------------
 # Helpers
@@ -143,6 +154,348 @@ def _json_default(value):
     if isinstance(value, Path):
         return str(value)
     return str(value)
+
+
+def durable_store_config():
+    """Read optional GitHub durable-store configuration from Streamlit secrets.
+
+    Expected Community Cloud secret block:
+
+    [durable_store]
+    provider = "github"
+    repository = "OWNER/REPO"
+    branch = "scanner-state"
+    source_branch = "main"
+    path_prefix = "scanner_snapshots"
+    token = "github_pat_..."
+    allow_watchlist = false
+
+    The token is never written to logs, snapshots, or the UI.
+    """
+    try:
+        raw = st.secrets.get("durable_store", {})
+        cfg = dict(raw) if raw is not None else {}
+    except Exception:
+        cfg = {}
+
+    provider = str(cfg.get("provider", "github")).strip().lower()
+    repository = str(cfg.get("repository", "")).strip()
+    token = str(cfg.get("token", "")).strip()
+    branch = str(cfg.get("branch", DURABLE_DEFAULT_BRANCH)).strip() or DURABLE_DEFAULT_BRANCH
+    source_branch = str(cfg.get("source_branch", DURABLE_DEFAULT_SOURCE_BRANCH)).strip() or DURABLE_DEFAULT_SOURCE_BRANCH
+    path_prefix = str(cfg.get("path_prefix", DURABLE_DEFAULT_PREFIX)).strip().strip("/") or DURABLE_DEFAULT_PREFIX
+    allow_watchlist = bool(cfg.get("allow_watchlist", False))
+
+    return {
+        "configured": provider == "github" and bool(repository) and bool(token),
+        "provider": provider,
+        "repository": repository,
+        "branch": branch,
+        "source_branch": source_branch,
+        "path_prefix": path_prefix,
+        "token": token,
+        "allow_watchlist": allow_watchlist,
+    }
+
+
+def durable_store_status():
+    cfg = durable_store_config()
+    if not cfg["configured"]:
+        return False, (
+            "Durable recovery is not configured. Add a [durable_store] block in Streamlit Secrets "
+            "to enable reboot-safe GitHub snapshot recovery."
+        )
+    watchlist_note = "" if cfg["allow_watchlist"] else " Custom watchlist snapshots are disabled by default."
+    return True, (
+        f"GitHub durable recovery configured: {cfg['repository']}@{cfg['branch']} / {cfg['path_prefix']}."
+        + watchlist_note
+    )
+
+
+def _durable_universe_allowed(universe_name):
+    cfg = durable_store_config()
+    if universe_name == "My Watchlist" and not cfg.get("allow_watchlist", False):
+        return False, (
+            "Durable save skipped for My Watchlist because allow_watchlist=false. "
+            "This prevents a personal watchlist from being written to a repository unintentionally."
+        )
+    return True, ""
+
+
+def _github_headers(token):
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "SwingMomentumScanner/Phase2B2",
+    }
+
+
+def _github_repo_parts(repository):
+    parts = str(repository).strip().split("/", 1)
+    if len(parts) != 2 or not all(parts):
+        raise ValueError("durable_store.repository must be in OWNER/REPO format")
+    return parts[0], parts[1]
+
+
+def _github_api_base(cfg):
+    owner, repo = _github_repo_parts(cfg["repository"])
+    return f"https://api.github.com/repos/{owner}/{repo}"
+
+
+def _github_ensure_state_branch(cfg):
+    """Ensure the configured state branch exists, creating it from source_branch."""
+    base = _github_api_base(cfg)
+    headers = _github_headers(cfg["token"])
+    branch = cfg["branch"]
+    check = requests.get(
+        f"{base}/git/ref/heads/{requests.utils.quote(branch, safe='')}",
+        headers=headers,
+        timeout=DURABLE_REQUEST_TIMEOUT,
+    )
+    if check.status_code == 200:
+        return True, ""
+    if check.status_code != 404:
+        return False, f"GitHub branch check failed ({check.status_code})."
+
+    source = cfg["source_branch"]
+    source_resp = requests.get(
+        f"{base}/git/ref/heads/{requests.utils.quote(source, safe='')}",
+        headers=headers,
+        timeout=DURABLE_REQUEST_TIMEOUT,
+    )
+    if source_resp.status_code != 200:
+        return False, f"GitHub source branch '{source}' could not be read ({source_resp.status_code})."
+    source_sha = ((source_resp.json().get("object") or {}).get("sha"))
+    if not source_sha:
+        return False, "GitHub source branch SHA was unavailable."
+
+    create = requests.post(
+        f"{base}/git/refs",
+        headers=headers,
+        json={"ref": f"refs/heads/{branch}", "sha": source_sha},
+        timeout=DURABLE_REQUEST_TIMEOUT,
+    )
+    if create.status_code in {200, 201}:
+        return True, ""
+    # Another process may have created it between GET and POST.
+    if create.status_code == 422:
+        recheck = requests.get(
+            f"{base}/git/ref/heads/{requests.utils.quote(branch, safe='')}",
+            headers=headers,
+            timeout=DURABLE_REQUEST_TIMEOUT,
+        )
+        if recheck.status_code == 200:
+            return True, ""
+    return False, f"GitHub state branch creation failed ({create.status_code})."
+
+
+def _durable_snapshot_path(universe_name, cfg=None):
+    cfg = cfg or durable_store_config()
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in str(universe_name)).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    digest = hashlib.sha1(str(universe_name).encode("utf-8")).hexdigest()[:8]
+    return f"{cfg['path_prefix']}/{slug}-{digest}.json"
+
+
+def _encode_durable_dataframe(df):
+    # Network-restored data is JSON, not pickle, so remote tampering cannot trigger
+    # arbitrary Python object deserialization.
+    table_json = df.to_json(orient="table", date_format="iso", double_precision=12)
+    compressed = zlib.compress(table_json.encode("utf-8"), level=9)
+    return base64.b64encode(compressed).decode("ascii"), hashlib.sha256(compressed).hexdigest()
+
+
+def _decode_durable_dataframe(data_blob, expected_sha256):
+    compressed = base64.b64decode(str(data_blob).encode("ascii"), validate=True)
+    actual = hashlib.sha256(compressed).hexdigest()
+    if expected_sha256 and actual != expected_sha256:
+        raise ValueError("Durable snapshot checksum mismatch")
+    table_json = zlib.decompress(compressed).decode("utf-8")
+    return pd.read_json(io.StringIO(table_json), orient="table")
+
+
+def _build_durable_snapshot_envelope(universe_name, results, timestamp, failures,
+                                     universe_signature, signal_session, engine_version,
+                                     health, diagnostics):
+    data_blob, data_sha = _encode_durable_dataframe(results)
+    return {
+        "schema": DURABLE_SNAPSHOT_SCHEMA,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "universe_name": universe_name,
+        "scan_timestamp": pd.Timestamp(timestamp).isoformat(),
+        "signal_session": pd.Timestamp(signal_session).isoformat() if signal_session is not None and not pd.isna(signal_session) else None,
+        "universe_signature": universe_signature,
+        "engine_version": engine_version,
+        "provider_health": health,
+        "failures": list(failures or []),
+        "diagnostics": list(diagnostics or []),
+        "row_count": int(len(results)),
+        "data_encoding": "pandas-table-json+zlib+base64",
+        "data_sha256": data_sha,
+        "data_blob": data_blob,
+    }
+
+
+def _github_read_snapshot_file(cfg, universe_name):
+    branch_ok, branch_message = _github_ensure_state_branch(cfg)
+    if not branch_ok:
+        return None, None, branch_message
+    base = _github_api_base(cfg)
+    path = _durable_snapshot_path(universe_name, cfg)
+    encoded_path = requests.utils.quote(path, safe="/")
+    resp = requests.get(
+        f"{base}/contents/{encoded_path}",
+        headers=_github_headers(cfg["token"]),
+        params={"ref": cfg["branch"]},
+        timeout=DURABLE_REQUEST_TIMEOUT,
+    )
+    if resp.status_code == 404:
+        return None, None, "No durable snapshot exists for this universe yet."
+    if resp.status_code != 200:
+        return None, None, f"GitHub durable read failed ({resp.status_code})."
+    payload = resp.json()
+    content = str(payload.get("content", "")).replace("\n", "")
+    if not content:
+        return None, payload.get("sha"), "GitHub durable snapshot content was empty."
+    try:
+        text = base64.b64decode(content).decode("utf-8")
+        return json.loads(text), payload.get("sha"), ""
+    except Exception as exc:
+        return None, payload.get("sha"), f"GitHub durable snapshot decode failed: {type(exc).__name__}."
+
+
+def save_durable_snapshot(universe_name, results, timestamp, failures, universe_signature,
+                          signal_session, engine_version, health, diagnostics):
+    """Save a reboot-safe snapshot to a GitHub state branch when configured."""
+    cfg = durable_store_config()
+    if not cfg["configured"]:
+        return False, "Durable recovery not configured; local SQLite snapshot only."
+    allowed, reason = _durable_universe_allowed(universe_name)
+    if not allowed:
+        return False, reason
+    if not persistable_last_good(results, health):
+        return False, "Scan did not meet the durable last-good quality threshold."
+
+    try:
+        branch_ok, branch_message = _github_ensure_state_branch(cfg)
+        if not branch_ok:
+            return False, branch_message
+
+        envelope = _build_durable_snapshot_envelope(
+            universe_name, results, timestamp, failures, universe_signature,
+            signal_session, engine_version, health, diagnostics,
+        )
+        existing, existing_sha, read_message = _github_read_snapshot_file(cfg, universe_name)
+        if existing is not None and existing.get("data_sha256") == envelope.get("data_sha256"):
+            # Avoid a no-op Git commit for repeated same-session scans.
+            return True, "Durable GitHub snapshot already matches current scan; no new commit was needed."
+
+        text = json.dumps(envelope, default=_json_default, separators=(",", ":"))
+        body = {
+            "message": f"Update scanner recovery snapshot: {universe_name}",
+            "content": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+            "branch": cfg["branch"],
+        }
+        if existing_sha:
+            body["sha"] = existing_sha
+
+        base = _github_api_base(cfg)
+        path = _durable_snapshot_path(universe_name, cfg)
+        encoded_path = requests.utils.quote(path, safe="/")
+        resp = requests.put(
+            f"{base}/contents/{encoded_path}",
+            headers=_github_headers(cfg["token"]),
+            json=body,
+            timeout=DURABLE_REQUEST_TIMEOUT,
+        )
+        if resp.status_code in {200, 201}:
+            return True, f"Saved {len(results):,}-row durable GitHub recovery snapshot."
+        if resp.status_code == 409:
+            # Optimistic-concurrency retry: fetch the newest blob SHA and try once.
+            latest, latest_sha, _ = _github_read_snapshot_file(cfg, universe_name)
+            if latest is not None and latest.get("data_sha256") == envelope.get("data_sha256"):
+                return True, "Durable GitHub snapshot was concurrently updated to the same data."
+            if latest_sha:
+                body["sha"] = latest_sha
+                retry = requests.put(
+                    f"{base}/contents/{encoded_path}",
+                    headers=_github_headers(cfg["token"]),
+                    json=body,
+                    timeout=DURABLE_REQUEST_TIMEOUT,
+                )
+                if retry.status_code in {200, 201}:
+                    return True, f"Saved {len(results):,}-row durable GitHub recovery snapshot after retry."
+                return False, f"Durable GitHub save retry failed ({retry.status_code})."
+        return False, f"Durable GitHub save failed ({resp.status_code}). Check token Contents: write permission."
+    except Exception as exc:
+        return False, f"Durable GitHub save failed: {type(exc).__name__}: {exc}"
+
+
+def load_durable_snapshot(universe_name):
+    cfg = durable_store_config()
+    if not cfg["configured"]:
+        return None, "Durable recovery not configured."
+    allowed, reason = _durable_universe_allowed(universe_name)
+    if not allowed:
+        return None, reason
+    try:
+        envelope, _, message = _github_read_snapshot_file(cfg, universe_name)
+        if envelope is None:
+            return None, message
+        if int(envelope.get("schema", -1)) != DURABLE_SNAPSHOT_SCHEMA:
+            return None, "Durable snapshot schema is incompatible with this app version."
+        if envelope.get("universe_name") != universe_name:
+            return None, "Durable snapshot universe name mismatch."
+        df = _decode_durable_dataframe(envelope.get("data_blob", ""), envelope.get("data_sha256", ""))
+        if df is None or df.empty:
+            return None, "Durable snapshot contained no scan rows."
+        row_count = int(envelope.get("row_count", len(df)))
+        if row_count != len(df):
+            return None, "Durable snapshot row-count verification failed."
+        snapshot = {
+            "df": df,
+            "timestamp": pd.Timestamp(envelope.get("scan_timestamp")).to_pydatetime(),
+            "signal_session": pd.Timestamp(envelope.get("signal_session")) if envelope.get("signal_session") else None,
+            "universe_signature": envelope.get("universe_signature", ""),
+            "engine_version": envelope.get("engine_version", ""),
+            "provider_health": dict(envelope.get("provider_health") or {}),
+            "failures": list(envelope.get("failures") or []),
+            "diagnostics": list(envelope.get("diagnostics") or []),
+            "row_count": row_count,
+            "recovery_source": "GitHub durable store",
+        }
+        return snapshot, "Loaded durable GitHub recovery snapshot."
+    except Exception as exc:
+        return None, f"Durable GitHub load failed: {type(exc).__name__}: {exc}"
+
+
+def load_best_available_snapshot(universe_name, universe_signature=None, engine_version=None):
+    """Prefer compatible local SQLite, then fall back to compatible durable GitHub state."""
+    def compatible(snapshot):
+        if snapshot is None:
+            return False
+        if universe_signature and snapshot.get("universe_signature") != universe_signature:
+            return False
+        if engine_version and snapshot.get("engine_version") != engine_version:
+            return False
+        return True
+
+    local = load_last_good_snapshot(universe_name)
+    if compatible(local):
+        local["recovery_source"] = "local SQLite"
+        return local, "local SQLite", ""
+
+    remote, message = load_durable_snapshot(universe_name)
+    if compatible(remote):
+        return remote, "GitHub durable store", ""
+
+    if remote is not None and not compatible(remote):
+        return None, "", "Durable snapshot exists but is incompatible with the current universe or engine version."
+    if local is not None and not compatible(local) and not message:
+        message = "Local snapshot exists but is incompatible with the current universe or engine version."
+    return None, "", message
 
 
 def _state_db_connect():
@@ -368,7 +721,7 @@ def recent_scan_runs(universe_name, limit=5):
 
 
 def apply_snapshot_to_session(universe_name, snapshot, recovered=False, preserve_provider_health=False):
-    """Apply a trusted locally-created snapshot to the current Streamlit session."""
+    """Apply a validated local or durable recovery snapshot to this Streamlit session."""
     st.session_state.scan_df = snapshot["df"].copy()
     st.session_state.scan_ranked_df = pd.DataFrame()
     st.session_state.scan_ranked_regime_label = ""
@@ -391,11 +744,13 @@ def apply_snapshot_to_session(universe_name, snapshot, recovered=False, preserve
     }
     if recovered and not preserve_provider_health:
         old_health = dict(snapshot.get("provider_health", {}) or {})
+        recovery_source = snapshot.get("recovery_source", "recovery store")
+        st.session_state.persistence_restore_source = recovery_source
         st.session_state.provider_health = {
             **old_health,
             "status": "RECOVERED",
             "message": (
-                "Recovered a best-effort local last-good snapshot. The live market-data provider "
+                f"Recovered a last-good snapshot from {recovery_source}. The live market-data provider "
                 "has not yet been retested in this app session."
             ),
         }
@@ -4094,8 +4449,9 @@ with scanner_tab:
     else:
         st.caption(f"Universe contains **{len(universe_df):,}** unique symbols.")
 
-    # Phase 2B: on a fresh Streamlit session, recover the most recent locally
-    # persisted last-good snapshot when the universe signature and engine match.
+    # Phase 2B.2: on a fresh Streamlit session, recover the most recent compatible
+    # last-good snapshot. Local SQLite is checked first, then the configured
+    # reboot-safe GitHub durable store.
     # A stale signal session may be displayed as a recovery snapshot, but pressing
     # Run will still force a fresh scan because reusable_session_scan validates the
     # current completed XNYS session and 15-minute TTL.
@@ -4108,20 +4464,21 @@ with scanner_tab:
         and current_restore_signature
     ):
         st.session_state.persistence_restore_checked[restore_key] = True
-        snapshot = load_last_good_snapshot(universe_name)
-        if (
-            snapshot is not None
-            and snapshot.get("universe_signature") == current_restore_signature
-            and snapshot.get("engine_version") == ENGINE_VERSION
-        ):
+        snapshot, restore_source, restore_message = load_best_available_snapshot(
+            universe_name, current_restore_signature, ENGINE_VERSION
+        )
+        if snapshot is not None:
+            snapshot["recovery_source"] = restore_source
             apply_snapshot_to_session(universe_name, snapshot, recovered=True)
             snap_session = snapshot.get("signal_session")
             st.session_state.persistent_restore_notice = (
-                f"Recovered best-effort last-good {universe_name} snapshot from "
-                f"{snapshot['timestamp']:%Y-%m-%d %H:%M:%S}"
+                f"Recovered last-good {universe_name} snapshot from **{restore_source}** • "
+                f"saved {snapshot['timestamp']:%Y-%m-%d %H:%M:%S}"
                 + (f" • signal session {pd.Timestamp(snap_session):%d-%b-%Y}." if snap_session is not None else ".")
             )
             st.rerun()
+        elif restore_message:
+            st.session_state.persistent_restore_notice = f"Recovery check: {restore_message}"
 
     if st.session_state.persistent_restore_notice:
         st.info(st.session_state.persistent_restore_notice)
@@ -4182,6 +4539,7 @@ with scanner_tab:
         st.session_state.scan_data_engine_version = ""
         st.session_state.scan_diagnostics = []
         st.session_state.persistent_restore_notice = ""
+        st.session_state.persistence_restore_source = ""
         st.session_state.persistence_restore_checked[restore_key] = True
         st.rerun()
 
@@ -4254,12 +4612,11 @@ with scanner_tab:
                 previous = st.session_state.last_good_scans.get(universe_name)
                 persistent_previous = None
                 if previous is None or previous.get("df", pd.DataFrame()).empty:
-                    candidate_snapshot = load_last_good_snapshot(universe_name)
-                    if (
-                        candidate_snapshot is not None
-                        and candidate_snapshot.get("universe_signature") == current_signature
-                        and candidate_snapshot.get("engine_version") == ENGINE_VERSION
-                    ):
+                    candidate_snapshot, snapshot_source, _ = load_best_available_snapshot(
+                        universe_name, current_signature, ENGINE_VERSION
+                    )
+                    if candidate_snapshot is not None:
+                        candidate_snapshot["recovery_source"] = snapshot_source
                         persistent_previous = candidate_snapshot
                         previous = candidate_snapshot
 
@@ -4286,7 +4643,10 @@ with scanner_tab:
                         st.session_state.scan_universe_signature = previous.get("universe_signature", "")
                         st.session_state.scan_signal_session = previous.get("signal_session")
                         st.session_state.scan_data_engine_version = previous.get("engine_version", "")
-                    source_word = "persisted recovery" if persistent_previous is not None else "in-session"
+                    source_word = (
+                        persistent_previous.get("recovery_source", "persisted recovery")
+                        if persistent_previous is not None else "in-session"
+                    )
                     st.warning(
                         f"Showing the {source_word} last-good {universe_name} scan from "
                         f"{previous['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} instead."
@@ -4331,6 +4691,18 @@ with scanner_tab:
                             st.session_state.scan_diagnostics,
                         )
                         st.session_state.persistence_last_message = persist_message
+                        durable_saved, durable_message = save_durable_snapshot(
+                            universe_name,
+                            results,
+                            st.session_state.scan_timestamp,
+                            failures,
+                            current_signature,
+                            current_signal_session,
+                            ENGINE_VERSION,
+                            health,
+                            st.session_state.scan_diagnostics,
+                        )
+                        st.session_state.durable_persistence_last_message = durable_message
                     else:
                         st.session_state.persistence_last_message = (
                             f"Scan completed, but usable coverage did not meet the "
@@ -4379,14 +4751,20 @@ with scanner_tab:
         persisted_ok, persisted_message = persistence_status()
         if persisted_ok:
             st.caption(
-                "Recovery snapshot store: available (best-effort local SQLite). "
-                "Streamlit Community Cloud does not guarantee persistence of runtime local files, "
-                "so this is a recovery layer rather than a guaranteed external backup."
+                "Local recovery: available (best-effort SQLite; fast, but Streamlit may remove it on container restart)."
             )
             if st.session_state.persistence_last_message:
                 st.caption(st.session_state.persistence_last_message)
         else:
             st.warning(persisted_message)
+
+        durable_ok, durable_message = durable_store_status()
+        if durable_ok:
+            st.success(f"Durable recovery: CONFIGURED — {durable_message}")
+            if st.session_state.durable_persistence_last_message:
+                st.caption(st.session_state.durable_persistence_last_message)
+        else:
+            st.warning(f"Durable recovery: NOT CONFIGURED — {durable_message}")
 
         run_history = recent_scan_runs(universe_name, limit=5)
         if not run_history.empty:
