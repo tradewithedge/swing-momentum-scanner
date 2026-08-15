@@ -1,9 +1,15 @@
-# Quality Engine v7.1 — Phase 2A.1 WORKING (Exchange Calendar + Targeted Recovery + Fast Scan Reuse)
+# Quality Engine v7.2 — Phase 2B WORKING (Recovery Snapshots + Structured Provider Diagnostics)
 
 import hashlib
 import io
+import json
+import os
+import pickle
+import sqlite3
 import time
+import zlib
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -38,7 +44,7 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.1-P2A.1-WORKING"
+ENGINE_VERSION = "v7.2-P2B-WORKING"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -54,6 +60,14 @@ SCAN_TARGETED_RETRY_MAX_FRACTION = 0.25
 SCAN_TARGETED_RETRY_MAX_SYMBOLS = 30
 SCAN_INDIVIDUAL_REPAIR_MAX_PER_BATCH = 6
 SCAN_INDIVIDUAL_REPAIR_MAX_TOTAL = 24
+
+# Phase 2B recovery snapshot / diagnostics controls.
+# Community Cloud local storage is best-effort only; an external durable backend can
+# be added later without changing the scanner decision engine.
+STATE_DB_DIR = Path(os.getenv("SWING_SCANNER_STATE_DIR", ".scanner_state"))
+STATE_DB_PATH = STATE_DB_DIR / "phase2b_scanner_state.sqlite3"
+PERSIST_MIN_USABLE_COVERAGE = 0.95
+PERSISTENT_RUN_LOG_LIMIT = 50
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 IWM_HOLDINGS_URL = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/latest-holdings.csv"
@@ -96,6 +110,16 @@ if "scan_signal_session" not in st.session_state:
     st.session_state.scan_signal_session = None
 if "scan_data_engine_version" not in st.session_state:
     st.session_state.scan_data_engine_version = ""
+if "scan_diagnostics" not in st.session_state:
+    st.session_state.scan_diagnostics = []
+if "persistence_restore_checked" not in st.session_state:
+    st.session_state.persistence_restore_checked = {}
+if "persistent_restore_notice" not in st.session_state:
+    st.session_state.persistent_restore_notice = ""
+if "last_scan_execution_seconds" not in st.session_state:
+    st.session_state.last_scan_execution_seconds = np.nan
+if "persistence_last_message" not in st.session_state:
+    st.session_state.persistence_last_message = ""
 
 # ---------------------------
 # Helpers
@@ -110,6 +134,309 @@ def clean_symbol(symbol: str) -> str:
     if not s or s in {"-", "NAN", "CASH", "USD"}:
         return ""
     return yahoo_symbol(s)
+
+def _json_default(value):
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _state_db_connect():
+    """Open/create the Phase 2B local recovery database.
+
+    Streamlit Community Cloud does not guarantee local-file persistence. This store
+    is therefore a best-effort recovery layer, not an external durable backup.
+    """
+    STATE_DB_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(STATE_DB_PATH), timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scan_snapshots (
+            universe_name TEXT PRIMARY KEY,
+            saved_at TEXT NOT NULL,
+            scan_timestamp TEXT NOT NULL,
+            signal_session TEXT,
+            universe_signature TEXT,
+            engine_version TEXT,
+            provider_health_json TEXT,
+            failures_json TEXT,
+            diagnostics_json TEXT,
+            row_count INTEGER NOT NULL,
+            data_blob BLOB NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scan_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_timestamp TEXT NOT NULL,
+            universe_name TEXT NOT NULL,
+            signal_session TEXT,
+            requested_count INTEGER NOT NULL,
+            result_count INTEGER NOT NULL,
+            elapsed_seconds REAL,
+            status TEXT,
+            coverage REAL,
+            usable_coverage REAL,
+            failures_json TEXT,
+            diagnostics_json TEXT,
+            provider_health_json TEXT
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def persistence_status():
+    try:
+        with _state_db_connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return True, f"Best-effort local SQLite recovery store available: {STATE_DB_PATH}"
+    except Exception as exc:
+        return False, f"Recovery snapshot store unavailable: {type(exc).__name__}: {exc}"
+
+
+def _encode_dataframe(df):
+    payload = pickle.dumps(df, protocol=pickle.HIGHEST_PROTOCOL)
+    return sqlite3.Binary(zlib.compress(payload, level=6))
+
+
+def _decode_dataframe(blob):
+    return pickle.loads(zlib.decompress(blob))
+
+
+def persistable_last_good(results, health):
+    if results is None or results.empty:
+        return False
+    if health.get("status") != "HEALTHY":
+        return False
+    usable = health.get("usable_coverage", 0.0)
+    try:
+        return float(usable) >= PERSIST_MIN_USABLE_COVERAGE
+    except Exception:
+        return False
+
+
+def save_last_good_snapshot(universe_name, results, timestamp, failures, universe_signature,
+                            signal_session, engine_version, health, diagnostics):
+    """Persist one best-effort last-good snapshot per universe."""
+    if not persistable_last_good(results, health):
+        return False, "Scan did not meet the persistent last-good quality threshold."
+    try:
+        with _state_db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scan_snapshots (
+                    universe_name, saved_at, scan_timestamp, signal_session,
+                    universe_signature, engine_version, provider_health_json,
+                    failures_json, diagnostics_json, row_count, data_blob
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(universe_name) DO UPDATE SET
+                    saved_at=excluded.saved_at,
+                    scan_timestamp=excluded.scan_timestamp,
+                    signal_session=excluded.signal_session,
+                    universe_signature=excluded.universe_signature,
+                    engine_version=excluded.engine_version,
+                    provider_health_json=excluded.provider_health_json,
+                    failures_json=excluded.failures_json,
+                    diagnostics_json=excluded.diagnostics_json,
+                    row_count=excluded.row_count,
+                    data_blob=excluded.data_blob
+                """,
+                (
+                    universe_name,
+                    datetime.now().isoformat(timespec="seconds"),
+                    pd.Timestamp(timestamp).isoformat(),
+                    pd.Timestamp(signal_session).isoformat() if signal_session is not None and not pd.isna(signal_session) else None,
+                    universe_signature,
+                    engine_version,
+                    json.dumps(health, default=_json_default),
+                    json.dumps(list(failures or []), default=_json_default),
+                    json.dumps(list(diagnostics or []), default=_json_default),
+                    int(len(results)),
+                    _encode_dataframe(results),
+                ),
+            )
+            conn.commit()
+        return True, f"Saved {len(results):,}-row last-good recovery snapshot."
+    except Exception as exc:
+        return False, f"Could not save recovery snapshot: {type(exc).__name__}: {exc}"
+
+
+def load_last_good_snapshot(universe_name):
+    try:
+        with _state_db_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT scan_timestamp, signal_session, universe_signature, engine_version,
+                       provider_health_json, failures_json, diagnostics_json, row_count, data_blob
+                FROM scan_snapshots WHERE universe_name = ?
+                """,
+                (universe_name,),
+            ).fetchone()
+        if not row:
+            return None
+        scan_timestamp, signal_session, signature, engine_version, health_json, failures_json, diagnostics_json, row_count, blob = row
+        df = _decode_dataframe(blob)
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        return {
+            "df": df,
+            "timestamp": pd.Timestamp(scan_timestamp).to_pydatetime(),
+            "signal_session": pd.Timestamp(signal_session) if signal_session else None,
+            "universe_signature": signature or "",
+            "engine_version": engine_version or "",
+            "provider_health": json.loads(health_json) if health_json else {},
+            "failures": json.loads(failures_json) if failures_json else [],
+            "diagnostics": json.loads(diagnostics_json) if diagnostics_json else [],
+            "row_count": int(row_count or len(df)),
+        }
+    except Exception:
+        return None
+
+
+def log_scan_run(universe_name, signal_session, requested_count, result_count, elapsed_seconds,
+                 failures, health, diagnostics):
+    """Persist compact structured scan-run diagnostics for later troubleshooting."""
+    try:
+        with _state_db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO scan_runs (
+                    run_timestamp, universe_name, signal_session, requested_count,
+                    result_count, elapsed_seconds, status, coverage, usable_coverage,
+                    failures_json, diagnostics_json, provider_health_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now().isoformat(timespec="seconds"),
+                    universe_name,
+                    pd.Timestamp(signal_session).isoformat() if signal_session is not None and not pd.isna(signal_session) else None,
+                    int(requested_count),
+                    int(result_count),
+                    float(elapsed_seconds) if np.isfinite(elapsed_seconds) else None,
+                    str(health.get("status", "UNKNOWN")),
+                    float(health.get("coverage", np.nan)) if pd.notna(health.get("coverage", np.nan)) else None,
+                    float(health.get("usable_coverage", np.nan)) if pd.notna(health.get("usable_coverage", np.nan)) else None,
+                    json.dumps(list(failures or []), default=_json_default),
+                    json.dumps(list(diagnostics or []), default=_json_default),
+                    json.dumps(health, default=_json_default),
+                ),
+            )
+            conn.execute(
+                """
+                DELETE FROM scan_runs
+                WHERE id NOT IN (
+                    SELECT id FROM scan_runs ORDER BY id DESC LIMIT ?
+                )
+                """,
+                (PERSISTENT_RUN_LOG_LIMIT,),
+            )
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def recent_scan_runs(universe_name, limit=5):
+    try:
+        with _state_db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_timestamp, signal_session, requested_count, result_count,
+                       elapsed_seconds, status, coverage, usable_coverage
+                FROM scan_runs
+                WHERE universe_name = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (universe_name, int(limit)),
+            ).fetchall()
+        return pd.DataFrame(
+            rows,
+            columns=["Run Time", "Signal Session", "Requested", "Analyzed", "Seconds", "Status", "Coverage", "Usable Coverage"],
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def apply_snapshot_to_session(universe_name, snapshot, recovered=False, preserve_provider_health=False):
+    """Apply a trusted locally-created snapshot to the current Streamlit session."""
+    st.session_state.scan_df = snapshot["df"].copy()
+    st.session_state.scan_ranked_df = pd.DataFrame()
+    st.session_state.scan_ranked_regime_label = ""
+    st.session_state.scan_ranked_engine_version = ""
+    st.session_state.scan_universe_name = universe_name
+    st.session_state.scan_timestamp = snapshot.get("timestamp")
+    st.session_state.scan_errors = list(snapshot.get("failures", []))
+    st.session_state.scan_universe_signature = snapshot.get("universe_signature", "")
+    st.session_state.scan_signal_session = snapshot.get("signal_session")
+    st.session_state.scan_data_engine_version = snapshot.get("engine_version", "")
+    st.session_state.scan_diagnostics = list(snapshot.get("diagnostics", []))
+    st.session_state.last_good_scans[universe_name] = {
+        "df": snapshot["df"].copy(),
+        "timestamp": snapshot.get("timestamp"),
+        "failures": list(snapshot.get("failures", [])),
+        "universe_signature": snapshot.get("universe_signature", ""),
+        "signal_session": snapshot.get("signal_session"),
+        "engine_version": snapshot.get("engine_version", ""),
+        "diagnostics": list(snapshot.get("diagnostics", [])),
+    }
+    if recovered and not preserve_provider_health:
+        old_health = dict(snapshot.get("provider_health", {}) or {})
+        st.session_state.provider_health = {
+            **old_health,
+            "status": "RECOVERED",
+            "message": (
+                "Recovered a best-effort local last-good snapshot. The live market-data provider "
+                "has not yet been retested in this app session."
+            ),
+        }
+
+
+def scanner_frame_diagnostic(df):
+    """Compact final-state diagnostic for one scanner frame."""
+    valid, reason = price_data_status(df, min_rows=126)
+    x = completed_session_frame(df)
+    latest = pd.NaT
+    if not x.empty and "Date" in x.columns:
+        latest = pd.to_datetime(x["Date"], errors="coerce").max()
+    if not valid:
+        return {
+            "usable": False,
+            "confidence": "LOW",
+            "latest_session": "" if pd.isna(latest) else pd.Timestamp(latest).strftime("%Y-%m-%d"),
+            "note": reason,
+        }
+    conf = data_confidence(x, recent_lookback=14)
+    return {
+        "usable": not bool(conf.get("block", True)),
+        "confidence": conf.get("level", "LOW"),
+        "latest_session": "" if pd.isna(latest) else pd.Timestamp(latest).strftime("%Y-%m-%d"),
+        "note": conf.get("message", ""),
+    }
+
+
+def format_elapsed_short(seconds):
+    try:
+        value = float(seconds)
+    except Exception:
+        return "N/A"
+    if not np.isfinite(value):
+        return "N/A"
+    if value < 1.0:
+        return "<1s"
+    if value < 10:
+        return f"{value:.1f}s"
+    return f"{value:.0f}s"
+
 
 def scan_universe_signature(universe_df):
     """Stable hash of the ticker set used by a scanner run.
@@ -1843,6 +2170,25 @@ def run_market_scan(universe_df, progress_bar, status_box):
     targeted_retry_repaired = 0
     individual_repair_attempts = 0
     individual_repair_repaired = 0
+    symbol_diagnostics = {}
+
+    def diag_touch(symbol, batch_no, initial_note=""):
+        item = symbol_diagnostics.setdefault(
+            symbol,
+            {
+                "Ticker": symbol,
+                "Batch": int(batch_no),
+                "Initial Issue": initial_note,
+                "Recovery Path": [],
+                "Final State": "PENDING",
+                "Confidence": "",
+                "Latest Session": "",
+                "Final Note": "",
+            },
+        )
+        if initial_note and not item.get("Initial Issue"):
+            item["Initial Issue"] = initial_note
+        return item
 
     for batch_no, start_i in enumerate(range(0, len(tickers), YAHOO_BATCH_SIZE), start=1):
         batch = tickers[start_i : start_i + YAHOO_BATCH_SIZE]
@@ -1854,6 +2200,10 @@ def run_market_scan(universe_df, progress_bar, status_box):
         raw = download_batch_cached(tuple(batch), conservative=False)
         frames = {symbol: split_batch_result(raw, symbol) for symbol in batch}
         problem_symbols = [symbol for symbol in batch if not scanner_frame_usable(frames[symbol])]
+        for symbol in problem_symbols:
+            d0 = scanner_frame_diagnostic(frames[symbol])
+            item = diag_touch(symbol, batch_no, d0.get("note", "Initial Yahoo batch frame was unusable."))
+            item["Recovery Path"].append("Yahoo batch issue")
 
         broad_problem_threshold = max(2, int(np.ceil(len(batch) * 0.20)))
         broad_problem = len(problem_symbols) >= broad_problem_threshold
@@ -1869,6 +2219,8 @@ def run_market_scan(universe_df, progress_bar, status_box):
                 raw_retry = download_batch_cached(tuple(batch), conservative=True)
                 for symbol in batch:
                     retry_df = split_batch_result(raw_retry, symbol)
+                    if symbol in problem_symbols:
+                        diag_touch(symbol, batch_no)["Recovery Path"].append("Conservative Yahoo batch retry")
                     frames[symbol] = better_scanner_frame(frames[symbol], retry_df)
             else:
                 # Isolated failures: retry only the affected subset.
@@ -1885,6 +2237,7 @@ def run_market_scan(universe_df, progress_bar, status_box):
                     for symbol in retry_subset:
                         before = scanner_frame_quality(frames[symbol])
                         retry_df = split_batch_result(retry_raw, symbol)
+                        diag_touch(symbol, batch_no)["Recovery Path"].append("Targeted Yahoo retry")
                         frames[symbol] = better_scanner_frame(frames[symbol], retry_df)
                         if scanner_frame_quality(frames[symbol]) > before:
                             targeted_retry_repaired += 1
@@ -1906,6 +2259,7 @@ def run_market_scan(universe_df, progress_bar, status_box):
                 individual_repair_attempts += 1
                 before = scanner_frame_quality(frames[symbol])
                 repaired_df = download_one(symbol, "1y")
+                diag_touch(symbol, batch_no)["Recovery Path"].append("Individual Yahoo → Stooq repair")
                 frames[symbol] = better_scanner_frame(frames[symbol], repaired_df)
                 if scanner_frame_quality(frames[symbol]) > before:
                     individual_repair_repaired += 1
@@ -1927,6 +2281,19 @@ def run_market_scan(universe_df, progress_bar, status_box):
                 records.append(rec)
             else:
                 failures.append(symbol)
+                item = diag_touch(symbol, batch_no, "Scanner record could not be built from the final price frame.")
+                if "Record computation failed" not in item["Recovery Path"]:
+                    item["Recovery Path"].append("Record computation failed")
+
+            if symbol in symbol_diagnostics:
+                final_diag = scanner_frame_diagnostic(df)
+                item = symbol_diagnostics[symbol]
+                item["Final State"] = "USABLE" if final_diag.get("usable") and rec is not None else "UNRESOLVED"
+                item["Confidence"] = final_diag.get("confidence", "")
+                item["Latest Session"] = final_diag.get("latest_session", "")
+                item["Final Note"] = final_diag.get("note", "")
+                if not item["Recovery Path"]:
+                    item["Recovery Path"].append("No recovery attempted")
 
         progress_bar.progress(min(batch_no / total_batches, 1.0))
 
@@ -1934,6 +2301,12 @@ def run_market_scan(universe_df, progress_bar, status_box):
         # after the controlled recovery sequence.
         if batch_no >= 2 and provider_batches_failed == batch_no and len(records) < 5:
             break
+
+    diagnostics = []
+    for symbol in sorted(symbol_diagnostics):
+        item = dict(symbol_diagnostics[symbol])
+        item["Recovery Path"] = " → ".join(item.get("Recovery Path", []))
+        diagnostics.append(item)
 
     coverage = len(records) / max(len(tickers), 1)
     usable_records = [r for r in records if not bool(r.get("Price Data Block", True))]
@@ -1950,6 +2323,9 @@ def run_market_scan(universe_df, progress_bar, status_box):
             "coverage": coverage,
             "usable_coverage": usable_coverage,
             "calendar_source": market_calendar_source(),
+            "provider_batches_failed": provider_batches_failed,
+            "diagnostics": diagnostics,
+            "unresolved_symbols": list(failures),
             "targeted_retry_symbols": targeted_retry_symbols,
             "targeted_retry_repaired": targeted_retry_repaired,
             "individual_repair_attempts": individual_repair_attempts,
@@ -1967,6 +2343,9 @@ def run_market_scan(universe_df, progress_bar, status_box):
             "coverage": coverage,
             "usable_coverage": usable_coverage,
             "calendar_source": market_calendar_source(),
+            "provider_batches_failed": provider_batches_failed,
+            "diagnostics": diagnostics,
+            "unresolved_symbols": list(failures),
             "targeted_retry_symbols": targeted_retry_symbols,
             "targeted_retry_repaired": targeted_retry_repaired,
             "individual_repair_attempts": individual_repair_attempts,
@@ -1983,6 +2362,9 @@ def run_market_scan(universe_df, progress_bar, status_box):
             "coverage": coverage,
             "usable_coverage": usable_coverage,
             "calendar_source": market_calendar_source(),
+            "provider_batches_failed": provider_batches_failed,
+            "diagnostics": diagnostics,
+            "unresolved_symbols": list(failures),
             "targeted_retry_symbols": targeted_retry_symbols,
             "targeted_retry_repaired": targeted_retry_repaired,
             "individual_repair_attempts": individual_repair_attempts,
@@ -3678,6 +4060,8 @@ with scanner_tab:
         st.warning(f"🟠 **Data Health: DEGRADED** — {health.get('message', '')}")
     elif h_status == "PROVIDER_FAILURE":
         st.error(f"🔴 **Data Health: PROVIDER FAILURE** — {health.get('message', '')}")
+    elif h_status == "RECOVERED":
+        st.info(f"🔵 **Data Health: RECOVERED SNAPSHOT** — {health.get('message', '')}")
     else:
         st.info("🔵 **Data Health:** Run a scan to test current bulk-provider coverage.")
 
@@ -3709,6 +4093,38 @@ with scanner_tab:
         )
     else:
         st.caption(f"Universe contains **{len(universe_df):,}** unique symbols.")
+
+    # Phase 2B: on a fresh Streamlit session, recover the most recent locally
+    # persisted last-good snapshot when the universe signature and engine match.
+    # A stale signal session may be displayed as a recovery snapshot, but pressing
+    # Run will still force a fresh scan because reusable_session_scan validates the
+    # current completed XNYS session and 15-minute TTL.
+    current_restore_signature = scan_universe_signature(universe_df)
+    restore_key = f"{universe_name}:{current_restore_signature}"
+    restore_checked = st.session_state.persistence_restore_checked.get(restore_key, False)
+    if (
+        not restore_checked
+        and st.session_state.scan_df.empty
+        and current_restore_signature
+    ):
+        st.session_state.persistence_restore_checked[restore_key] = True
+        snapshot = load_last_good_snapshot(universe_name)
+        if (
+            snapshot is not None
+            and snapshot.get("universe_signature") == current_restore_signature
+            and snapshot.get("engine_version") == ENGINE_VERSION
+        ):
+            apply_snapshot_to_session(universe_name, snapshot, recovered=True)
+            snap_session = snapshot.get("signal_session")
+            st.session_state.persistent_restore_notice = (
+                f"Recovered best-effort last-good {universe_name} snapshot from "
+                f"{snapshot['timestamp']:%Y-%m-%d %H:%M:%S}"
+                + (f" • signal session {pd.Timestamp(snap_session):%d-%b-%Y}." if snap_session is not None else ".")
+            )
+            st.rerun()
+
+    if st.session_state.persistent_restore_notice:
+        st.info(st.session_state.persistent_restore_notice)
 
     st.info(
         "**Professional Quality Engine:** first applies hard tradeability/data gates, then scores each stock from **0–100**. "
@@ -3764,10 +4180,14 @@ with scanner_tab:
         st.session_state.scan_universe_signature = ""
         st.session_state.scan_signal_session = None
         st.session_state.scan_data_engine_version = ""
+        st.session_state.scan_diagnostics = []
+        st.session_state.persistent_restore_notice = ""
+        st.session_state.persistence_restore_checked[restore_key] = True
         st.rerun()
 
     scan_requested = run_scan or force_refresh_scan
     if scan_requested:
+        request_started_perf = time.perf_counter()
         if universe_df.empty:
             universe_df = refresh_universe(universe_name, watchlist_text)
         if universe_df.empty:
@@ -3784,9 +4204,12 @@ with scanner_tab:
             reuse_ok, cache_age, signal_session, _ = reusable_session_scan(universe_name, universe_df)
 
         if reuse_ok:
+            reuse_elapsed = time.perf_counter() - request_started_perf
+            st.session_state.last_scan_execution_seconds = reuse_elapsed
             st.success(
                 f"Reused current {universe_name} scan: {len(st.session_state.scan_df):,}/{len(universe_df):,} symbols • "
-                f"signal session {pd.Timestamp(signal_session):%d-%b-%Y} • cache age {cache_age:.0f}s. "
+                f"reuse time {format_elapsed_short(reuse_elapsed)} • cached data age {cache_age:.0f}s • "
+                f"signal session {pd.Timestamp(signal_session):%d-%b-%Y}. "
                 "No Yahoo re-download or per-symbol recomputation was needed."
             )
         else:
@@ -3811,34 +4234,66 @@ with scanner_tab:
             status.empty()
 
             st.session_state.provider_health = health
+            st.session_state.scan_diagnostics = list(health.get("diagnostics", []))
             elapsed = time.time() - started
+            st.session_state.last_scan_execution_seconds = elapsed
             current_signature = scan_universe_signature(universe_df)
             current_signal_session = expected_latest_completed_us_session()
+            log_scan_run(
+                universe_name,
+                current_signal_session,
+                len(universe_df),
+                len(results),
+                elapsed,
+                failures,
+                health,
+                st.session_state.scan_diagnostics,
+            )
 
             if health["status"] == "PROVIDER_FAILURE":
                 previous = st.session_state.last_good_scans.get(universe_name)
+                persistent_previous = None
+                if previous is None or previous.get("df", pd.DataFrame()).empty:
+                    candidate_snapshot = load_last_good_snapshot(universe_name)
+                    if (
+                        candidate_snapshot is not None
+                        and candidate_snapshot.get("universe_signature") == current_signature
+                        and candidate_snapshot.get("engine_version") == ENGINE_VERSION
+                    ):
+                        persistent_previous = candidate_snapshot
+                        previous = candidate_snapshot
+
                 st.error(
                     f"🔴 **DATA PROVIDER FAILURE** — {health['message']} "
                     "The failed scan has NOT replaced your last valid results."
                 )
                 if previous is not None and not previous.get("df", pd.DataFrame()).empty:
-                    st.session_state.scan_df = previous["df"].copy()
-                    st.session_state.scan_ranked_df = pd.DataFrame()
-                    st.session_state.scan_ranked_regime_label = ""
-                    st.session_state.scan_ranked_engine_version = ""
-                    st.session_state.scan_universe_name = universe_name
-                    st.session_state.scan_timestamp = previous["timestamp"]
-                    st.session_state.scan_errors = previous.get("failures", [])
-                    st.session_state.scan_universe_signature = previous.get("universe_signature", "")
-                    st.session_state.scan_signal_session = previous.get("signal_session")
-                    st.session_state.scan_data_engine_version = previous.get("engine_version", "")
+                    if persistent_previous is not None:
+                        apply_snapshot_to_session(
+                            universe_name, persistent_previous, recovered=False, preserve_provider_health=True
+                        )
+                        # Keep current failed-provider diagnostics visible rather than replacing
+                        # them with the historical snapshot diagnostics.
+                        st.session_state.scan_diagnostics = list(health.get("diagnostics", []))
+                    else:
+                        st.session_state.scan_df = previous["df"].copy()
+                        st.session_state.scan_ranked_df = pd.DataFrame()
+                        st.session_state.scan_ranked_regime_label = ""
+                        st.session_state.scan_ranked_engine_version = ""
+                        st.session_state.scan_universe_name = universe_name
+                        st.session_state.scan_timestamp = previous["timestamp"]
+                        st.session_state.scan_errors = previous.get("failures", [])
+                        st.session_state.scan_universe_signature = previous.get("universe_signature", "")
+                        st.session_state.scan_signal_session = previous.get("signal_session")
+                        st.session_state.scan_data_engine_version = previous.get("engine_version", "")
+                    source_word = "persisted recovery" if persistent_previous is not None else "in-session"
                     st.warning(
-                        f"Showing the last good {universe_name} scan from "
+                        f"Showing the {source_word} last-good {universe_name} scan from "
                         f"{previous['timestamp'].strftime('%Y-%m-%d %H:%M:%S')} instead."
                     )
                 else:
                     st.warning(
-                        "No last-good scan is available in this session. "
+                        "No compatible last-good recovery snapshot is available. "
                         "Please retry later rather than using an empty/partial scan."
                     )
             else:
@@ -3854,14 +4309,35 @@ with scanner_tab:
                 st.session_state.scan_data_engine_version = ENGINE_VERSION
 
                 if health["status"] == "HEALTHY":
-                    st.session_state.last_good_scans[universe_name] = {
-                        "df": results.copy(),
-                        "timestamp": st.session_state.scan_timestamp,
-                        "failures": list(failures),
-                        "universe_signature": current_signature,
-                        "signal_session": current_signal_session,
-                        "engine_version": ENGINE_VERSION,
-                    }
+                    if persistable_last_good(results, health):
+                        st.session_state.last_good_scans[universe_name] = {
+                            "df": results.copy(),
+                            "timestamp": st.session_state.scan_timestamp,
+                            "failures": list(failures),
+                            "universe_signature": current_signature,
+                            "signal_session": current_signal_session,
+                            "engine_version": ENGINE_VERSION,
+                            "diagnostics": list(st.session_state.scan_diagnostics),
+                        }
+                        saved, persist_message = save_last_good_snapshot(
+                            universe_name,
+                            results,
+                            st.session_state.scan_timestamp,
+                            failures,
+                            current_signature,
+                            current_signal_session,
+                            ENGINE_VERSION,
+                            health,
+                            st.session_state.scan_diagnostics,
+                        )
+                        st.session_state.persistence_last_message = persist_message
+                    else:
+                        st.session_state.persistence_last_message = (
+                            f"Scan completed, but usable coverage did not meet the "
+                            f"{PERSIST_MIN_USABLE_COVERAGE:.0%} last-good promotion threshold; "
+                            "the previous recovery snapshot was preserved."
+                        )
+                    st.session_state.persistence_restore_checked[restore_key] = True
                     st.success(
                         f"Scan complete: {len(results):,}/{len(universe_df):,} symbols analyzed "
                         f"in {elapsed:.0f}s."
@@ -3871,6 +4347,60 @@ with scanner_tab:
                         f"⚠️ Scan completed with degraded coverage: "
                         f"{len(results):,}/{len(universe_df):,} in {elapsed:.0f}s."
                     )
+
+    with st.expander("Provider diagnostics & recovery", expanded=False):
+        live_health = st.session_state.provider_health
+        diag_rows = list(st.session_state.get("scan_diagnostics", []))
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Provider status", live_health.get("status", "UNKNOWN"))
+        coverage = live_health.get("coverage", np.nan)
+        usable_coverage = live_health.get("usable_coverage", np.nan)
+        d2.metric("Raw coverage", "N/A" if pd.isna(coverage) else f"{coverage:.1%}")
+        d3.metric("Usable coverage", "N/A" if pd.isna(usable_coverage) else f"{usable_coverage:.1%}")
+        d4.metric(
+            "Targeted repairs",
+            f"{int(live_health.get('targeted_retry_repaired', 0))}/{int(live_health.get('targeted_retry_symbols', 0))}",
+        )
+        d5.metric("Unresolved", f"{len(live_health.get('unresolved_symbols', [])):,}")
+
+        if diag_rows:
+            diag_df = pd.DataFrame(diag_rows)
+            diag_cols = [
+                "Ticker", "Batch", "Initial Issue", "Recovery Path", "Final State",
+                "Confidence", "Latest Session", "Final Note",
+            ]
+            diag_cols = [c for c in diag_cols if c in diag_df.columns]
+            st.dataframe(diag_df[diag_cols], hide_index=True, use_container_width=True)
+        elif live_health.get("status") in {"HEALTHY", "DEGRADED", "PROVIDER_FAILURE"}:
+            st.success("No symbol-level recovery issue was recorded for the current scan.")
+        else:
+            st.caption("Run a fresh scan to populate symbol-level provider diagnostics.")
+
+        persisted_ok, persisted_message = persistence_status()
+        if persisted_ok:
+            st.caption(
+                "Recovery snapshot store: available (best-effort local SQLite). "
+                "Streamlit Community Cloud does not guarantee persistence of runtime local files, "
+                "so this is a recovery layer rather than a guaranteed external backup."
+            )
+            if st.session_state.persistence_last_message:
+                st.caption(st.session_state.persistence_last_message)
+        else:
+            st.warning(persisted_message)
+
+        run_history = recent_scan_runs(universe_name, limit=5)
+        if not run_history.empty:
+            st.markdown("**Recent fresh-scan runs**")
+            st.dataframe(
+                run_history,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Seconds": st.column_config.NumberColumn(format="%.1f"),
+                    "Coverage": st.column_config.NumberColumn(format="%.3f"),
+                    "Usable Coverage": st.column_config.NumberColumn(format="%.3f"),
+                },
+            )
 
     scan_df = st.session_state.scan_df
     if not scan_df.empty:
