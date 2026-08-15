@@ -1,4 +1,4 @@
-# Quality Engine v7.3 — Phase 2B.2 WORKING (Durable Recovery + Structured Provider Diagnostics)
+# Quality Engine v7.4 — Phase 2C WORKING (Event Verification + Fundamental Metadata Fallbacks)
 
 import base64
 import hashlib
@@ -45,7 +45,7 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.3-P2B.2-WORKING"
+ENGINE_VERSION = "v7.4-P2C-WORKING"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -53,6 +53,9 @@ EARNINGS_HARD_BLOCK_DAYS = 3
 EARNINGS_CAUTION_DAYS = 14
 RECENT_EARNINGS_GRACE_DAYS = 5
 COMPANY_SNAPSHOT_TTL = 30 * 60
+NASDAQ_EARNINGS_CACHE_TTL = 6 * 60 * 60
+SEC_REFERENCE_CACHE_TTL = 24 * 60 * 60
+METADATA_HTTP_TIMEOUT = 12
 
 # Phase 2A market-session / targeted-recovery controls.
 NYSE_CALENDAR_NAME = "XNYS"
@@ -77,6 +80,11 @@ DURABLE_DEFAULT_PREFIX = "scanner_snapshots"
 DURABLE_REQUEST_TIMEOUT = 15
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+NASDAQ_EARNINGS_API = "https://api.nasdaq.com/api/calendar/earnings"
+YAHOO_QUOTE_API = "https://query1.finance.yahoo.com/v7/finance/quote"
+YAHOO_QUOTE_SUMMARY_API = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
 IWM_HOLDINGS_URL = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/latest-holdings.csv"
 SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 NASDAQ100_URL = "https://en.wikipedia.org/wiki/Nasdaq-100"
@@ -910,7 +918,7 @@ def setup_label(row):
 def safe_headers():
     # SEC asks automated clients to identify themselves.
     return {
-        "User-Agent": "SwingMomentumScanner/1.0 research-dashboard contact@example.com",
+        "User-Agent": "tradewithedge SwingMomentumScanner/Phase2C https://github.com/tradewithedge/swing-momentum-scanner",
         "Accept-Encoding": "gzip, deflate",
     }
 
@@ -1205,9 +1213,255 @@ def _split_earnings_dates(values, today=None):
     return (min(future) if future else pd.NaT, max(past) if past else pd.NaT)
 
 
+@st.cache_data(ttl=SEC_REFERENCE_CACHE_TTL, show_spinner=False)
+def load_sec_ticker_reference():
+    """Ticker -> CIK reference used only for fallback metadata / filing verification."""
+    mapping = {}
+    try:
+        response = requests.get(SEC_TICKERS_URL, headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT)
+        response.raise_for_status()
+        payload = response.json()
+        for item in payload.values():
+            ticker = clean_symbol(item.get("ticker", ""))
+            cik = item.get("cik_str")
+            if ticker and cik is not None:
+                mapping[ticker] = str(int(cik)).zfill(10)
+    except Exception:
+        pass
+    return mapping
+
+
+def _provider_number(value):
+    """Extract Yahoo quoteSummary raw numeric values without assuming one response shape."""
+    if isinstance(value, dict):
+        value = value.get("raw", value.get("fmt"))
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else np.nan
+    except Exception:
+        return np.nan
+
+
 @st.cache_data(ttl=COMPANY_SNAPSHOT_TTL, show_spinner=False)
-def get_company_snapshot(symbol):
-    """Cached metadata with explicit fundamental/event confidence and earnings fallbacks."""
+def yahoo_direct_fundamentals(symbol):
+    """Secondary Yahoo HTTP route used only to repair missing yfinance metadata fields."""
+    result = {
+        "sector": "", "industry": "", "market_cap": np.nan,
+        "trailing_pe": np.nan, "forward_pe": np.nan,
+        "route_notes": [],
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; SwingMomentumScanner/Phase2C)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    # Lightweight quote endpoint first.
+    try:
+        response = requests.get(
+            YAHOO_QUOTE_API,
+            params={"symbols": clean_symbol(symbol)},
+            headers=headers,
+            timeout=METADATA_HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        rows = ((response.json().get("quoteResponse") or {}).get("result") or [])
+        if rows:
+            row = rows[0]
+            result["market_cap"] = _provider_number(row.get("marketCap"))
+            result["trailing_pe"] = _provider_number(row.get("trailingPE"))
+            result["forward_pe"] = _provider_number(row.get("forwardPE"))
+            result["route_notes"].append("Yahoo direct quote")
+    except Exception:
+        pass
+
+    # quoteSummary can repair profile fields and valuation fields when available.
+    try:
+        url = YAHOO_QUOTE_SUMMARY_API.format(symbol=requests.utils.quote(clean_symbol(symbol), safe="-"))
+        response = requests.get(
+            url,
+            params={"modules": "assetProfile,summaryDetail,defaultKeyStatistics,price"},
+            headers=headers,
+            timeout=METADATA_HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = (((response.json().get("quoteSummary") or {}).get("result") or [{}])[0]) or {}
+        profile = payload.get("assetProfile") or {}
+        summary = payload.get("summaryDetail") or {}
+        stats = payload.get("defaultKeyStatistics") or {}
+        price = payload.get("price") or {}
+        result["sector"] = str(profile.get("sector", "") or "")
+        result["industry"] = str(profile.get("industry", "") or "")
+        if pd.isna(result["market_cap"]):
+            result["market_cap"] = _provider_number(price.get("marketCap", summary.get("marketCap")))
+        if pd.isna(result["trailing_pe"]):
+            result["trailing_pe"] = _provider_number(summary.get("trailingPE"))
+        if pd.isna(result["forward_pe"]):
+            result["forward_pe"] = _provider_number(summary.get("forwardPE", stats.get("forwardPE")))
+        result["route_notes"].append("Yahoo direct quoteSummary")
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=SEC_REFERENCE_CACHE_TTL, show_spinner=False)
+def sec_company_fallback(symbol):
+    """Independent SEC fallback: SIC industry, shares outstanding, and recent 8-K 2.02 event evidence."""
+    result = {
+        "cik": "", "industry": "", "shares_outstanding": np.nan,
+        "recent_results_date": None, "recent_results_source": "",
+        "foreign_issuer": False,
+    }
+    cik = load_sec_ticker_reference().get(clean_symbol(symbol), "")
+    if not cik:
+        return result
+    result["cik"] = cik
+
+    # Submissions: SIC description + recent 8-K Item 2.02 (results of operations).
+    try:
+        response = requests.get(
+            SEC_SUBMISSIONS_URL.format(cik=cik), headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT
+        )
+        response.raise_for_status()
+        payload = response.json()
+        result["industry"] = str(payload.get("sicDescription", "") or "")
+        recent = ((payload.get("filings") or {}).get("recent") or {})
+        forms = recent.get("form") or []
+        result["foreign_issuer"] = any(str(form or "").upper().startswith(("20-F", "40-F")) for form in forms)
+        dates = recent.get("filingDate") or []
+        items = recent.get("items") or []
+        candidates = []
+        for idx, form in enumerate(forms):
+            form_text = str(form or "").upper()
+            item_text = str(items[idx] if idx < len(items) else "")
+            if form_text.startswith("8-K") and "2.02" in item_text:
+                try:
+                    filing_date = pd.Timestamp(dates[idx]).normalize()
+                    candidates.append(filing_date)
+                except Exception:
+                    pass
+        if candidates:
+            recent_date = max(candidates)
+            if 0 <= (us_market_today() - recent_date).days <= 10:
+                result["recent_results_date"] = recent_date
+                result["recent_results_source"] = "SEC 8-K Item 2.02"
+    except Exception:
+        pass
+
+    # Company facts: latest reported common shares outstanding for market-cap repair.
+    try:
+        response = requests.get(
+            SEC_COMPANYFACTS_URL.format(cik=cik), headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT
+        )
+        response.raise_for_status()
+        facts = response.json().get("facts") or {}
+        candidates = []
+        for taxonomy, concept in [
+            ("dei", "EntityCommonStockSharesOutstanding"),
+            ("us-gaap", "CommonStockSharesOutstanding"),
+        ]:
+            concept_payload = ((facts.get(taxonomy) or {}).get(concept) or {})
+            unit_rows = (concept_payload.get("units") or {}).get("shares") or []
+            for row in unit_rows:
+                value = _provider_number(row.get("val"))
+                if pd.isna(value) or value <= 0:
+                    continue
+                try:
+                    end_date = pd.Timestamp(row.get("end") or row.get("filed")).normalize()
+                except Exception:
+                    end_date = pd.Timestamp("1900-01-01")
+                candidates.append((end_date, value))
+        if candidates:
+            result["shares_outstanding"] = max(candidates, key=lambda x: x[0])[1]
+    except Exception:
+        pass
+    return result
+
+
+@st.cache_data(ttl=NASDAQ_EARNINGS_CACHE_TTL, show_spinner=False)
+def nasdaq_earnings_rows(date_value):
+    """Fetch one Nasdaq earnings-calendar date. Nasdaq states this calendar is Zacks-derived/estimated."""
+    date_text = pd.Timestamp(date_value).strftime("%Y-%m-%d")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.nasdaq.com/market-activity/earnings",
+        "Origin": "https://www.nasdaq.com",
+    }
+    try:
+        response = requests.get(
+            NASDAQ_EARNINGS_API,
+            params={"date": date_text},
+            headers=headers,
+            timeout=METADATA_HTTP_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json().get("data") or {}
+        rows = data.get("rows") or ((data.get("calendar") or {}).get("rows")) or []
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return None
+
+
+def nasdaq_earnings_corroboration(symbol, candidate_date):
+    """Corroborate a Yahoo estimate against Nasdaq/Zacks; never upgrades it to primary-source CONFIRMED."""
+    if candidate_date is None or pd.isna(candidate_date):
+        return {"status": "UNAVAILABLE", "date": None, "time": "", "source": "Nasdaq/Zacks earnings calendar"}
+    candidate = pd.Timestamp(candidate_date).normalize()
+    ticker = clean_symbol(symbol)
+    exact_rows = nasdaq_earnings_rows(candidate)
+    if exact_rows is None:
+        return {"status": "UNAVAILABLE", "date": None, "time": "", "source": "Nasdaq/Zacks earnings calendar"}
+    for row in exact_rows:
+        if clean_symbol(row.get("symbol", "")) == ticker:
+            return {
+                "status": "MATCH", "date": candidate,
+                "time": str(row.get("time", "") or ""),
+                "source": "Nasdaq/Zacks earnings calendar",
+            }
+    # Adjacent-date conflict detection is only worth the extra requests inside the
+    # 14-day decision window. Farther-out dates remain estimates if exact corroboration
+    # is unavailable; this keeps ticker lookup responsive.
+    days_to_event = (candidate - us_market_today()).days
+    if 0 <= days_to_event <= EARNINGS_CAUTION_DAYS:
+        for offset in (-1, 1):
+            other = candidate + pd.Timedelta(days=offset)
+            other_rows = nasdaq_earnings_rows(other)
+            if other_rows is None:
+                continue
+            for row in other_rows:
+                if clean_symbol(row.get("symbol", "")) == ticker:
+                    return {
+                        "status": "CONFLICT", "date": other,
+                        "time": str(row.get("time", "") or ""),
+                        "source": "Nasdaq/Zacks earnings calendar",
+                    }
+    return {"status": "NOT_FOUND", "date": None, "time": "", "source": "Nasdaq/Zacks earnings calendar"}
+
+
+def event_override_for_symbol(symbol):
+    """Optional primary-source override hook via Streamlit Secrets.
+
+    Example TOML:
+      [event_overrides.AMAT]
+      date = "2026-11-12"
+      source = "Applied Materials Investor Relations"
+    Only explicit operator-supplied primary/company evidence is labeled CONFIRMED.
+    """
+    try:
+        root = st.secrets.get("event_overrides", {})
+        entry = root.get(clean_symbol(symbol), {}) if hasattr(root, "get") else {}
+        date_value = entry.get("date") if hasattr(entry, "get") else None
+        source = str(entry.get("source", "") or "") if hasattr(entry, "get") else ""
+        ts = _normalize_event_timestamp(date_value)
+        if pd.notna(ts) and source:
+            return {"date": pd.Timestamp(ts).normalize(), "source": source}
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=COMPANY_SNAPSHOT_TTL, show_spinner=False)
+def get_company_snapshot(symbol, fallback_close=None):
+    """Phase 2C metadata pipeline with provenance, fallback repair and event corroboration."""
     snapshot = {
         "sector": "",
         "industry": "",
@@ -1221,29 +1475,50 @@ def get_company_snapshot(symbol):
         "event_data_confidence": "LOW — UNKNOWN",
         "earnings_certainty": "UNKNOWN",
         "fundamental_data_confidence": "LOW",
+        "fundamental_sources": {},
+        "event_sources": [],
+        "event_conflict": "",
+        "metadata_retrieved_at": datetime.now().isoformat(timespec="seconds"),
     }
+    info = {}
+    ticker = None
     try:
         ticker = yf.Ticker(symbol)
-        info = {}
         try:
             fast = ticker.fast_info
             if fast:
-                snapshot["market_cap"] = fast.get("market_cap", np.nan)
+                value = fast.get("market_cap", np.nan)
+                if pd.notna(value):
+                    snapshot["market_cap"] = value
+                    snapshot["fundamental_sources"]["Market Cap"] = "Yahoo/yfinance fast_info"
         except Exception:
             pass
 
         try:
             info = ticker.info or {}
-            snapshot["sector"] = str(info.get("sector", "") or "")
-            snapshot["industry"] = str(info.get("industry", "") or "")
-            snapshot["trailing_pe"] = info.get("trailingPE", np.nan)
-            snapshot["forward_pe"] = info.get("forwardPE", np.nan)
-            if pd.isna(snapshot["market_cap"]):
-                snapshot["market_cap"] = info.get("marketCap", np.nan)
+            field_map = {
+                "sector": ("sector", "Sector"),
+                "industry": ("industry", "Industry"),
+                "trailing_pe": ("trailingPE", "Trailing P/E"),
+                "forward_pe": ("forwardPE", "Forward P/E"),
+            }
+            for target, (source_key, label) in field_map.items():
+                value = info.get(source_key, "" if target in {"sector", "industry"} else np.nan)
+                if target in {"sector", "industry"}:
+                    value = str(value or "")
+                    if value:
+                        snapshot[target] = value
+                        snapshot["fundamental_sources"][label] = "Yahoo/yfinance info"
+                elif pd.notna(value):
+                    snapshot[target] = value
+                    snapshot["fundamental_sources"][label] = "Yahoo/yfinance info"
+            if pd.isna(snapshot["market_cap"]) and pd.notna(info.get("marketCap", np.nan)):
+                snapshot["market_cap"] = info.get("marketCap")
+                snapshot["fundamental_sources"]["Market Cap"] = "Yahoo/yfinance info"
         except Exception:
             info = {}
 
-        # Route 1: Yahoo calendar. This is normally the cheapest forward-looking route.
+        # Yahoo event routes: useful forward estimates, but not primary-source confirmation.
         calendar_dates = []
         try:
             cal = ticker.calendar
@@ -1265,12 +1540,10 @@ def get_company_snapshot(symbol):
         if pd.notna(next_date):
             snapshot["next_earnings_date"] = next_date
             snapshot["earnings_source"] = "Yahoo calendar"
+            snapshot["event_sources"].append({"Source": "Yahoo calendar", "Date": str(pd.Timestamp(next_date).date()), "Role": "Estimate"})
         if pd.notna(last_date):
             snapshot["last_earnings_date"] = last_date
 
-        # Route 2: use the heavier earnings table only when the calendar did not
-        # produce a forward date. This preserves reliability without paying the
-        # latency cost on every ticker lookup.
         if snapshot["next_earnings_date"] is None:
             try:
                 earnings_dates = ticker.get_earnings_dates(limit=12)
@@ -1284,13 +1557,12 @@ def get_company_snapshot(symbol):
                 if pd.notna(table_next):
                     snapshot["next_earnings_date"] = table_next
                     snapshot["earnings_source"] = "Yahoo earnings dates"
+                    snapshot["event_sources"].append({"Source": "Yahoo earnings dates", "Date": str(pd.Timestamp(table_next).date()), "Role": "Estimate"})
                 if snapshot["last_earnings_date"] is None and pd.notna(table_last):
                     snapshot["last_earnings_date"] = table_last
             except Exception:
                 pass
 
-        # Route 3: timestamp fields exposed through quote metadata. Use only if
-        # the first two routes did not verify a forward date.
         if snapshot["next_earnings_date"] is None:
             try:
                 timestamp_values = [
@@ -1302,42 +1574,127 @@ def get_company_snapshot(symbol):
                 if pd.notna(ts_next):
                     snapshot["next_earnings_date"] = ts_next
                     snapshot["earnings_source"] = "Yahoo quote timestamp"
+                    snapshot["event_sources"].append({"Source": "Yahoo quote timestamp", "Date": str(pd.Timestamp(ts_next).date()), "Role": "Estimate"})
                 if snapshot["last_earnings_date"] is None and pd.notna(ts_last):
                     snapshot["last_earnings_date"] = ts_last
             except Exception:
                 pass
     except Exception:
-        pass
+        ticker = None
 
-    next_date = snapshot.get("next_earnings_date")
-    last_date = snapshot.get("last_earnings_date")
-    today = us_market_today()
-    if next_date is not None and not pd.isna(next_date):
-        snapshot["earnings_date"] = pd.Timestamp(next_date)
-        # Phase 1.3: a future Yahoo date is useful for risk control, but it is not
-        # equivalent to a company/primary-source confirmation. Keep the schema
-        # ready for a future primary-source verifier via earnings_confirmed=True.
-        if bool(snapshot.get("earnings_confirmed", False)):
-            snapshot["earnings_certainty"] = "CONFIRMED"
-            snapshot["event_data_confidence"] = "HIGH — CONFIRMED"
-        else:
-            snapshot["earnings_certainty"] = "ESTIMATED"
-            snapshot["event_data_confidence"] = "MEDIUM — ESTIMATED"
-    elif last_date is not None and not pd.isna(last_date):
-        snapshot["earnings_date"] = pd.Timestamp(last_date)
-        days_since = (today - pd.Timestamp(last_date).normalize()).days
-        # A recent historical report can reduce immediate event ambiguity, but it
-        # does not verify the next quarter's date.
-        snapshot["earnings_certainty"] = "UNKNOWN"
-        snapshot["event_data_confidence"] = (
-            "MEDIUM — NEXT DATE UNKNOWN" if 0 <= days_since <= RECENT_EARNINGS_GRACE_DAYS
-            else "LOW — UNKNOWN"
-        )
-        if not snapshot.get("earnings_source"):
-            snapshot["earnings_source"] = "Yahoo earnings history"
+    # Fundamental repair route 2: direct Yahoo HTTP endpoints, filling only missing fields.
+    needs_yahoo_repair = (
+        not snapshot["sector"] or not snapshot["industry"] or pd.isna(snapshot["market_cap"])
+        or pd.isna(snapshot["trailing_pe"]) or pd.isna(snapshot["forward_pe"])
+    )
+    if needs_yahoo_repair:
+        direct = yahoo_direct_fundamentals(symbol)
+        for key, label in [
+            ("sector", "Sector"), ("industry", "Industry"), ("market_cap", "Market Cap"),
+            ("trailing_pe", "Trailing P/E"), ("forward_pe", "Forward P/E"),
+        ]:
+            missing = (not snapshot[key]) if key in {"sector", "industry"} else pd.isna(snapshot[key])
+            candidate = direct.get(key)
+            candidate_valid = bool(candidate) if key in {"sector", "industry"} else pd.notna(candidate)
+            if missing and candidate_valid:
+                snapshot[key] = candidate
+                snapshot["fundamental_sources"][label] = "Yahoo direct HTTP fallback"
 
-    fundamental_available = 0
-    fundamental_available += bool(snapshot.get("sector"))
+    # Independent SEC fallback is invoked when profile/market-cap metadata is still incomplete,
+    # or when a recent results filing can reduce post-event ambiguity.
+    need_sec_fallback = (
+        not snapshot["industry"]
+        or pd.isna(snapshot["market_cap"])
+        or snapshot.get("next_earnings_date") is None
+    )
+    sec = sec_company_fallback(symbol) if need_sec_fallback else {
+        "industry": "", "shares_outstanding": np.nan,
+        "recent_results_date": None, "recent_results_source": "",
+        "foreign_issuer": False,
+    }
+    if not snapshot["industry"] and sec.get("industry"):
+        snapshot["industry"] = sec["industry"]
+        snapshot["fundamental_sources"]["Industry"] = "SEC SIC description"
+    if pd.isna(snapshot["market_cap"]):
+        shares = sec.get("shares_outstanding", np.nan)
+        try:
+            close_value = float(fallback_close)
+        except Exception:
+            close_value = np.nan
+        if (
+            not bool(sec.get("foreign_issuer", False))
+            and pd.notna(shares) and shares > 0
+            and pd.notna(close_value) and close_value > 0
+        ):
+            snapshot["market_cap"] = float(shares) * close_value
+            snapshot["fundamental_sources"]["Market Cap"] = (
+                "SEC reported shares × completed-session close (fallback estimate)"
+            )
+
+    # Recent SEC 8-K Item 2.02 is primary filing evidence that results were released.
+    if sec.get("recent_results_date") is not None:
+        sec_date = pd.Timestamp(sec["recent_results_date"]).normalize()
+        current_last = snapshot.get("last_earnings_date")
+        if current_last is None or pd.isna(current_last) or abs((pd.Timestamp(current_last).normalize() - sec_date).days) <= 3:
+            snapshot["last_earnings_date"] = sec_date
+            snapshot["event_sources"].append({"Source": sec.get("recent_results_source", "SEC 8-K Item 2.02"), "Date": str(sec_date.date()), "Role": "Primary filing / historical confirmation"})
+
+    # Optional operator-supplied company/IR primary source has highest authority.
+    override = event_override_for_symbol(symbol)
+    if override is not None:
+        override_date = pd.Timestamp(override["date"]).normalize()
+        snapshot["next_earnings_date"] = override_date if override_date >= us_market_today() else snapshot.get("next_earnings_date")
+        if override_date < us_market_today():
+            snapshot["last_earnings_date"] = override_date
+        snapshot["earnings_date"] = override_date
+        snapshot["earnings_source"] = override["source"]
+        snapshot["earnings_certainty"] = "CONFIRMED"
+        snapshot["event_data_confidence"] = "HIGH — CONFIRMED"
+        snapshot["event_sources"].append({"Source": override["source"], "Date": str(override_date.date()), "Role": "Primary/company confirmation"})
+    else:
+        next_date = snapshot.get("next_earnings_date")
+        last_date = snapshot.get("last_earnings_date")
+        today = us_market_today()
+        if next_date is not None and not pd.isna(next_date):
+            next_date = pd.Timestamp(next_date).normalize()
+            snapshot["earnings_date"] = next_date
+            corroboration = nasdaq_earnings_corroboration(symbol, next_date)
+            if corroboration.get("status") == "MATCH":
+                snapshot["earnings_certainty"] = "CORROBORATED"
+                snapshot["event_data_confidence"] = "MEDIUM-HIGH — CORROBORATED"
+                snapshot["earnings_source"] = f"{snapshot.get('earnings_source') or 'Yahoo'} + Nasdaq/Zacks calendar"
+                snapshot["event_sources"].append({
+                    "Source": corroboration["source"], "Date": str(pd.Timestamp(corroboration["date"]).date()),
+                    "Role": "Independent estimate corroboration",
+                })
+            elif corroboration.get("status") == "CONFLICT":
+                other_date = pd.Timestamp(corroboration["date"]).normalize()
+                snapshot["earnings_certainty"] = "CONFLICT"
+                snapshot["event_data_confidence"] = "LOW — SOURCE CONFLICT"
+                snapshot["event_conflict"] = (
+                    f"Yahoo estimate {next_date:%d-%b-%Y} conflicts with Nasdaq/Zacks {other_date:%d-%b-%Y}."
+                )
+                snapshot["event_sources"].append({
+                    "Source": corroboration["source"], "Date": str(other_date.date()), "Role": "Conflicting estimate",
+                })
+            else:
+                snapshot["earnings_certainty"] = "ESTIMATED"
+                snapshot["event_data_confidence"] = "MEDIUM — ESTIMATED"
+        elif last_date is not None and not pd.isna(last_date):
+            last_date = pd.Timestamp(last_date).normalize()
+            snapshot["earnings_date"] = last_date
+            days_since = (today - last_date).days
+            snapshot["earnings_certainty"] = "UNKNOWN"
+            snapshot["event_data_confidence"] = (
+                "MEDIUM — NEXT DATE UNKNOWN" if 0 <= days_since <= RECENT_EARNINGS_GRACE_DAYS
+                else "LOW — UNKNOWN"
+            )
+            if not snapshot.get("earnings_source"):
+                snapshot["earnings_source"] = "Yahoo/SEC earnings history"
+
+    # Confidence measures availability and provenance; missing data never implies the company lacks the field.
+    profile_available = bool(snapshot.get("sector") or snapshot.get("industry"))
+    fundamental_available = int(profile_available)
     fundamental_available += int(pd.notna(snapshot.get("market_cap")))
     fundamental_available += int(pd.notna(snapshot.get("trailing_pe")))
     fundamental_available += int(pd.notna(snapshot.get("forward_pe")))
@@ -1364,8 +1721,9 @@ def evaluate_earnings_event(metadata, today=None):
     legacy_date = metadata.get("earnings_date")
     source = metadata.get("earnings_source", "") or "Unverified"
     certainty = str(metadata.get("earnings_certainty", "UNKNOWN") or "UNKNOWN").upper()
-    if certainty not in {"CONFIRMED", "ESTIMATED", "UNKNOWN"}:
+    if certainty not in {"CONFIRMED", "CORROBORATED", "ESTIMATED", "CONFLICT", "UNKNOWN"}:
         certainty = "UNKNOWN"
+    conflict_detail = str(metadata.get("event_conflict", "") or "")
 
     def _fmt(ts):
         return pd.Timestamp(ts).normalize().strftime("%d-%b-%Y")
@@ -1373,9 +1731,23 @@ def evaluate_earnings_event(metadata, today=None):
     def _confidence_for(cert):
         if cert == "CONFIRMED":
             return "HIGH — CONFIRMED"
+        if cert == "CORROBORATED":
+            return "MEDIUM-HIGH — CORROBORATED"
         if cert == "ESTIMATED":
             return "MEDIUM — ESTIMATED"
+        if cert == "CONFLICT":
+            return "LOW — SOURCE CONFLICT"
         return "LOW — UNKNOWN"
+
+    if certainty == "CONFLICT":
+        return {
+            "text": conflict_detail or "Earnings sources disagree on the next report date",
+            "risk": True, "state": "UNKNOWN", "block": True,
+            "block_reason": (conflict_detail or "Earnings-date sources conflict.")
+                + " New swing entries are blocked until the event date is re-verified.",
+            "event_date": pd.Timestamp(next_date).normalize() if next_date is not None and not pd.isna(next_date) else pd.NaT,
+            "source": source, "confidence": "LOW — SOURCE CONFLICT", "certainty": "CONFLICT",
+        }
 
     if next_date is not None and not pd.isna(next_date):
         event_date = pd.Timestamp(next_date).normalize()
@@ -1391,7 +1763,11 @@ def evaluate_earnings_event(metadata, today=None):
             }
 
         text = f"{_fmt(event_date)} — Today" if days == 0 else f"{_fmt(event_date)} — {days} days away"
-        label = "Confirmed earnings" if certainty == "CONFIRMED" else "Estimated earnings date"
+        label = (
+            "Confirmed earnings" if certainty == "CONFIRMED" else
+            "Corroborated earnings estimate" if certainty == "CORROBORATED" else
+            "Estimated earnings date"
+        )
 
         if days <= EARNINGS_HARD_BLOCK_DAYS:
             return {
@@ -3650,6 +4026,10 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Earnings Certainty": earnings_certainty,
         "Event Data Confidence": event_data_confidence,
         "Fundamental Data Confidence": fundamental_data_confidence,
+        "Fundamental Sources": metadata.get("fundamental_sources", {}),
+        "Event Sources": metadata.get("event_sources", []),
+        "Event Conflict": metadata.get("event_conflict", ""),
+        "Metadata Retrieved At": metadata.get("metadata_retrieved_at", ""),
         "Directional Alignment": aligned_direction,
         "Directional Alignment Reason": alignment_reason,
         "Entry Quality": entry_quality, "Bias": bias, "Verdict": verdict,
@@ -3731,7 +4111,12 @@ with ticker_tab:
 
         with st.spinner(f"Analyzing {selected_ticker}..."):
             df = download_one(selected_ticker, "5y")
-            metadata = get_company_snapshot(selected_ticker)
+            completed_for_meta = completed_session_frame(df)
+            fallback_close = (
+                float(completed_for_meta["Close"].iloc[-1])
+                if not completed_for_meta.empty and "Close" in completed_for_meta.columns else np.nan
+            )
+            metadata = get_company_snapshot(selected_ticker, fallback_close)
             diag = compute_search_diagnostic(selected_ticker, selected_company, df, metadata)
 
         if diag is None or not diag.get("Data Valid", False):
@@ -3953,13 +4338,20 @@ with ticker_tab:
             event_state = diag.get("Earnings Risk State", "UNKNOWN")
             source_text = diag.get("Earnings Source", "Unverified")
             event_certainty = diag.get("Earnings Certainty", "UNKNOWN")
+            certainty_display = {
+                "CONFIRMED": "Confirmed",
+                "CORROBORATED": "Corroborated estimate",
+                "ESTIMATED": "Estimated",
+                "CONFLICT": "Conflicting sources",
+                "UNKNOWN": "Unverified",
+            }.get(event_certainty, event_certainty.title())
             if event_state == "UNKNOWN":
                 st.error(
                     f"🔴 **Earnings timing UNKNOWN** — {diag['Earnings']}. "
                     "Unknown event risk is not treated as safe; actionable trade plans are blocked until the event is verified."
                 )
             elif event_state == "HIGH":
-                certainty_text = "Confirmed" if event_certainty == "CONFIRMED" else "Estimated"
+                certainty_text = certainty_display
                 st.warning(
                     f"⚠️ **Earnings danger window** — {diag['Earnings']}. "
                     f"Certainty: **{event_certainty}** • Source: {source_text}. "
@@ -3977,7 +4369,7 @@ with ticker_tab:
                     "Recent post-earnings volatility may remain elevated; the next event date is not yet verified."
                 )
             else:
-                qualifier = "Confirmed" if event_certainty == "CONFIRMED" else "Estimated" if event_certainty == "ESTIMATED" else "Unverified"
+                qualifier = certainty_display
                 st.info(f"{qualifier} earnings date: {diag['Earnings']}. Source: {source_text}.")
 
             st.markdown("### Decision Summary")
@@ -4393,6 +4785,29 @@ with ticker_tab:
                 f1.metric("Market Cap", "N/A" if pd.isna(mc) else f"${mc/1e9:,.1f}B")
                 f2.metric("Trailing P/E", "N/A" if pd.isna(diag["Trailing PE"]) else f"{diag['Trailing PE']:.1f}")
                 f3.metric("Forward P/E", "N/A" if pd.isna(diag["Forward PE"]) else f"{diag['Forward PE']:.1f}")
+
+
+                fundamental_sources = diag.get("Fundamental Sources", {}) or {}
+                event_sources = diag.get("Event Sources", []) or []
+                provenance_rows = []
+                for field, source_name in fundamental_sources.items():
+                    provenance_rows.append({"Field": field, "Source": source_name, "Role": "Fundamental metadata"})
+                for row in event_sources:
+                    if isinstance(row, dict):
+                        provenance_rows.append({
+                            "Field": "Earnings date",
+                            "Source": row.get("Source", ""),
+                            "Role": row.get("Role", "Event evidence") + (f" • {row.get('Date')}" if row.get("Date") else ""),
+                        })
+                if provenance_rows:
+                    st.markdown("**Metadata provenance**")
+                    st.dataframe(pd.DataFrame(provenance_rows), hide_index=True, use_container_width=True)
+                else:
+                    st.caption("Metadata provenance is unavailable for this lookup.")
+                if diag.get("Metadata Retrieved At"):
+                    st.caption(f"Metadata retrieved: {diag['Metadata Retrieved At']} (app/server clock).")
+                if diag.get("Event Conflict"):
+                    st.error(f"Event-source conflict: {diag['Event Conflict']}")
 
 
             st.caption(
