@@ -1,4 +1,4 @@
-# Quality Engine v7.4 — Phase 2C WORKING (Event Verification + Fundamental Metadata Fallbacks)
+# Quality Engine v7.4.1 — Phase 2C FINAL-CANDIDATE (Event/Fundamental Reliability Semantics)
 
 import base64
 import hashlib
@@ -45,7 +45,7 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
-ENGINE_VERSION = "v7.4-P2C-WORKING"
+ENGINE_VERSION = "v7.4.1-P2C-FINAL-CANDIDATE"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -1247,7 +1247,7 @@ def yahoo_direct_fundamentals(symbol):
     """Secondary Yahoo HTTP route used only to repair missing yfinance metadata fields."""
     result = {
         "sector": "", "industry": "", "market_cap": np.nan,
-        "trailing_pe": np.nan, "forward_pe": np.nan,
+        "trailing_pe": np.nan, "forward_pe": np.nan, "trailing_eps": np.nan,
         "route_notes": [],
     }
     headers = {
@@ -1269,6 +1269,7 @@ def yahoo_direct_fundamentals(symbol):
             result["market_cap"] = _provider_number(row.get("marketCap"))
             result["trailing_pe"] = _provider_number(row.get("trailingPE"))
             result["forward_pe"] = _provider_number(row.get("forwardPE"))
+            result["trailing_eps"] = _provider_number(row.get("epsTrailingTwelveMonths"))
             result["route_notes"].append("Yahoo direct quote")
     except Exception:
         pass
@@ -1296,6 +1297,8 @@ def yahoo_direct_fundamentals(symbol):
             result["trailing_pe"] = _provider_number(summary.get("trailingPE"))
         if pd.isna(result["forward_pe"]):
             result["forward_pe"] = _provider_number(summary.get("forwardPE", stats.get("forwardPE")))
+        if pd.isna(result["trailing_eps"]):
+            result["trailing_eps"] = _provider_number(stats.get("trailingEps"))
         result["route_notes"].append("Yahoo direct quoteSummary")
     except Exception:
         pass
@@ -1476,9 +1479,15 @@ def get_company_snapshot(symbol, fallback_close=None):
         "earnings_certainty": "UNKNOWN",
         "fundamental_data_confidence": "LOW",
         "fundamental_sources": {},
+        "fundamental_field_status": {},
+        "fundamental_field_notes": {},
+        "trailing_eps": np.nan,
         "event_sources": [],
         "event_conflict": "",
-        "metadata_retrieved_at": datetime.now().isoformat(timespec="seconds"),
+        "event_window_start": None,
+        "event_window_end": None,
+        "event_window_note": "",
+        "metadata_retrieved_at": pd.Timestamp.now(tz="America/New_York").strftime("%Y-%m-%d %H:%M:%S %Z"),
     }
     info = {}
     ticker = None
@@ -1515,6 +1524,9 @@ def get_company_snapshot(symbol, fallback_close=None):
             if pd.isna(snapshot["market_cap"]) and pd.notna(info.get("marketCap", np.nan)):
                 snapshot["market_cap"] = info.get("marketCap")
                 snapshot["fundamental_sources"]["Market Cap"] = "Yahoo/yfinance info"
+            trailing_eps = _provider_number(info.get("trailingEps"))
+            if pd.notna(trailing_eps):
+                snapshot["trailing_eps"] = trailing_eps
         except Exception:
             info = {}
 
@@ -1599,6 +1611,8 @@ def get_company_snapshot(symbol, fallback_close=None):
             if missing and candidate_valid:
                 snapshot[key] = candidate
                 snapshot["fundamental_sources"][label] = "Yahoo direct HTTP fallback"
+        if pd.isna(snapshot.get("trailing_eps", np.nan)) and pd.notna(direct.get("trailing_eps", np.nan)):
+            snapshot["trailing_eps"] = direct.get("trailing_eps")
 
     # Independent SEC fallback is invoked when profile/market-cap metadata is still incomplete,
     # or when a recent results filing can reduce post-event ambiguity.
@@ -1669,14 +1683,32 @@ def get_company_snapshot(symbol, fallback_close=None):
                 })
             elif corroboration.get("status") == "CONFLICT":
                 other_date = pd.Timestamp(corroboration["date"]).normalize()
-                snapshot["earnings_certainty"] = "CONFLICT"
-                snapshot["event_data_confidence"] = "LOW — SOURCE CONFLICT"
-                snapshot["event_conflict"] = (
-                    f"Yahoo estimate {next_date:%d-%b-%Y} conflicts with Nasdaq/Zacks {other_date:%d-%b-%Y}."
-                )
-                snapshot["event_sources"].append({
-                    "Source": corroboration["source"], "Date": str(other_date.date()), "Role": "Conflicting estimate",
-                })
+                gap_days = abs((other_date - next_date).days)
+                if gap_days <= 1:
+                    window_start = min(next_date, other_date)
+                    window_end = max(next_date, other_date)
+                    snapshot["earnings_certainty"] = "ESTIMATE_WINDOW"
+                    snapshot["event_data_confidence"] = "MEDIUM — ESTIMATE WINDOW"
+                    snapshot["event_window_start"] = window_start
+                    snapshot["event_window_end"] = window_end
+                    snapshot["event_window_note"] = (
+                        f"Independent estimate sources differ by {gap_days} day: "
+                        f"expected earnings window {window_start:%d-%b-%Y} to {window_end:%d-%b-%Y}. "
+                        "The company has not yet confirmed the exact date."
+                    )
+                    snapshot["earnings_source"] = f"{snapshot.get('earnings_source') or 'Yahoo'} + Nasdaq/Zacks calendar"
+                    snapshot["event_sources"].append({
+                        "Source": corroboration["source"], "Date": str(other_date.date()), "Role": "Adjacent independent estimate",
+                    })
+                else:
+                    snapshot["earnings_certainty"] = "CONFLICT"
+                    snapshot["event_data_confidence"] = "LOW — SOURCE CONFLICT"
+                    snapshot["event_conflict"] = (
+                        f"Yahoo estimate {next_date:%d-%b-%Y} conflicts with Nasdaq/Zacks {other_date:%d-%b-%Y}."
+                    )
+                    snapshot["event_sources"].append({
+                        "Source": corroboration["source"], "Date": str(other_date.date()), "Role": "Conflicting estimate",
+                    })
             else:
                 snapshot["earnings_certainty"] = "ESTIMATED"
                 snapshot["event_data_confidence"] = "MEDIUM — ESTIMATED"
@@ -1692,14 +1724,33 @@ def get_company_snapshot(symbol, fallback_close=None):
             if not snapshot.get("earnings_source"):
                 snapshot["earnings_source"] = "Yahoo/SEC earnings history"
 
-    # Confidence measures availability and provenance; missing data never implies the company lacks the field.
-    profile_available = bool(snapshot.get("sector") or snapshot.get("industry"))
-    fundamental_available = int(profile_available)
-    fundamental_available += int(pd.notna(snapshot.get("market_cap")))
-    fundamental_available += int(pd.notna(snapshot.get("trailing_pe")))
-    fundamental_available += int(pd.notna(snapshot.get("forward_pe")))
+    # Phase 2C finishing semantics: distinguish AVAILABLE, NOT_MEANINGFUL and UNRESOLVED.
+    # A valuation multiple can be legitimately N/M (for example, trailing P/E when TTM EPS <= 0);
+    # that is not a provider/data-quality failure and should not reduce confidence by itself.
+    statuses = {
+        "Sector": "AVAILABLE" if bool(snapshot.get("sector")) else "UNRESOLVED",
+        "Industry": "AVAILABLE" if bool(snapshot.get("industry")) else "UNRESOLVED",
+        "Market Cap": "AVAILABLE" if pd.notna(snapshot.get("market_cap")) else "UNRESOLVED",
+        "Trailing P/E": "AVAILABLE" if pd.notna(snapshot.get("trailing_pe")) else "UNRESOLVED",
+        "Forward P/E": "AVAILABLE" if pd.notna(snapshot.get("forward_pe")) else "UNRESOLVED",
+    }
+    notes = {}
+    trailing_eps = snapshot.get("trailing_eps", np.nan)
+    if statuses["Trailing P/E"] == "UNRESOLVED" and pd.notna(trailing_eps) and float(trailing_eps) <= 0:
+        statuses["Trailing P/E"] = "NOT_MEANINGFUL"
+        notes["Trailing P/E"] = f"N/M — trailing EPS is {float(trailing_eps):.2f}; a positive trailing P/E is not meaningful."
+        snapshot["fundamental_sources"].setdefault("Trailing P/E", "Yahoo earnings/valuation data")
+
+    snapshot["fundamental_field_status"] = statuses
+    snapshot["fundamental_field_notes"] = notes
+
+    profile_resolved = statuses["Sector"] == "AVAILABLE" or statuses["Industry"] == "AVAILABLE"
+    fundamental_resolved = int(profile_resolved)
+    fundamental_resolved += int(statuses["Market Cap"] == "AVAILABLE")
+    fundamental_resolved += int(statuses["Trailing P/E"] in {"AVAILABLE", "NOT_MEANINGFUL"})
+    fundamental_resolved += int(statuses["Forward P/E"] == "AVAILABLE")
     snapshot["fundamental_data_confidence"] = (
-        "HIGH" if fundamental_available >= 3 else "MEDIUM" if fundamental_available >= 1 else "LOW"
+        "HIGH" if fundamental_resolved >= 3 else "MEDIUM" if fundamental_resolved >= 1 else "LOW"
     )
     return snapshot
 
@@ -1709,8 +1760,9 @@ def evaluate_earnings_event(metadata, today=None):
 
     Phase 1.3 separates *date availability* from *date certainty*:
       CONFIRMED = explicitly verified by a primary/company source or override.
-      ESTIMATED = provider-supplied future date (Yahoo routes in this build).
-      UNKNOWN   = no usable next event date.
+      ESTIMATED       = provider-supplied future date (Yahoo routes in this build).
+      ESTIMATE_WINDOW = adjacent independent estimates disagree by one day; exact timing unconfirmed.
+      UNKNOWN         = no usable next event date.
 
     Estimated dates still protect the account: if an estimate falls inside the
     hard danger window, the engine blocks new swing entries conservatively.
@@ -1721,7 +1773,7 @@ def evaluate_earnings_event(metadata, today=None):
     legacy_date = metadata.get("earnings_date")
     source = metadata.get("earnings_source", "") or "Unverified"
     certainty = str(metadata.get("earnings_certainty", "UNKNOWN") or "UNKNOWN").upper()
-    if certainty not in {"CONFIRMED", "CORROBORATED", "ESTIMATED", "CONFLICT", "UNKNOWN"}:
+    if certainty not in {"CONFIRMED", "CORROBORATED", "ESTIMATED", "ESTIMATE_WINDOW", "CONFLICT", "UNKNOWN"}:
         certainty = "UNKNOWN"
     conflict_detail = str(metadata.get("event_conflict", "") or "")
 
@@ -1735,9 +1787,38 @@ def evaluate_earnings_event(metadata, today=None):
             return "MEDIUM-HIGH — CORROBORATED"
         if cert == "ESTIMATED":
             return "MEDIUM — ESTIMATED"
+        if cert == "ESTIMATE_WINDOW":
+            return "MEDIUM — ESTIMATE WINDOW"
         if cert == "CONFLICT":
             return "LOW — SOURCE CONFLICT"
         return "LOW — UNKNOWN"
+
+
+    if certainty == "ESTIMATE_WINDOW":
+        start = metadata.get("event_window_start")
+        end = metadata.get("event_window_end")
+        if start is None or pd.isna(start):
+            start = next_date
+        if end is None or pd.isna(end):
+            end = next_date
+        start = pd.Timestamp(start).normalize() if start is not None and not pd.isna(start) else pd.NaT
+        end = pd.Timestamp(end).normalize() if end is not None and not pd.isna(end) else pd.NaT
+        if pd.notna(start) and pd.notna(end):
+            earliest_days = (start - market_day).days
+            latest_days = (end - market_day).days
+            day_text = (
+                f"{earliest_days}–{latest_days} days away" if earliest_days != latest_days
+                else ("Today" if earliest_days == 0 else f"{earliest_days} days away")
+            )
+            window_text = f"{_fmt(start)} to {_fmt(end)} — {day_text}"
+            note = str(metadata.get("event_window_note", "") or "")
+            return {
+                "text": window_text, "risk": True, "state": "WINDOW", "block": True,
+                "block_reason": (note + " " if note else "")
+                    + "New swing entries are blocked until the exact event timing is sufficiently verified.",
+                "event_date": start, "source": source,
+                "confidence": "MEDIUM — ESTIMATE WINDOW", "certainty": "ESTIMATE_WINDOW",
+            }
 
     if certainty == "CONFLICT":
         return {
@@ -3891,7 +3972,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         stop_pct=stop_pct,
         event_block=earnings_event_block,
         event_reason=earnings_event_block_reason,
-        event_unknown=earnings_risk_state == "UNKNOWN",
+        event_unknown=earnings_risk_state in {"UNKNOWN", "WINDOW"},
         structure_reason=alignment_reason,
     )
     # Preserve the independent price/risk geometry assessment even when candidate
@@ -4027,8 +4108,11 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Event Data Confidence": event_data_confidence,
         "Fundamental Data Confidence": fundamental_data_confidence,
         "Fundamental Sources": metadata.get("fundamental_sources", {}),
+        "Fundamental Field Status": metadata.get("fundamental_field_status", {}),
+        "Fundamental Field Notes": metadata.get("fundamental_field_notes", {}),
         "Event Sources": metadata.get("event_sources", []),
         "Event Conflict": metadata.get("event_conflict", ""),
+        "Event Window Note": metadata.get("event_window_note", ""),
         "Metadata Retrieved At": metadata.get("metadata_retrieved_at", ""),
         "Directional Alignment": aligned_direction,
         "Directional Alignment Reason": alignment_reason,
@@ -4312,24 +4396,27 @@ with ticker_tab:
             else:
                 st.success(f"**Trade interpretation:** {diag['Trade Comment']}")
 
-            # Explain missing metadata rather than implying N/A is a company characteristic.
+            # Explain unresolved metadata without misclassifying economically non-meaningful metrics as provider failures.
+            field_status = diag.get("Fundamental Field Status", {}) or {}
+            field_notes = diag.get("Fundamental Field Notes", {}) or {}
             missing_meta = []
-            if diag["Sector"] == "N/A":
-                missing_meta.append("sector")
-            if pd.isna(diag["Market Cap"]):
-                missing_meta.append("market cap")
-            if pd.isna(diag["Trailing PE"]):
-                missing_meta.append("trailing P/E")
-            if pd.isna(diag["Forward PE"]):
-                missing_meta.append("forward P/E")
+            for field_name, display_name in [
+                ("Sector", "sector"), ("Industry", "industry"), ("Market Cap", "market cap"),
+                ("Trailing P/E", "trailing P/E"), ("Forward P/E", "forward P/E"),
+            ]:
+                if field_status.get(field_name, "UNRESOLVED") == "UNRESOLVED":
+                    missing_meta.append(display_name)
             if str(diag["Event Data Confidence"]).startswith("LOW"):
                 missing_meta.append("verified earnings date")
             if missing_meta:
                 st.warning(
-                    "Some fundamental/event metadata could not be fully retrieved: "
+                    "Some fundamental/event metadata remains unresolved: "
                     + ", ".join(missing_meta)
-                    + ". This is a data-availability issue, not an indication that the company has no such data."
+                    + ". This is a data-availability issue, not an indication that the company lacks the underlying information."
                 )
+            nm_notes = [note for field, note in field_notes.items() if field_status.get(field) == "NOT_MEANINGFUL" and note]
+            if nm_notes:
+                st.info(" • ".join(nm_notes) + " This is not a data-quality failure.")
 
             md1, md2 = st.columns(2)
             md1.metric("Fundamental Data Confidence", diag["Fundamental Data Confidence"])
@@ -4342,10 +4429,17 @@ with ticker_tab:
                 "CONFIRMED": "Confirmed",
                 "CORROBORATED": "Corroborated estimate",
                 "ESTIMATED": "Estimated",
+                "ESTIMATE_WINDOW": "Estimated date window",
                 "CONFLICT": "Conflicting sources",
                 "UNKNOWN": "Unverified",
             }.get(event_certainty, event_certainty.title())
-            if event_state == "UNKNOWN":
+            if event_state == "WINDOW":
+                st.warning(
+                    f"⚠️ **Earnings estimate window** — {diag['Earnings']}. "
+                    f"Source: {source_text}. The company has not yet confirmed the exact date; "
+                    "new swing entries remain blocked until timing is sufficiently verified."
+                )
+            elif event_state == "UNKNOWN":
                 st.error(
                     f"🔴 **Earnings timing UNKNOWN** — {diag['Earnings']}. "
                     "Unknown event risk is not treated as safe; actionable trade plans are blocked until the event is verified."
@@ -4782,16 +4876,35 @@ with ticker_tab:
             with st.expander("Fundamental snapshot", expanded=False):
                 f1, f2, f3 = st.columns(3)
                 mc = diag["Market Cap"]
+                field_status = diag.get("Fundamental Field Status", {}) or {}
+                field_notes = diag.get("Fundamental Field Notes", {}) or {}
+                trailing_pe_display = (
+                    "N/M" if field_status.get("Trailing P/E") == "NOT_MEANINGFUL"
+                    else ("N/A" if pd.isna(diag["Trailing PE"]) else f"{diag['Trailing PE']:.1f}")
+                )
                 f1.metric("Market Cap", "N/A" if pd.isna(mc) else f"${mc/1e9:,.1f}B")
-                f2.metric("Trailing P/E", "N/A" if pd.isna(diag["Trailing PE"]) else f"{diag['Trailing PE']:.1f}")
+                f2.metric("Trailing P/E", trailing_pe_display)
                 f3.metric("Forward P/E", "N/A" if pd.isna(diag["Forward PE"]) else f"{diag['Forward PE']:.1f}")
 
 
                 fundamental_sources = diag.get("Fundamental Sources", {}) or {}
                 event_sources = diag.get("Event Sources", []) or []
                 provenance_rows = []
-                for field, source_name in fundamental_sources.items():
-                    provenance_rows.append({"Field": field, "Source": source_name, "Role": "Fundamental metadata"})
+                fundamental_order = ["Sector", "Industry", "Market Cap", "Trailing P/E", "Forward P/E"]
+                for field in fundamental_order:
+                    status = field_status.get(field, "UNRESOLVED")
+                    source_name = fundamental_sources.get(field, "")
+                    if status == "AVAILABLE":
+                        role = "Available fundamental metadata"
+                    elif status == "NOT_MEANINGFUL":
+                        role = field_notes.get(field, "Not meaningful for the current earnings profile")
+                    else:
+                        role = "Unresolved after configured retrieval/fallback routes"
+                    provenance_rows.append({
+                        "Field": field,
+                        "Source": source_name or ("No verified source" if status == "UNRESOLVED" else "Derived semantic classification"),
+                        "Role": role,
+                    })
                 for row in event_sources:
                     if isinstance(row, dict):
                         provenance_rows.append({
@@ -4805,7 +4918,9 @@ with ticker_tab:
                 else:
                     st.caption("Metadata provenance is unavailable for this lookup.")
                 if diag.get("Metadata Retrieved At"):
-                    st.caption(f"Metadata retrieved: {diag['Metadata Retrieved At']} (app/server clock).")
+                    st.caption(f"Metadata retrieved (ET): {diag['Metadata Retrieved At']}.")
+                if diag.get("Event Window Note"):
+                    st.warning(f"Event estimate window: {diag['Event Window Note']}")
                 if diag.get("Event Conflict"):
                     st.error(f"Event-source conflict: {diag['Event Conflict']}")
 
