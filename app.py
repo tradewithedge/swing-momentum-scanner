@@ -1,4 +1,4 @@
-# Quality Engine v7.4.5 — Phase 2C FREEZE (Event/Fundamental Reliability)
+# Quality Engine v7.5.0 — Phase 2D.1 WORKING (Transport Hardening & Observability)
 
 import base64
 import hashlib
@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+from requests.adapters import HTTPAdapter
 import streamlit as st
 import yfinance as yf
 
@@ -47,7 +48,11 @@ SCAN_CACHE_TTL = 15 * 60
 SCAN_RESULT_REUSE_TTL = 15 * 60
 UNIVERSE_CACHE_TTL = 6 * 60 * 60
 DIRECTORY_CACHE_TTL = 24 * 60 * 60
+# ENGINE_VERSION is the data/scoring compatibility key used by persisted scan snapshots.
+# Phase 2D.1 changes transport/observability only, so it deliberately remains at the
+# Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
+APP_BUILD_VERSION = "v7.5.0-P2D1-TRANSPORT-OBSERVABILITY"
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -58,6 +63,19 @@ COMPANY_SNAPSHOT_TTL = 30 * 60
 NASDAQ_EARNINGS_CACHE_TTL = 6 * 60 * 60
 SEC_REFERENCE_CACHE_TTL = 24 * 60 * 60
 METADATA_HTTP_TIMEOUT = 12
+
+# Phase 2D.1 direct-HTTP transport controls. These affect only explicit requests
+# made by this app. yfinance maintains its own transport and is measured separately.
+HTTP_CONNECT_TIMEOUT = 3
+HTTP_DEFAULT_READ_TIMEOUT = 12
+HTTP_MAX_READ_RETRIES = 1
+HTTP_BACKOFF_BASE_SECONDS = 0.35
+HTTP_MAX_BACKOFF_SECONDS = 2.0
+HTTP_POOL_CONNECTIONS = 16
+HTTP_POOL_MAXSIZE = 32
+HTTP_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+PROVIDER_TELEMETRY_MAX_EVENTS = 120
+PROVIDER_TELEMETRY_WINDOW = 20
 
 # Phase 2A market-session / targeted-recovery controls.
 NYSE_CALENDAR_NAME = "XNYS"
@@ -143,6 +161,8 @@ if "durable_persistence_last_message" not in st.session_state:
     st.session_state.durable_persistence_last_message = ""
 if "persistence_restore_source" not in st.session_state:
     st.session_state.persistence_restore_source = ""
+if "provider_transport_events" not in st.session_state:
+    st.session_state.provider_transport_events = []
 
 # ---------------------------
 # Helpers
@@ -166,6 +186,203 @@ def _json_default(value):
     if isinstance(value, Path):
         return str(value)
     return str(value)
+
+
+def shared_http_session():
+    """Reuse TCP/TLS connections within one Streamlit user session.
+
+    Keeping the Session in st.session_state avoids sharing a mutable requests.Session
+    across concurrent app users. Automatic adapter retries are disabled: retry policy
+    lives in http_request() so attempts are bounded, observable and disabled for writes.
+    """
+    key = "_phase2d_http_session"
+    session = st.session_state.get(key)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=HTTP_POOL_CONNECTIONS,
+            pool_maxsize=HTTP_POOL_MAXSIZE,
+            max_retries=0,
+            pool_block=False,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        st.session_state[key] = session
+    return session
+
+
+def _record_provider_transport_event(provider, success, elapsed_ms, status_code=None,
+                                     retries=0, error="", route="", note=""):
+    """Record one logical provider call for session-scoped observability."""
+    try:
+        events = st.session_state.setdefault("provider_transport_events", [])
+        events.append({
+            "Provider": str(provider or "Unknown"),
+            "Success": bool(success),
+            "Latency ms": float(elapsed_ms) if pd.notna(elapsed_ms) else np.nan,
+            "HTTP Status": status_code if status_code is not None else "",
+            "Retries": int(retries or 0),
+            "Error": str(error or ""),
+            "Route": str(route or ""),
+            "Note": str(note or ""),
+            "Time ET": pd.Timestamp.now(tz="America/New_York").strftime("%H:%M:%S"),
+        })
+        if len(events) > PROVIDER_TELEMETRY_MAX_EVENTS:
+            del events[:-PROVIDER_TELEMETRY_MAX_EVENTS]
+    except Exception:
+        # Telemetry must never break trading/data logic.
+        pass
+
+
+def _retry_delay_seconds(response, attempt_index):
+    retry_after = None
+    try:
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        if retry_after is not None:
+            retry_after = float(retry_after)
+    except Exception:
+        retry_after = None
+    if retry_after is not None and np.isfinite(retry_after) and retry_after >= 0:
+        return min(float(retry_after), HTTP_MAX_BACKOFF_SECONDS)
+    delay = HTTP_BACKOFF_BASE_SECONDS * (2 ** max(0, int(attempt_index)))
+    return min(delay, HTTP_MAX_BACKOFF_SECONDS)
+
+
+def http_request(provider, method, url, *, timeout=None, max_retries=None,
+                 expected_statuses=None, retry_statuses=None, route="", **kwargs):
+    """Bounded, observable request wrapper for app-owned HTTP traffic.
+
+    Read operations retry transient network errors and 429/5xx responses at most
+    HTTP_MAX_READ_RETRIES times. Writes never auto-retry because application-level
+    optimistic-concurrency logic already handles GitHub snapshot writes safely.
+    """
+    method = str(method or "GET").upper()
+    is_read = method in {"GET", "HEAD", "OPTIONS"}
+    retries_allowed = HTTP_MAX_READ_RETRIES if max_retries is None and is_read else int(max_retries or 0)
+    retry_codes = set(HTTP_RETRY_STATUS_CODES if retry_statuses is None else retry_statuses)
+
+    if timeout is None:
+        request_timeout = (HTTP_CONNECT_TIMEOUT, HTTP_DEFAULT_READ_TIMEOUT)
+    elif isinstance(timeout, (tuple, list)) and len(timeout) == 2:
+        request_timeout = tuple(timeout)
+    else:
+        request_timeout = (HTTP_CONNECT_TIMEOUT, float(timeout))
+
+    started_total = time.perf_counter()
+    last_error = ""
+    response = None
+    attempts = 0
+    for attempt in range(retries_allowed + 1):
+        attempts = attempt + 1
+        try:
+            response = shared_http_session().request(
+                method, url, timeout=request_timeout, **kwargs
+            )
+            if response.status_code in retry_codes and attempt < retries_allowed:
+                time.sleep(_retry_delay_seconds(response, attempt))
+                continue
+
+            if expected_statuses is None:
+                success = 200 <= int(response.status_code) < 400
+            else:
+                success = int(response.status_code) in set(expected_statuses)
+            elapsed_ms = (time.perf_counter() - started_total) * 1000.0
+            _record_provider_transport_event(
+                provider, success, elapsed_ms, status_code=response.status_code,
+                retries=max(0, attempts - 1), route=route,
+                error="" if success else f"HTTP {response.status_code}",
+            )
+            return response
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < retries_allowed:
+                time.sleep(_retry_delay_seconds(None, attempt))
+                continue
+            elapsed_ms = (time.perf_counter() - started_total) * 1000.0
+            _record_provider_transport_event(
+                provider, False, elapsed_ms, status_code="", retries=max(0, attempts - 1),
+                route=route, error=last_error,
+            )
+            raise
+        except requests.RequestException as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            elapsed_ms = (time.perf_counter() - started_total) * 1000.0
+            _record_provider_transport_event(
+                provider, False, elapsed_ms, status_code="", retries=max(0, attempts - 1),
+                route=route, error=last_error,
+            )
+            raise
+
+    elapsed_ms = (time.perf_counter() - started_total) * 1000.0
+    _record_provider_transport_event(
+        provider, False, elapsed_ms, status_code=getattr(response, "status_code", ""),
+        retries=max(0, attempts - 1), route=route, error=last_error or "Unknown HTTP failure",
+    )
+    return response
+
+
+def http_get(provider, url, **kwargs):
+    return http_request(provider, "GET", url, **kwargs)
+
+
+def transport_telemetry_summary():
+    """Summarize recent logical calls by provider without mixing them with data quality."""
+    events = list(st.session_state.get("provider_transport_events", []))
+    if not events:
+        return pd.DataFrame()
+    rows = []
+    providers = []
+    for event in events:
+        provider = str(event.get("Provider", "Unknown"))
+        if provider not in providers:
+            providers.append(provider)
+    for provider in providers:
+        subset = [e for e in events if str(e.get("Provider")) == provider][-PROVIDER_TELEMETRY_WINDOW:]
+        calls = len(subset)
+        successes = sum(bool(e.get("Success", False)) for e in subset)
+        retries = sum(int(e.get("Retries", 0) or 0) for e in subset)
+        latencies = [float(e.get("Latency ms")) for e in subset if pd.notna(e.get("Latency ms", np.nan))]
+        success_rate = successes / calls if calls else np.nan
+        last = subset[-1] if subset else {}
+        recent_retry_calls = sum(1 for e in subset if int(e.get("Retries", 0) or 0) > 0)
+        if calls == 0:
+            health = "UNKNOWN"
+        elif success_rate < 0.50:
+            health = "FAILED"
+        elif success_rate < 0.90 or recent_retry_calls >= max(2, int(np.ceil(calls * 0.25))):
+            health = "DEGRADED"
+        else:
+            health = "HEALTHY"
+        rows.append({
+            "Provider": provider,
+            "Transport Health": health,
+            "Calls": calls,
+            "Success Rate": success_rate,
+            "Retries": retries,
+            "Avg Latency ms": np.mean(latencies) if latencies else np.nan,
+            "Last Status": last.get("HTTP Status", "") or ("OK" if last.get("Success") else "ERROR"),
+            "Last Route": last.get("Route", ""),
+            "Last Error": last.get("Error", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+def signal_session_health(signal_session=None):
+    """Separate completed-bar currency from provider/network health."""
+    signal_session = st.session_state.get("scan_signal_session") if signal_session is None else signal_session
+    if signal_session is None or pd.isna(signal_session):
+        return "UNKNOWN", "No completed-session scan is loaded."
+    try:
+        actual = pd.Timestamp(signal_session).normalize()
+        expected = pd.Timestamp(expected_latest_completed_us_session()).normalize()
+        if actual == expected:
+            return "CURRENT", f"Signal session {actual:%d-%b-%Y} matches the latest completed XNYS session."
+        if actual < expected:
+            lag = max(1, int((expected - actual).days))
+            return "STALE", f"Signal session {actual:%d-%b-%Y}; expected {expected:%d-%b-%Y} ({lag} calendar day(s) behind)."
+        return "FUTURE/BLOCK", f"Signal session {actual:%d-%b-%Y} is ahead of expected {expected:%d-%b-%Y}."
+    except Exception:
+        return "UNKNOWN", "Signal-session currency could not be evaluated."
 
 
 def durable_store_config():
@@ -260,10 +477,11 @@ def _github_ensure_state_branch(cfg):
     base = _github_api_base(cfg)
     headers = _github_headers(cfg["token"])
     branch = cfg["branch"]
-    check = requests.get(
+    check = http_get(
+        "GitHub",
         f"{base}/git/ref/heads/{requests.utils.quote(branch, safe='')}",
-        headers=headers,
-        timeout=DURABLE_REQUEST_TIMEOUT,
+        headers=headers, timeout=DURABLE_REQUEST_TIMEOUT,
+        expected_statuses={200, 404}, route="durable branch check",
     )
     if check.status_code == 200:
         return True, ""
@@ -271,10 +489,11 @@ def _github_ensure_state_branch(cfg):
         return False, f"GitHub branch check failed ({check.status_code})."
 
     source = cfg["source_branch"]
-    source_resp = requests.get(
+    source_resp = http_get(
+        "GitHub",
         f"{base}/git/ref/heads/{requests.utils.quote(source, safe='')}",
-        headers=headers,
-        timeout=DURABLE_REQUEST_TIMEOUT,
+        headers=headers, timeout=DURABLE_REQUEST_TIMEOUT,
+        expected_statuses={200}, route="durable source branch read",
     )
     if source_resp.status_code != 200:
         return False, f"GitHub source branch '{source}' could not be read ({source_resp.status_code})."
@@ -282,20 +501,21 @@ def _github_ensure_state_branch(cfg):
     if not source_sha:
         return False, "GitHub source branch SHA was unavailable."
 
-    create = requests.post(
-        f"{base}/git/refs",
-        headers=headers,
-        json={"ref": f"refs/heads/{branch}", "sha": source_sha},
-        timeout=DURABLE_REQUEST_TIMEOUT,
+    create = http_request(
+        "GitHub", "POST", f"{base}/git/refs",
+        headers=headers, json={"ref": f"refs/heads/{branch}", "sha": source_sha},
+        timeout=DURABLE_REQUEST_TIMEOUT, max_retries=0,
+        expected_statuses={200, 201, 422}, route="durable branch create",
     )
     if create.status_code in {200, 201}:
         return True, ""
     # Another process may have created it between GET and POST.
     if create.status_code == 422:
-        recheck = requests.get(
+        recheck = http_get(
+            "GitHub",
             f"{base}/git/ref/heads/{requests.utils.quote(branch, safe='')}",
-            headers=headers,
-            timeout=DURABLE_REQUEST_TIMEOUT,
+            headers=headers, timeout=DURABLE_REQUEST_TIMEOUT,
+            expected_statuses={200, 404}, route="durable branch recheck",
         )
         if recheck.status_code == 200:
             return True, ""
@@ -357,11 +577,11 @@ def _github_read_snapshot_file(cfg, universe_name):
     base = _github_api_base(cfg)
     path = _durable_snapshot_path(universe_name, cfg)
     encoded_path = requests.utils.quote(path, safe="/")
-    resp = requests.get(
-        f"{base}/contents/{encoded_path}",
-        headers=_github_headers(cfg["token"]),
-        params={"ref": cfg["branch"]},
-        timeout=DURABLE_REQUEST_TIMEOUT,
+    resp = http_get(
+        "GitHub", f"{base}/contents/{encoded_path}",
+        headers=_github_headers(cfg["token"]), params={"ref": cfg["branch"]},
+        timeout=DURABLE_REQUEST_TIMEOUT, expected_statuses={200, 404},
+        route="durable snapshot read",
     )
     if resp.status_code == 404:
         return None, None, "No durable snapshot exists for this universe yet."
@@ -416,11 +636,11 @@ def save_durable_snapshot(universe_name, results, timestamp, failures, universe_
         base = _github_api_base(cfg)
         path = _durable_snapshot_path(universe_name, cfg)
         encoded_path = requests.utils.quote(path, safe="/")
-        resp = requests.put(
-            f"{base}/contents/{encoded_path}",
-            headers=_github_headers(cfg["token"]),
-            json=body,
-            timeout=DURABLE_REQUEST_TIMEOUT,
+        resp = http_request(
+            "GitHub", "PUT", f"{base}/contents/{encoded_path}",
+            headers=_github_headers(cfg["token"]), json=body,
+            timeout=DURABLE_REQUEST_TIMEOUT, max_retries=0,
+            expected_statuses={200, 201, 409}, route="durable snapshot write",
         )
         if resp.status_code in {200, 201}:
             return True, f"Saved {len(results):,}-row durable GitHub recovery snapshot."
@@ -431,11 +651,11 @@ def save_durable_snapshot(universe_name, results, timestamp, failures, universe_
                 return True, "Durable GitHub snapshot was concurrently updated to the same data."
             if latest_sha:
                 body["sha"] = latest_sha
-                retry = requests.put(
-                    f"{base}/contents/{encoded_path}",
-                    headers=_github_headers(cfg["token"]),
-                    json=body,
-                    timeout=DURABLE_REQUEST_TIMEOUT,
+                retry = http_request(
+                    "GitHub", "PUT", f"{base}/contents/{encoded_path}",
+                    headers=_github_headers(cfg["token"]), json=body,
+                    timeout=DURABLE_REQUEST_TIMEOUT, max_retries=0,
+                    expected_statuses={200, 201}, route="durable snapshot conflict retry",
                 )
                 if retry.status_code in {200, 201}:
                     return True, f"Saved {len(results):,}-row durable GitHub recovery snapshot after retry."
@@ -933,7 +1153,7 @@ def safe_headers():
 def load_company_directory():
     rows = []
     try:
-        response = requests.get(SEC_TICKERS_URL, headers=safe_headers(), timeout=12)
+        response = http_get("SEC", SEC_TICKERS_URL, headers=safe_headers(), timeout=12, max_retries=0, route="company ticker directory")
         response.raise_for_status()
         payload = response.json()
         for item in payload.values():
@@ -963,8 +1183,9 @@ def load_company_directory():
 def load_sp500():
     """Load S&P 500 constituents with multiple fallbacks."""
     try:
-        response = requests.get(
-            SP500_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"}
+        response = http_get(
+            "Wikipedia", SP500_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"},
+            route="S&P 500 constituents",
         )
         response.raise_for_status()
         tables = pd.read_html(io.StringIO(response.text))
@@ -984,7 +1205,10 @@ def load_sp500():
 
     try:
         url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
-        response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        response = http_get(
+            "GitHub Raw", url, timeout=15, headers={"User-Agent": "Mozilla/5.0"},
+            route="S&P 500 fallback constituents",
+        )
         response.raise_for_status()
         table = pd.read_csv(io.StringIO(response.text))
         if "Symbol" in table.columns and len(table) >= 450:
@@ -1008,10 +1232,9 @@ def load_sp500():
 def load_nasdaq100():
     """Load Nasdaq-100 constituents with robust parsing and a fallback symbol set."""
     try:
-        response = requests.get(
-            NASDAQ100_URL,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"},
+        response = http_get(
+            "Wikipedia", NASDAQ100_URL, timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}, route="Nasdaq-100 constituents",
         )
         response.raise_for_status()
         tables = pd.read_html(io.StringIO(response.text))
@@ -1088,7 +1311,10 @@ def load_iwm():
     ]
     for url in csv_urls:
         try:
-            response = requests.get(url, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+            response = http_get(
+                "iShares", url, timeout=25, max_retries=0, headers={"User-Agent": "Mozilla/5.0"},
+                route="IWM holdings",
+            )
             response.raise_for_status()
             raw = response.content.decode("utf-8-sig", errors="ignore")
 
@@ -1222,7 +1448,10 @@ def load_sec_ticker_reference():
     """Ticker -> CIK reference used only for fallback metadata / filing verification."""
     mapping = {}
     try:
-        response = requests.get(SEC_TICKERS_URL, headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT)
+        response = http_get(
+            "SEC", SEC_TICKERS_URL, headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT, max_retries=0,
+            route="SEC ticker reference",
+        )
         response.raise_for_status()
         payload = response.json()
         for item in payload.values():
@@ -1260,11 +1489,9 @@ def yahoo_direct_fundamentals(symbol):
     }
     # Lightweight quote endpoint first.
     try:
-        response = requests.get(
-            YAHOO_QUOTE_API,
-            params={"symbols": clean_symbol(symbol)},
-            headers=headers,
-            timeout=METADATA_HTTP_TIMEOUT,
+        response = http_get(
+            "Yahoo HTTP", YAHOO_QUOTE_API, params={"symbols": clean_symbol(symbol)},
+            headers=headers, timeout=METADATA_HTTP_TIMEOUT, max_retries=0, route="direct quote fundamentals",
         )
         response.raise_for_status()
         rows = ((response.json().get("quoteResponse") or {}).get("result") or [])
@@ -1281,11 +1508,10 @@ def yahoo_direct_fundamentals(symbol):
     # quoteSummary can repair profile fields and valuation fields when available.
     try:
         url = YAHOO_QUOTE_SUMMARY_API.format(symbol=requests.utils.quote(clean_symbol(symbol), safe="-"))
-        response = requests.get(
-            url,
+        response = http_get(
+            "Yahoo HTTP", url,
             params={"modules": "assetProfile,summaryDetail,defaultKeyStatistics,price"},
-            headers=headers,
-            timeout=METADATA_HTTP_TIMEOUT,
+            headers=headers, timeout=METADATA_HTTP_TIMEOUT, max_retries=0, route="quoteSummary fundamentals",
         )
         response.raise_for_status()
         payload = (((response.json().get("quoteSummary") or {}).get("result") or [{}])[0]) or {}
@@ -1329,8 +1555,9 @@ def nasdaq_direct_fundamentals(symbol):
     }
     try:
         url = NASDAQ_QUOTE_SUMMARY_API.format(symbol=requests.utils.quote(clean_symbol(symbol), safe="-"))
-        response = requests.get(
-            url, params={"assetclass": "stocks"}, headers=headers, timeout=METADATA_HTTP_TIMEOUT
+        response = http_get(
+            "Nasdaq", url, params={"assetclass": "stocks"}, headers=headers,
+            timeout=METADATA_HTTP_TIMEOUT, route="quote summary fundamentals",
         )
         result["http_status"] = response.status_code
         response.raise_for_status()
@@ -1462,7 +1689,10 @@ def _sec_recent_filing_shares(cik, recent):
         for document in docs:
             url = f"{SEC_ARCHIVES_BASE}/{cik_path}/{accession}/{document}"
             try:
-                response = requests.get(url, headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT)
+                response = http_get(
+                    "SEC", url, headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT, max_retries=0,
+                    route="filing document shares",
+                )
                 if response.status_code != 200:
                     continue
                 shares, source = _sec_extract_shares_from_filing_html(response.text)
@@ -1499,8 +1729,9 @@ def sec_company_fallback(symbol):
 
     # Submissions: SIC description + recent 8-K Item 2.02 (results of operations).
     try:
-        response = requests.get(
-            SEC_SUBMISSIONS_URL.format(cik=cik), headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT
+        response = http_get(
+            "SEC", SEC_SUBMISSIONS_URL.format(cik=cik), headers=safe_headers(),
+            timeout=METADATA_HTTP_TIMEOUT, max_retries=0, route="company submissions",
         )
         response.raise_for_status()
         payload = response.json()
@@ -1530,8 +1761,9 @@ def sec_company_fallback(symbol):
 
     # Company facts: latest reported common shares outstanding for market-cap repair.
     try:
-        response = requests.get(
-            SEC_COMPANYFACTS_URL.format(cik=cik), headers=safe_headers(), timeout=METADATA_HTTP_TIMEOUT
+        response = http_get(
+            "SEC", SEC_COMPANYFACTS_URL.format(cik=cik), headers=safe_headers(),
+            timeout=METADATA_HTTP_TIMEOUT, max_retries=0, route="company facts",
         )
         response.raise_for_status()
         facts = response.json().get("facts") or {}
@@ -1630,11 +1862,9 @@ def nasdaq_earnings_rows(date_value):
         "Origin": "https://www.nasdaq.com",
     }
     try:
-        response = requests.get(
-            NASDAQ_EARNINGS_API,
-            params={"date": date_text},
-            headers=headers,
-            timeout=METADATA_HTTP_TIMEOUT,
+        response = http_get(
+            "Nasdaq", NASDAQ_EARNINGS_API, params={"date": date_text},
+            headers=headers, timeout=METADATA_HTTP_TIMEOUT, route="earnings calendar",
         )
         response.raise_for_status()
         data = response.json().get("data") or {}
@@ -1733,18 +1963,31 @@ def get_company_snapshot(symbol, fallback_close=None):
     ticker = None
     try:
         ticker = yf.Ticker(symbol)
+        y_start = time.perf_counter()
         try:
             fast = ticker.fast_info
+            _record_provider_transport_event(
+                "Yahoo / yfinance", True, (time.perf_counter() - y_start) * 1000.0,
+                status_code="OK", route="metadata fast_info",
+            )
             if fast:
                 value = fast.get("market_cap", np.nan)
                 if pd.notna(value):
                     snapshot["market_cap"] = value
                     snapshot["fundamental_sources"]["Market Cap"] = "Yahoo/yfinance fast_info"
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_provider_transport_event(
+                "Yahoo / yfinance", False, (time.perf_counter() - y_start) * 1000.0,
+                route="metadata fast_info", error=f"{type(exc).__name__}: {exc}",
+            )
 
+        y_start = time.perf_counter()
         try:
             info = ticker.info or {}
+            _record_provider_transport_event(
+                "Yahoo / yfinance", True, (time.perf_counter() - y_start) * 1000.0,
+                status_code="OK", route="metadata info",
+            )
             field_map = {
                 "sector": ("sector", "Sector"),
                 "industry": ("industry", "Industry"),
@@ -1767,13 +2010,22 @@ def get_company_snapshot(symbol, fallback_close=None):
             trailing_eps = _provider_number(info.get("trailingEps"))
             if pd.notna(trailing_eps):
                 snapshot["trailing_eps"] = trailing_eps
-        except Exception:
+        except Exception as exc:
+            _record_provider_transport_event(
+                "Yahoo / yfinance", False, (time.perf_counter() - y_start) * 1000.0,
+                route="metadata info", error=f"{type(exc).__name__}: {exc}",
+            )
             info = {}
 
         # Yahoo event routes: useful forward estimates, but not primary-source confirmation.
         calendar_dates = []
+        y_start = time.perf_counter()
         try:
             cal = ticker.calendar
+            _record_provider_transport_event(
+                "Yahoo / yfinance", True, (time.perf_counter() - y_start) * 1000.0,
+                status_code="OK", route="earnings calendar",
+            )
             if isinstance(cal, dict):
                 value = cal.get("Earnings Date")
                 if isinstance(value, (list, tuple, pd.Series, pd.Index, np.ndarray)):
@@ -1785,8 +2037,11 @@ def get_company_snapshot(symbol, fallback_close=None):
                     calendar_dates.extend(list(cal.loc["Earnings Date"].dropna().values))
                 elif "Earnings Date" in cal.columns:
                     calendar_dates.extend(list(cal["Earnings Date"].dropna().values))
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_provider_transport_event(
+                "Yahoo / yfinance", False, (time.perf_counter() - y_start) * 1000.0,
+                route="earnings calendar", error=f"{type(exc).__name__}: {exc}",
+            )
 
         next_date, last_date = _split_earnings_dates(calendar_dates)
         if pd.notna(next_date):
@@ -2934,16 +3189,15 @@ def download_stooq(symbol, period="1y"):
         start_date = period_start_date(period)
         end_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
         url = "https://stooq.com/q/d/l/"
-        response = requests.get(
-            url,
+        response = http_get(
+            "Stooq", url,
             params={
                 "s": mapped,
                 "d1": start_date.strftime("%Y%m%d"),
                 "d2": end_date.strftime("%Y%m%d"),
                 "i": "d",
             },
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=15, headers={"User-Agent": "Mozilla/5.0"}, route="daily price fallback",
         )
         response.raise_for_status()
         raw = response.text.strip()
@@ -2996,6 +3250,7 @@ def download_one(symbol, period="1y"):
     or has recent session gaps.
     """
     yahoo = pd.DataFrame()
+    y_start = time.perf_counter()
     try:
         yahoo = yf.download(
             symbol,
@@ -3006,11 +3261,21 @@ def download_one(symbol, period="1y"):
             threads=False,
             timeout=12,
         )
+        _record_provider_transport_event(
+            "Yahoo / yfinance", True, (time.perf_counter() - y_start) * 1000.0,
+            status_code="OK", route="individual price download",
+            note="empty frame" if yahoo is None or getattr(yahoo, "empty", True) else "",
+        )
         yahoo = normalize_single_history(yahoo)
         if not yahoo.empty:
             yahoo.attrs["provider"] = "Yahoo"
             yahoo.attrs["download_route"] = "Yahoo / yfinance"
-    except Exception:
+    except Exception as exc:
+        _record_provider_transport_event(
+            "Yahoo / yfinance", False, (time.perf_counter() - y_start) * 1000.0,
+            status_code="", route="individual price download",
+            error=f"{type(exc).__name__}: {exc}",
+        )
         yahoo = pd.DataFrame()
 
     yahoo_fresh = False
@@ -3039,8 +3304,9 @@ def download_batch_cached(symbols_tuple, conservative=False):
     if not symbols:
         return pd.DataFrame()
 
+    y_start = time.perf_counter()
     try:
-        return yf.download(
+        data = yf.download(
             tickers=symbols,
             period="1y",
             interval="1d",
@@ -3050,7 +3316,20 @@ def download_batch_cached(symbols_tuple, conservative=False):
             threads=False if conservative else True,
             timeout=25,
         )
-    except Exception:
+        _record_provider_transport_event(
+            "Yahoo / yfinance", True, (time.perf_counter() - y_start) * 1000.0,
+            status_code="OK",
+            route="bulk price download (conservative)" if conservative else "bulk price download",
+            note="empty frame" if data is None or getattr(data, "empty", True) else "",
+        )
+        return data
+    except Exception as exc:
+        _record_provider_transport_event(
+            "Yahoo / yfinance", False, (time.perf_counter() - y_start) * 1000.0,
+            status_code="",
+            route="bulk price download (conservative)" if conservative else "bulk price download",
+            error=f"{type(exc).__name__}: {exc}",
+        )
         return pd.DataFrame()
 
 
@@ -5189,19 +5468,21 @@ with scanner_tab:
     health = st.session_state.provider_health
     h_status = health.get("status", "UNKNOWN")
     if h_status == "HEALTHY":
-        st.success(f"🟢 **Data Health: HEALTHY** — {health.get('message', '')}")
+        st.success(f"🟢 **Scan Data Health: HEALTHY** — {health.get('message', '')}")
     elif h_status == "DEGRADED":
-        st.warning(f"🟠 **Data Health: DEGRADED** — {health.get('message', '')}")
+        st.warning(f"🟠 **Scan Data Health: DEGRADED** — {health.get('message', '')}")
     elif h_status == "PROVIDER_FAILURE":
-        st.error(f"🔴 **Data Health: PROVIDER FAILURE** — {health.get('message', '')}")
+        st.error(f"🔴 **Scan Data Health: PROVIDER FAILURE** — {health.get('message', '')}")
     elif h_status == "RECOVERED":
-        st.info(f"🔵 **Data Health: RECOVERED SNAPSHOT** — {health.get('message', '')}")
+        st.info(f"🔵 **Scan Data Health: RECOVERED SNAPSHOT** — {health.get('message', '')}")
     else:
-        st.info("🔵 **Data Health:** Run a scan to test current bulk-provider coverage.")
+        st.info("🔵 **Scan Data Health:** Run a scan to test current bulk-provider coverage.")
 
+    signal_state, signal_message = signal_session_health()
     st.caption(
         f"Market-session calendar: **{health.get('calendar_source', market_calendar_source())}** • "
-        f"Signal bars require a {MARKET_DATA_PUBLICATION_BUFFER_MINUTES}-minute post-close publication buffer."
+        f"Signal bars: **{signal_state}** • {signal_message} • "
+        f"{MARKET_DATA_PUBLICATION_BUFFER_MINUTES}-minute post-close publication buffer."
     )
 
     c1, c2 = st.columns([1, 2])
@@ -5502,17 +5783,48 @@ with scanner_tab:
     with st.expander("Provider diagnostics & recovery", expanded=False):
         live_health = st.session_state.provider_health
         diag_rows = list(st.session_state.get("scan_diagnostics", []))
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("Provider status", live_health.get("status", "UNKNOWN"))
+        signal_state, signal_message = signal_session_health()
+        d1, d2, d3, d4, d5, d6 = st.columns(6)
+        d1.metric("Scan data health", live_health.get("status", "UNKNOWN"))
+        d2.metric("Signal bars", signal_state)
         coverage = live_health.get("coverage", np.nan)
         usable_coverage = live_health.get("usable_coverage", np.nan)
-        d2.metric("Raw coverage", "N/A" if pd.isna(coverage) else f"{coverage:.1%}")
-        d3.metric("Usable coverage", "N/A" if pd.isna(usable_coverage) else f"{usable_coverage:.1%}")
-        d4.metric(
+        d3.metric("Raw coverage", "N/A" if pd.isna(coverage) else f"{coverage:.1%}")
+        d4.metric("Usable coverage", "N/A" if pd.isna(usable_coverage) else f"{usable_coverage:.1%}")
+        d5.metric(
             "Targeted repairs",
             f"{int(live_health.get('targeted_retry_repaired', 0))}/{int(live_health.get('targeted_retry_symbols', 0))}",
         )
-        d5.metric("Unresolved", f"{len(live_health.get('unresolved_symbols', [])):,}")
+        d6.metric("Unresolved", f"{len(live_health.get('unresolved_symbols', [])):,}")
+
+        st.caption(
+            "**Health layers are intentionally separate:** Scan data health = completed-session coverage/freshness; "
+            "Signal bars = whether the loaded signal session matches the expected completed XNYS session; "
+            "transport telemetry below = network/endpoint behavior. "
+            "Fundamental and Event Data Confidence remain ticker-specific in Ticker Search."
+        )
+        st.caption(f"App build: **{APP_BUILD_VERSION}** • Data/scoring compatibility: **{ENGINE_VERSION}**")
+        st.caption(signal_message)
+
+        transport_df = transport_telemetry_summary()
+        if not transport_df.empty:
+            st.markdown("**Provider transport telemetry — current app session**")
+            display_transport = transport_df.copy()
+            if "Success Rate" in display_transport.columns:
+                display_transport["Success Rate"] = display_transport["Success Rate"].map(
+                    lambda v: "N/A" if pd.isna(v) else f"{v:.0%}"
+                )
+            if "Avg Latency ms" in display_transport.columns:
+                display_transport["Avg Latency ms"] = display_transport["Avg Latency ms"].map(
+                    lambda v: "N/A" if pd.isna(v) else f"{v:,.0f}"
+                )
+            st.dataframe(display_transport, hide_index=True, use_container_width=True)
+            st.caption(
+                "Direct HTTP calls use one pooled requests.Session with bounded transient retries. "
+                "Yahoo/yfinance rows are timed at the library-call level because yfinance owns its internal HTTP transport."
+            )
+        else:
+            st.caption("No provider transport event has been recorded in this app session yet.")
 
         if diag_rows:
             diag_df = pd.DataFrame(diag_rows)
