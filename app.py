@@ -1,4 +1,4 @@
-# Quality Engine v7.5.0 — Phase 2D.1 WORKING (Transport Hardening & Observability)
+# Quality Engine v7.5.1 — Phase 2D.1 HOTFIX (Session-Pinned Freshness & Snapshot Compatibility)
 
 import base64
 import hashlib
@@ -52,7 +52,10 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.5.0-P2D1-TRANSPORT-OBSERVABILITY"
+APP_BUILD_VERSION = "v7.5.1-P2D1-SESSION-PINNED-HOTFIX"
+# Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
+# Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
+COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
@@ -704,14 +707,25 @@ def load_durable_snapshot(universe_name):
 
 
 def load_best_available_snapshot(universe_name, universe_signature=None, engine_version=None):
-    """Prefer compatible local SQLite, then fall back to compatible durable GitHub state."""
+    """Prefer compatible local SQLite, then fall back to compatible durable GitHub state.
+
+    Snapshot compatibility is deliberately separated from the UI/app build version.
+    The v7.3 Phase 2B.2 scanner snapshot is explicitly accepted because subsequent
+    Phase 2C work changed ticker-level event/fundamental reliability rather than the
+    scanner's stored record/scoring schema.
+    """
     def compatible(snapshot):
         if snapshot is None:
             return False
         if universe_signature and snapshot.get("universe_signature") != universe_signature:
             return False
-        if engine_version and snapshot.get("engine_version") != engine_version:
-            return False
+        if engine_version:
+            snapshot_version = str(snapshot.get("engine_version", "") or "")
+            if engine_version == ENGINE_VERSION:
+                if snapshot_version not in COMPATIBLE_SCAN_SNAPSHOT_VERSIONS:
+                    return False
+            elif snapshot_version != engine_version:
+                return False
         return True
 
     local = load_last_good_snapshot(universe_name)
@@ -724,9 +738,9 @@ def load_best_available_snapshot(universe_name, universe_signature=None, engine_
         return remote, "GitHub durable store", ""
 
     if remote is not None and not compatible(remote):
-        return None, "", "Durable snapshot exists but is incompatible with the current universe or engine version."
+        return None, "", "Durable snapshot exists but is incompatible with the current universe signature or scanner-data compatibility version."
     if local is not None and not compatible(local) and not message:
-        message = "Local snapshot exists but is incompatible with the current universe or engine version."
+        message = "Local snapshot exists but is incompatible with the current universe signature or scanner-data compatibility version."
     return None, "", message
 
 
@@ -3299,16 +3313,37 @@ def download_one(symbol, period="1y"):
 
 
 @st.cache_data(ttl=SCAN_CACHE_TTL, show_spinner=False)
-def download_batch_cached(symbols_tuple, conservative=False):
+def download_batch_cached(symbols_tuple, conservative=False, signal_session_key="", session_pinned=False):
+    """Download one Yahoo batch with the completed-session date in the cache key.
+
+    Normal scans keep Yahoo's efficient relative 1y request. Recovery scans can pin
+    an explicit start/end window to the expected completed XNYS session. yfinance/Yahoo
+    treats ``end`` as exclusive, so the recovery end is expected_session + 1 calendar day.
+    This prevents a retry from reproducing a stale relative-period boundary.
+    """
     symbols = list(symbols_tuple)
     if not symbols:
         return pd.DataFrame()
 
-    y_start = time.perf_counter()
+    expected_session = None
     try:
-        data = yf.download(
+        expected_session = (
+            pd.Timestamp(signal_session_key).normalize()
+            if signal_session_key else pd.Timestamp(expected_latest_completed_us_session()).normalize()
+        )
+    except Exception:
+        expected_session = pd.Timestamp(expected_latest_completed_us_session()).normalize()
+
+    y_start = time.perf_counter()
+    route = "bulk price download"
+    if conservative:
+        route += " (conservative)"
+    if session_pinned:
+        route += " [session-pinned]"
+
+    try:
+        kwargs = dict(
             tickers=symbols,
-            period="1y",
             interval="1d",
             auto_adjust=True,
             group_by="ticker",
@@ -3316,18 +3351,28 @@ def download_batch_cached(symbols_tuple, conservative=False):
             threads=False if conservative else True,
             timeout=25,
         )
+        if session_pinned:
+            # Use a generous 400-calendar-day window so 126/252-session metrics remain available.
+            # Yahoo/yfinance end= is exclusive, therefore +1 day is required to include the
+            # expected completed session itself.
+            kwargs["start"] = (expected_session - pd.Timedelta(days=400)).strftime("%Y-%m-%d")
+            kwargs["end"] = (expected_session + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            kwargs["period"] = "1y"
+
+        data = yf.download(**kwargs)
         _record_provider_transport_event(
             "Yahoo / yfinance", True, (time.perf_counter() - y_start) * 1000.0,
-            status_code="OK",
-            route="bulk price download (conservative)" if conservative else "bulk price download",
-            note="empty frame" if data is None or getattr(data, "empty", True) else "",
+            status_code="OK", route=route,
+            note="empty frame" if data is None or getattr(data, "empty", True) else (
+                f"expected session {expected_session:%Y-%m-%d}" if session_pinned else ""
+            ),
         )
         return data
     except Exception as exc:
         _record_provider_transport_event(
             "Yahoo / yfinance", False, (time.perf_counter() - y_start) * 1000.0,
-            status_code="",
-            route="bulk price download (conservative)" if conservative else "bulk price download",
+            status_code="", route=route,
             error=f"{type(exc).__name__}: {exc}",
         )
         return pd.DataFrame()
@@ -3512,6 +3557,10 @@ def run_market_scan(universe_df, progress_bar, status_box):
     individual_repair_attempts = 0
     individual_repair_repaired = 0
     symbol_diagnostics = {}
+    # Pin all batch-cache/recovery decisions to the expected completed XNYS session.
+    # This prevents a 15-minute Streamlit cache entry from straddling a session boundary.
+    scan_expected_session = pd.Timestamp(expected_latest_completed_us_session()).normalize()
+    scan_session_key = scan_expected_session.strftime("%Y-%m-%d")
 
     def diag_touch(symbol, batch_no, initial_note=""):
         item = symbol_diagnostics.setdefault(
@@ -3538,7 +3587,7 @@ def run_market_scan(universe_df, progress_bar, status_box):
             f"({start_i + 1}-{min(start_i + len(batch), len(tickers))} of {len(tickers)})"
         )
 
-        raw = download_batch_cached(tuple(batch), conservative=False)
+        raw = download_batch_cached(tuple(batch), conservative=False, signal_session_key=scan_session_key, session_pinned=False)
         frames = {symbol: split_batch_result(raw, symbol) for symbol in batch}
         problem_symbols = [symbol for symbol in batch if not scanner_frame_usable(frames[symbol])]
         for symbol in problem_symbols:
@@ -3557,7 +3606,7 @@ def run_market_scan(universe_df, progress_bar, status_box):
                     f"Yahoo batch {batch_no}/{total_batches} is broadly degraded; "
                     "running one conservative provider retry."
                 )
-                raw_retry = download_batch_cached(tuple(batch), conservative=True)
+                raw_retry = download_batch_cached(tuple(batch), conservative=True, signal_session_key=scan_session_key, session_pinned=True)
                 for symbol in batch:
                     retry_df = split_batch_result(raw_retry, symbol)
                     if symbol in problem_symbols:
@@ -3574,7 +3623,7 @@ def run_market_scan(universe_df, progress_bar, status_box):
                         f"Repairing {len(retry_subset)} isolated Yahoo symbol(s) in batch "
                         f"{batch_no}/{total_batches}."
                     )
-                    retry_raw = download_batch_cached(tuple(retry_subset), conservative=True)
+                    retry_raw = download_batch_cached(tuple(retry_subset), conservative=True, signal_session_key=scan_session_key, session_pinned=True)
                     for symbol in retry_subset:
                         before = scanner_frame_quality(frames[symbol])
                         retry_df = split_batch_result(retry_raw, symbol)
