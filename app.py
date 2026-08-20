@@ -1,4 +1,4 @@
-# Quality Engine v7.5.2 — Phase 2D.2 (Provider Health Policy & Failure Isolation)
+# Quality Engine v7.5.3 — Phase 2D.2 HOTFIX (P95 Latency Policy Classification)
 
 import base64
 import hashlib
@@ -52,7 +52,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.5.2-P2D2-PROVIDER-HEALTH-POLICY"
+APP_BUILD_VERSION = "v7.5.3-P2D2-LATENCY-POLICY-HOTFIX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -410,7 +410,9 @@ def _provider_transport_health(subset, warn_latency_ms):
         return "DEGRADED"
     if pd.notna(avg_latency) and avg_latency > float(warn_latency_ms):
         return "DEGRADED"
-    if calls >= 2 and pd.notna(p95_latency) and p95_latency > float(warn_latency_ms) * 1.75:
+    # P95 is the declared latency-policy boundary: exceeding the provider warning
+    # threshold degrades transport health, but latency alone can never mark it FAILED.
+    if pd.notna(p95_latency) and p95_latency > float(warn_latency_ms):
         return "DEGRADED"
     return "HEALTHY"
 
