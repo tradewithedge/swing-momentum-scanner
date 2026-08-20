@@ -1,4 +1,4 @@
-# Quality Engine v7.5.1 — Phase 2D.1 HOTFIX (Session-Pinned Freshness & Snapshot Compatibility)
+# Quality Engine v7.5.2 — Phase 2D.2 (Provider Health Policy & Failure Isolation)
 
 import base64
 import hashlib
@@ -52,7 +52,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.5.1-P2D1-SESSION-PINNED-HOTFIX"
+APP_BUILD_VERSION = "v7.5.2-P2D2-PROVIDER-HEALTH-POLICY"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -79,6 +79,50 @@ HTTP_POOL_MAXSIZE = 32
 HTTP_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 PROVIDER_TELEMETRY_MAX_EVENTS = 120
 PROVIDER_TELEMETRY_WINDOW = 20
+
+# Phase 2D.2 provider-health policy. Provider transport state is deliberately
+# separated from scan-data quality and from ticker-specific metadata confidence.
+# A provider may be FAILED while the scanner remains healthy when that provider
+# is only an ancillary or recovery route for the current workflow.
+PROVIDER_TRANSPORT_POLICIES = {
+    "Yahoo / yfinance": {
+        "role": "CORE", "scope": "Scanner / ticker price history", "warn_latency_ms": 3000,
+        "scanner_impact": "CORE — may degrade scanner transport",
+    },
+    "GitHub": {
+        "role": "RECOVERY", "scope": "Durable last-good snapshots", "warn_latency_ms": 2500,
+        "scanner_impact": "RECOVERY — current scan remains valid if persistence fails",
+    },
+    "Stooq": {
+        "role": "RECOVERY", "scope": "Individual price-history repair", "warn_latency_ms": 3000,
+        "scanner_impact": "RECOVERY — only affects repair capacity",
+    },
+    "Wikipedia": {
+        "role": "UNIVERSE", "scope": "S&P 500 / Nasdaq-100 constituents", "warn_latency_ms": 2000,
+        "scanner_impact": "INPUT — only affects uncached universe discovery",
+    },
+    "iShares": {
+        "role": "UNIVERSE", "scope": "Russell 2000 holdings", "warn_latency_ms": 3000,
+        "scanner_impact": "INPUT — only affects uncached universe discovery",
+    },
+    "Yahoo HTTP": {
+        "role": "RECOVERY", "scope": "Fundamental metadata repair", "warn_latency_ms": 2500,
+        "scanner_impact": "RECOVERY — ticker metadata only",
+    },
+    "Nasdaq": {
+        "role": "ANCILLARY", "scope": "Independent fundamentals / event corroboration", "warn_latency_ms": 2500,
+        "scanner_impact": "ISOLATED — no scanner-price-health impact",
+    },
+    "SEC": {
+        "role": "ANCILLARY", "scope": "Directory / tertiary fundamentals / filing evidence", "warn_latency_ms": 2500,
+        "scanner_impact": "ISOLATED — no scanner-price-health impact",
+    },
+}
+DEFAULT_PROVIDER_TRANSPORT_POLICY = {
+    "role": "ANCILLARY", "scope": "Other external endpoint", "warn_latency_ms": 3000,
+    "scanner_impact": "ISOLATED — no scanner-price-health impact",
+}
+TRANSPORT_HEALTH_RANK = {"UNKNOWN": 0, "HEALTHY": 1, "DEGRADED": 2, "FAILED": 3}
 
 # Phase 2A market-session / targeted-recovery controls.
 NYSE_CALENDAR_NAME = "XNYS"
@@ -328,8 +372,51 @@ def http_get(provider, url, **kwargs):
     return http_request(provider, "GET", url, **kwargs)
 
 
+def provider_transport_policy(provider):
+    """Return the declared transport role/latency policy for one provider."""
+    policy = PROVIDER_TRANSPORT_POLICIES.get(str(provider), DEFAULT_PROVIDER_TRANSPORT_POLICY)
+    return dict(policy)
+
+
+def _provider_transport_health(subset, warn_latency_ms):
+    """Formal provider state using success, retry pressure and latency.
+
+    Latency alone can degrade a successful provider but never marks it FAILED.
+    FAILED is reserved for material request failure. This prevents slow-but-valid
+    endpoints from being confused with unavailable endpoints.
+    """
+    calls = len(subset)
+    if calls == 0:
+        return "UNKNOWN"
+    successes = sum(bool(e.get("Success", False)) for e in subset)
+    success_rate = successes / calls
+    retry_calls = sum(1 for e in subset if int(e.get("Retries", 0) or 0) > 0)
+    retry_fraction = retry_calls / calls
+    latencies = [
+        float(e.get("Latency ms")) for e in subset
+        if pd.notna(e.get("Latency ms", np.nan))
+    ]
+    avg_latency = float(np.mean(latencies)) if latencies else np.nan
+    p95_latency = float(np.percentile(latencies, 95)) if latencies else np.nan
+
+    # Hard provider failure is based on unsuccessful logical calls, not data semantics.
+    if success_rate < 0.50:
+        return "FAILED"
+
+    # Partial failures, repeated retries, or persistently slow successful calls are degraded.
+    if success_rate < 0.90:
+        return "DEGRADED"
+    if calls >= 2 and retry_fraction >= 0.25:
+        return "DEGRADED"
+    if pd.notna(avg_latency) and avg_latency > float(warn_latency_ms):
+        return "DEGRADED"
+    if calls >= 2 and pd.notna(p95_latency) and p95_latency > float(warn_latency_ms) * 1.75:
+        return "DEGRADED"
+    return "HEALTHY"
+
+
 def transport_telemetry_summary():
-    """Summarize recent logical calls by provider without mixing them with data quality."""
+    """Summarize provider transport without allowing ancillary failures to contaminate scan health."""
     events = list(st.session_state.get("provider_transport_events", []))
     if not events:
         return pd.DataFrame()
@@ -339,6 +426,7 @@ def transport_telemetry_summary():
         provider = str(event.get("Provider", "Unknown"))
         if provider not in providers:
             providers.append(provider)
+
     for provider in providers:
         subset = [e for e in events if str(e.get("Provider")) == provider][-PROVIDER_TELEMETRY_WINDOW:]
         calls = len(subset)
@@ -347,27 +435,68 @@ def transport_telemetry_summary():
         latencies = [float(e.get("Latency ms")) for e in subset if pd.notna(e.get("Latency ms", np.nan))]
         success_rate = successes / calls if calls else np.nan
         last = subset[-1] if subset else {}
-        recent_retry_calls = sum(1 for e in subset if int(e.get("Retries", 0) or 0) > 0)
-        if calls == 0:
-            health = "UNKNOWN"
-        elif success_rate < 0.50:
-            health = "FAILED"
-        elif success_rate < 0.90 or recent_retry_calls >= max(2, int(np.ceil(calls * 0.25))):
-            health = "DEGRADED"
-        else:
-            health = "HEALTHY"
+        policy = provider_transport_policy(provider)
+        warn_ms = float(policy.get("warn_latency_ms", 3000))
+        health = _provider_transport_health(subset, warn_ms)
         rows.append({
             "Provider": provider,
+            "Policy Role": policy.get("role", "ANCILLARY"),
             "Transport Health": health,
             "Calls": calls,
             "Success Rate": success_rate,
             "Retries": retries,
             "Avg Latency ms": np.mean(latencies) if latencies else np.nan,
+            "P95 Latency ms": np.percentile(latencies, 95) if latencies else np.nan,
+            "Latency Policy": f"warn >{warn_ms:,.0f} ms",
+            "Scanner Impact": policy.get("scanner_impact", "ISOLATED"),
             "Last Status": last.get("HTTP Status", "") or ("OK" if last.get("Success") else "ERROR"),
             "Last Route": last.get("Route", ""),
             "Last Error": last.get("Error", ""),
         })
     return pd.DataFrame(rows)
+
+
+def _worst_transport_state(states, *, soften_failures=False):
+    values = [str(s) for s in states if str(s) in TRANSPORT_HEALTH_RANK]
+    if not values:
+        return "UNKNOWN"
+    worst = max(values, key=lambda s: TRANSPORT_HEALTH_RANK[s])
+    if soften_failures and worst == "FAILED":
+        return "DEGRADED"
+    return worst
+
+
+def scanner_transport_policy_rollup(transport_df):
+    """Compute scanner-facing transport layers from declared provider roles.
+
+    Only CORE providers can make Core Transport FAILED. Recovery, universe-input and
+    ancillary providers are deliberately isolated so their failures cannot relabel a
+    valid price scan as a provider outage.
+    """
+    if transport_df is None or transport_df.empty:
+        return {
+            "Core Transport": "UNKNOWN",
+            "Recovery/Input": "UNKNOWN",
+            "Ancillary": "UNKNOWN",
+            "Isolated Failures": [],
+        }
+
+    core = transport_df[transport_df["Policy Role"].eq("CORE")]
+    support = transport_df[transport_df["Policy Role"].isin({"RECOVERY", "UNIVERSE"})]
+    ancillary = transport_df[transport_df["Policy Role"].eq("ANCILLARY")]
+
+    isolated = transport_df[
+        transport_df["Policy Role"].ne("CORE") & transport_df["Transport Health"].eq("FAILED")
+    ]["Provider"].astype(str).tolist()
+
+    return {
+        "Core Transport": _worst_transport_state(core["Transport Health"].tolist()),
+        # A failed fallback/input endpoint means reduced resilience, not a failed current scan.
+        "Recovery/Input": _worst_transport_state(support["Transport Health"].tolist(), soften_failures=True),
+        # Ancillary failures remain visible but are explicitly isolated from scanner health.
+        "Ancillary": _worst_transport_state(ancillary["Transport Health"].tolist(), soften_failures=True),
+        "Isolated Failures": isolated,
+    }
 
 
 def signal_session_health(signal_session=None):
@@ -5857,20 +5986,38 @@ with scanner_tab:
 
         transport_df = transport_telemetry_summary()
         if not transport_df.empty:
+            st.markdown("**Provider transport health policy — current app session**")
+            policy_rollup = scanner_transport_policy_rollup(transport_df)
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Core transport", policy_rollup.get("Core Transport", "UNKNOWN"))
+            t2.metric("Recovery / input", policy_rollup.get("Recovery/Input", "UNKNOWN"))
+            t3.metric("Ancillary", policy_rollup.get("Ancillary", "UNKNOWN"))
+
+            isolated_failures = policy_rollup.get("Isolated Failures", [])
+            if isolated_failures:
+                st.info(
+                    "Provider isolation active: "
+                    + ", ".join(isolated_failures)
+                    + " failed at the transport layer, but its declared role is non-core. "
+                    "It does not downgrade Scan Data Health or Core Transport unless that route becomes required for the active workflow."
+                )
+
             st.markdown("**Provider transport telemetry — current app session**")
             display_transport = transport_df.copy()
             if "Success Rate" in display_transport.columns:
                 display_transport["Success Rate"] = display_transport["Success Rate"].map(
                     lambda v: "N/A" if pd.isna(v) else f"{v:.0%}"
                 )
-            if "Avg Latency ms" in display_transport.columns:
-                display_transport["Avg Latency ms"] = display_transport["Avg Latency ms"].map(
-                    lambda v: "N/A" if pd.isna(v) else f"{v:,.0f}"
-                )
+            for latency_col in ["Avg Latency ms", "P95 Latency ms"]:
+                if latency_col in display_transport.columns:
+                    display_transport[latency_col] = display_transport[latency_col].map(
+                        lambda v: "N/A" if pd.isna(v) else f"{v:,.0f}"
+                    )
             st.dataframe(display_transport, hide_index=True, use_container_width=True)
             st.caption(
-                "Direct HTTP calls use one pooled requests.Session with bounded transient retries. "
-                "Yahoo/yfinance rows are timed at the library-call level because yfinance owns its internal HTTP transport."
+                "Provider states are policy-driven: FAILED reflects material request failure; DEGRADED reflects partial failure, retry pressure, or latency above the provider threshold. "
+                "Only CORE provider state contributes to Core Transport. RECOVERY, UNIVERSE and ANCILLARY failures remain visible but are isolated from scanner-price health. "
+                "Direct HTTP calls use one pooled requests.Session with bounded transient retries; Yahoo/yfinance is timed at the library-call level."
             )
         else:
             st.caption("No provider transport event has been recorded in this app session yet.")
