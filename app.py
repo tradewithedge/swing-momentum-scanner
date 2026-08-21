@@ -1,4 +1,4 @@
-# Quality Engine v7.5.4 — Phase 2D.2 HOTFIX (Ticker Search Resilience)
+# Quality Engine v7.6.0 — Phase 2D.3 (Operational Resilience / Circuit Breakers)
 
 import base64
 import hashlib
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.5.4-P2D2-TICKER-SEARCH-RESILIENCE"
+APP_BUILD_VERSION = "v7.6.0-P2D3-CIRCUIT-BREAKER"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -124,6 +124,24 @@ DEFAULT_PROVIDER_TRANSPORT_POLICY = {
     "scanner_impact": "ISOLATED — no scanner-price-health impact",
 }
 TRANSPORT_HEALTH_RANK = {"UNKNOWN": 0, "HEALTHY": 1, "DEGRADED": 2, "FAILED": 3}
+
+# Phase 2D.3 route-scoped circuit-breaker policy for app-owned direct HTTP.
+# yfinance owns its internal HTTP transport, so price-history calls remain protected
+# by the existing freshness/data-integrity gates rather than being short-circuited here.
+CIRCUIT_FAILURE_WINDOW_SECONDS = 10 * 60
+CIRCUIT_FAILURE_THRESHOLD_BY_ROLE = {
+    "CORE": 3,
+    "RECOVERY": 2,
+    "UNIVERSE": 2,
+    "ANCILLARY": 2,
+}
+CIRCUIT_COOLDOWN_SECONDS_BY_ROLE = {
+    "CORE": 60,
+    "RECOVERY": 120,
+    "UNIVERSE": 180,
+    "ANCILLARY": 300,
+}
+CIRCUIT_STATE_RANK = {"CLOSED": 0, "HALF_OPEN": 1, "OPEN": 2}
 
 # Phase 2A market-session / targeted-recovery controls.
 NYSE_CALENDAR_NAME = "XNYS"
@@ -211,6 +229,8 @@ if "persistence_restore_source" not in st.session_state:
     st.session_state.persistence_restore_source = ""
 if "provider_transport_events" not in st.session_state:
     st.session_state.provider_transport_events = []
+if "provider_circuit_breakers" not in st.session_state:
+    st.session_state.provider_circuit_breakers = {}
 
 # ---------------------------
 # Helpers
@@ -296,6 +316,214 @@ def _retry_delay_seconds(response, attempt_index):
     return min(delay, HTTP_MAX_BACKOFF_SECONDS)
 
 
+
+class CircuitOpenError(requests.RequestException):
+    """Raised when a route-scoped circuit intentionally skips a network call."""
+
+
+def _circuit_route_role(provider, route=""):
+    """Return the resilience role for one provider route.
+
+    Provider-level roles are the default. Yahoo/yfinance metadata routes are
+    explicitly non-core even though Yahoo price history is CORE; direct HTTP
+    Yahoo metadata already uses the separate "Yahoo HTTP" provider label.
+    """
+    return str(provider_transport_policy(provider).get("role", "ANCILLARY")).upper()
+
+
+def _circuit_key(provider, route, url=""):
+    route_name = str(route or "").strip()
+    if not route_name:
+        try:
+            parsed = requests.utils.urlparse(str(url))
+            route_name = f"{parsed.netloc}{parsed.path}" or str(url)
+        except Exception:
+            route_name = str(url or "default")
+    return f"{str(provider or 'Unknown')}::{route_name}", route_name
+
+
+def _circuit_policy(provider, route=""):
+    role = _circuit_route_role(provider, route)
+    threshold = int(CIRCUIT_FAILURE_THRESHOLD_BY_ROLE.get(role, 2))
+    cooldown = int(CIRCUIT_COOLDOWN_SECONDS_BY_ROLE.get(role, 180))
+    return role, max(1, threshold), max(1, cooldown)
+
+
+def _circuit_get_state(provider, route="", url=""):
+    key, route_name = _circuit_key(provider, route, url)
+    role, threshold, cooldown = _circuit_policy(provider, route_name)
+    store = st.session_state.setdefault("provider_circuit_breakers", {})
+    state = store.get(key)
+    if not isinstance(state, dict):
+        state = {
+            "provider": str(provider or "Unknown"),
+            "route": route_name,
+            "role": role,
+            "state": "CLOSED",
+            "consecutive_failures": 0,
+            "opens": 0,
+            "blocked_calls": 0,
+            "opened_at": None,
+            "last_failure_at": None,
+            "last_success_at": None,
+            "last_status": "",
+            "last_error": "",
+            "last_transition": "initialized CLOSED",
+            "threshold": threshold,
+            "cooldown_seconds": cooldown,
+        }
+        store[key] = state
+    else:
+        # Keep policy fields current across app code upgrades within a session.
+        state["provider"] = str(provider or state.get("provider", "Unknown"))
+        state["route"] = route_name
+        state["role"] = role
+        state["threshold"] = threshold
+        state["cooldown_seconds"] = cooldown
+    return key, state
+
+
+def _circuit_before_request(provider, route="", url=""):
+    """Return (allowed, circuit_state, cooldown_remaining_seconds).
+
+    OPEN circuits reject calls during cooldown. Once cooldown expires, exactly
+    the next synchronous request becomes a HALF_OPEN recovery probe.
+    """
+    _, state = _circuit_get_state(provider, route, url)
+    now = time.time()
+    current = str(state.get("state", "CLOSED"))
+
+    if current == "OPEN":
+        opened_at = state.get("opened_at")
+        cooldown = int(state.get("cooldown_seconds", 180))
+        elapsed = (now - float(opened_at)) if opened_at is not None else float("inf")
+        remaining = max(0.0, cooldown - elapsed)
+
+        if remaining > 0:
+            state["blocked_calls"] = int(state.get("blocked_calls", 0)) + 1
+            state["last_transition"] = f"OPEN — blocked call; probe eligible in {remaining:.0f}s"
+            return False, state, remaining
+
+        state["state"] = "HALF_OPEN"
+        state["last_transition"] = "HALF_OPEN — cooldown elapsed; recovery probe allowed"
+        return True, state, 0.0
+
+    # HALF_OPEN is synchronous in this app: the allowed request below becomes
+    # the recovery probe and its result immediately closes or re-opens the circuit.
+    return True, state, 0.0
+
+
+def _circuit_after_request(provider, route="", url="", *, success, status_code="", error=""):
+    """Update one route circuit from the final logical request outcome."""
+    _, state = _circuit_get_state(provider, route, url)
+    now = time.time()
+    current = str(state.get("state", "CLOSED"))
+    state["last_status"] = status_code if status_code is not None else ""
+    state["last_error"] = str(error or "")
+
+    if bool(success):
+        was_recovery = current in {"OPEN", "HALF_OPEN"}
+        state["state"] = "CLOSED"
+        state["consecutive_failures"] = 0
+        state["opened_at"] = None
+        state["last_success_at"] = now
+        state["last_transition"] = (
+            "CLOSED — recovery probe succeeded"
+            if was_recovery else "CLOSED — request succeeded"
+        )
+        return state
+
+    last_failure_at = state.get("last_failure_at")
+    if (
+        last_failure_at is None
+        or (now - float(last_failure_at)) > CIRCUIT_FAILURE_WINDOW_SECONDS
+    ):
+        state["consecutive_failures"] = 0
+
+    state["last_failure_at"] = now
+    state["consecutive_failures"] = int(state.get("consecutive_failures", 0)) + 1
+    threshold = int(state.get("threshold", 2))
+
+    if current == "HALF_OPEN" or state["consecutive_failures"] >= threshold:
+        state["state"] = "OPEN"
+        state["opened_at"] = now
+        state["opens"] = int(state.get("opens", 0)) + 1
+        state["last_transition"] = (
+            "OPEN — recovery probe failed"
+            if current == "HALF_OPEN"
+            else f"OPEN — {state['consecutive_failures']} failures reached threshold {threshold}"
+        )
+    else:
+        state["state"] = "CLOSED"
+        state["last_transition"] = (
+            f"CLOSED — failure {state['consecutive_failures']}/{threshold}; circuit not open"
+        )
+    return state
+
+
+def circuit_breaker_summary(include_closed=True):
+    """Return route-level circuit state for diagnostics."""
+    store = st.session_state.get("provider_circuit_breakers", {}) or {}
+    rows = []
+    now = time.time()
+
+    for state in store.values():
+        if not isinstance(state, dict):
+            continue
+        circuit_state = str(state.get("state", "CLOSED"))
+        if not include_closed and circuit_state == "CLOSED":
+            continue
+
+        cooldown_remaining = 0.0
+        if circuit_state == "OPEN" and state.get("opened_at") is not None:
+            cooldown_remaining = max(
+                0.0,
+                float(state.get("cooldown_seconds", 180))
+                - (now - float(state.get("opened_at"))),
+            )
+
+        rows.append({
+            "Provider": state.get("provider", "Unknown"),
+            "Route": state.get("route", ""),
+            "Role": state.get("role", "ANCILLARY"),
+            "Circuit State": circuit_state,
+            "Failures": int(state.get("consecutive_failures", 0)),
+            "Threshold": int(state.get("threshold", 2)),
+            "Opens": int(state.get("opens", 0)),
+            "Blocked Calls": int(state.get("blocked_calls", 0)),
+            "Cooldown Remaining s": cooldown_remaining,
+            "Last Status": state.get("last_status", ""),
+            "Last Error": state.get("last_error", ""),
+            "Last Transition": state.get("last_transition", ""),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    return df.sort_values(
+        ["Circuit State", "Provider", "Route"],
+        key=lambda s: (
+            s.map({"OPEN": 0, "HALF_OPEN": 1, "CLOSED": 2})
+            if s.name == "Circuit State" else s
+        ),
+    ).reset_index(drop=True)
+
+
+def _provider_circuit_rollup(provider):
+    """Compact provider-level view of route circuits for the telemetry table."""
+    df = circuit_breaker_summary(include_closed=True)
+    if df.empty:
+        return "UNKNOWN", 0, 0
+    subset = df[df["Provider"].astype(str).eq(str(provider))]
+    if subset.empty:
+        return "UNKNOWN", 0, 0
+    states = subset["Circuit State"].astype(str).tolist()
+    state = max(states, key=lambda s: CIRCUIT_STATE_RANK.get(s, -1))
+    blocked = int(pd.to_numeric(subset["Blocked Calls"], errors="coerce").fillna(0).sum())
+    opens = int(pd.to_numeric(subset["Opens"], errors="coerce").fillna(0).sum())
+    return state, blocked, opens
+
+
 def http_request(provider, method, url, *, timeout=None, max_retries=None,
                  expected_statuses=None, retry_statuses=None, route="", **kwargs):
     """Bounded, observable request wrapper for app-owned HTTP traffic.
@@ -316,6 +544,16 @@ def http_request(provider, method, url, *, timeout=None, max_retries=None,
     else:
         request_timeout = (HTTP_CONNECT_TIMEOUT, float(timeout))
 
+    allowed, circuit_state, cooldown_remaining = _circuit_before_request(
+        provider, route=route, url=url
+    )
+    if not allowed:
+        route_name = circuit_state.get("route", route or "endpoint")
+        raise CircuitOpenError(
+            f"{provider} circuit OPEN for {route_name}; "
+            f"recovery probe available in {cooldown_remaining:.0f}s"
+        )
+
     started_total = time.perf_counter()
     last_error = ""
     response = None
@@ -335,10 +573,15 @@ def http_request(provider, method, url, *, timeout=None, max_retries=None,
             else:
                 success = int(response.status_code) in set(expected_statuses)
             elapsed_ms = (time.perf_counter() - started_total) * 1000.0
+            logical_error = "" if success else f"HTTP {response.status_code}"
+            _circuit_after_request(
+                provider, route=route, url=url, success=success,
+                status_code=response.status_code, error=logical_error,
+            )
             _record_provider_transport_event(
                 provider, success, elapsed_ms, status_code=response.status_code,
                 retries=max(0, attempts - 1), route=route,
-                error="" if success else f"HTTP {response.status_code}",
+                error=logical_error,
             )
             return response
         except (requests.Timeout, requests.ConnectionError) as exc:
@@ -347,6 +590,10 @@ def http_request(provider, method, url, *, timeout=None, max_retries=None,
                 time.sleep(_retry_delay_seconds(None, attempt))
                 continue
             elapsed_ms = (time.perf_counter() - started_total) * 1000.0
+            _circuit_after_request(
+                provider, route=route, url=url, success=False,
+                status_code="", error=last_error,
+            )
             _record_provider_transport_event(
                 provider, False, elapsed_ms, status_code="", retries=max(0, attempts - 1),
                 route=route, error=last_error,
@@ -355,6 +602,10 @@ def http_request(provider, method, url, *, timeout=None, max_retries=None,
         except requests.RequestException as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             elapsed_ms = (time.perf_counter() - started_total) * 1000.0
+            _circuit_after_request(
+                provider, route=route, url=url, success=False,
+                status_code="", error=last_error,
+            )
             _record_provider_transport_event(
                 provider, False, elapsed_ms, status_code="", retries=max(0, attempts - 1),
                 route=route, error=last_error,
@@ -362,9 +613,15 @@ def http_request(provider, method, url, *, timeout=None, max_retries=None,
             raise
 
     elapsed_ms = (time.perf_counter() - started_total) * 1000.0
+    final_status = getattr(response, "status_code", "")
+    final_error = last_error or "Unknown HTTP failure"
+    _circuit_after_request(
+        provider, route=route, url=url, success=False,
+        status_code=final_status, error=final_error,
+    )
     _record_provider_transport_event(
-        provider, False, elapsed_ms, status_code=getattr(response, "status_code", ""),
-        retries=max(0, attempts - 1), route=route, error=last_error or "Unknown HTTP failure",
+        provider, False, elapsed_ms, status_code=final_status,
+        retries=max(0, attempts - 1), route=route, error=final_error,
     )
     return response
 
@@ -441,10 +698,14 @@ def transport_telemetry_summary():
         policy = provider_transport_policy(provider)
         warn_ms = float(policy.get("warn_latency_ms", 3000))
         health = _provider_transport_health(subset, warn_ms)
+        circuit_state, circuit_blocked, circuit_opens = _provider_circuit_rollup(provider)
         rows.append({
             "Provider": provider,
             "Policy Role": policy.get("role", "ANCILLARY"),
             "Transport Health": health,
+            "Circuit State": circuit_state,
+            "Circuit Opens": circuit_opens,
+            "Blocked Calls": circuit_blocked,
             "Calls": calls,
             "Success Rate": success_rate,
             "Retries": retries,
@@ -6126,10 +6387,43 @@ with scanner_tab:
                         lambda v: "N/A" if pd.isna(v) else f"{v:,.0f}"
                     )
             st.dataframe(display_transport, hide_index=True, use_container_width=True)
+
+            circuit_df = circuit_breaker_summary(include_closed=True)
+            if not circuit_df.empty:
+                open_count = int(circuit_df["Circuit State"].eq("OPEN").sum())
+                half_open_count = int(circuit_df["Circuit State"].eq("HALF_OPEN").sum())
+                blocked_count = int(
+                    pd.to_numeric(circuit_df["Blocked Calls"], errors="coerce").fillna(0).sum()
+                )
+                cb1, cb2, cb3 = st.columns(3)
+                cb1.metric("Open circuits", open_count)
+                cb2.metric("Half-open probes", half_open_count)
+                cb3.metric("Blocked calls", blocked_count)
+
+                active_circuits = circuit_df[
+                    circuit_df["Circuit State"].ne("CLOSED")
+                    | (pd.to_numeric(circuit_df["Blocked Calls"], errors="coerce").fillna(0) > 0)
+                ].copy()
+                if not active_circuits.empty:
+                    if "Cooldown Remaining s" in active_circuits.columns:
+                        active_circuits["Cooldown Remaining s"] = active_circuits[
+                            "Cooldown Remaining s"
+                        ].map(lambda v: f"{float(v):.0f}" if pd.notna(v) else "N/A")
+                    st.warning(
+                        "Circuit-breaker isolation is active for one or more direct-HTTP routes. "
+                        "OPEN routes are skipped until their cooldown expires; the next call then becomes a HALF_OPEN recovery probe."
+                    )
+                    st.dataframe(active_circuits, hide_index=True, use_container_width=True)
+                else:
+                    st.caption(
+                        "Circuit breakers: all exercised direct-HTTP routes are CLOSED; no calls have been blocked in this app session."
+                    )
+
             st.caption(
                 "Provider states are policy-driven: FAILED reflects material request failure; DEGRADED reflects partial failure, retry pressure, or latency above the provider threshold. "
                 "Only CORE provider state contributes to Core Transport. RECOVERY, UNIVERSE and ANCILLARY failures remain visible but are isolated from scanner-price health. "
-                "Direct HTTP calls use one pooled requests.Session with bounded transient retries; Yahoo/yfinance is timed at the library-call level."
+                "Phase 2D.3 circuit breakers are route-scoped for app-owned direct HTTP: repeated logical failures open only the failing route, cooldown suppresses repeated calls, and the first post-cooldown call is a recovery probe. "
+                "Yahoo/yfinance price-history transport remains governed by its library plus the scanner's completed-session freshness/data-integrity gates."
             )
         else:
             st.caption("No provider transport event has been recorded in this app session yet.")
