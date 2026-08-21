@@ -1,9 +1,10 @@
-# Quality Engine v7.5.3 — Phase 2D.2 HOTFIX (P95 Latency Policy Classification)
+# Quality Engine v7.5.4 — Phase 2D.2 HOTFIX (Ticker Search Resilience)
 
 import base64
 import hashlib
 import html as html_lib
 import io
+import inspect
 import json
 import os
 import re
@@ -52,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.5.3-P2D2-LATENCY-POLICY-HOTFIX"
+APP_BUILD_VERSION = "v7.5.4-P2D2-TICKER-SEARCH-RESILIENCE"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -1296,9 +1297,22 @@ def safe_headers():
 # ---------------------------
 @st.cache_data(ttl=DIRECTORY_CACHE_TTL, show_spinner=False)
 def load_company_directory():
+    """Ticker/company autocomplete directory with a non-blocking fallback.
+
+    SEC is preferred because it provides broad US issuer coverage. If SEC is
+    unavailable (for example a hosted-cloud 403), company-name autocomplete
+    falls back to the S&P 500 directory plus a compact core list. Exact ticker
+    entry remains available independently of this directory.
+    """
     rows = []
+    directory_source = "SEC company ticker directory"
+    degraded = False
+
     try:
-        response = http_get("SEC", SEC_TICKERS_URL, headers=safe_headers(), timeout=12, max_retries=0, route="company ticker directory")
+        response = http_get(
+            "SEC", SEC_TICKERS_URL, headers=safe_headers(), timeout=12,
+            max_retries=0, route="company ticker directory",
+        )
         response.raise_for_status()
         payload = response.json()
         for item in payload.values():
@@ -1307,18 +1321,38 @@ def load_company_directory():
             if ticker and title:
                 rows.append((ticker, title))
     except Exception:
-        # Small fallback so the search control still renders if SEC is temporarily unavailable.
-        rows = [
+        degraded = True
+        directory_source = "fallback directory"
+
+        # Broad, independent emergency directory. load_sp500() does not depend
+        # on load_company_directory(), so this does not create recursion.
+        try:
+            sp500 = load_sp500()
+            if isinstance(sp500, pd.DataFrame) and not sp500.empty:
+                for _, row in sp500.iterrows():
+                    ticker = clean_symbol(row.get("Ticker", ""))
+                    company = str(row.get("Company", "") or "").strip()
+                    if ticker and company:
+                        rows.append((ticker, company))
+        except Exception:
+            pass
+
+        # Keep a small deterministic core even if every directory endpoint is down.
+        rows.extend([
             ("AAPL", "Apple Inc."),
             ("MSFT", "Microsoft Corporation"),
             ("NVDA", "NVIDIA Corporation"),
             ("CSCO", "Cisco Systems, Inc."),
             ("CRDO", "Credo Technology Group Holding Ltd"),
-        ]
+            ("SMTC", "Semtech Corporation"),
+        ])
 
     df = pd.DataFrame(rows, columns=["Ticker", "Company"]).drop_duplicates("Ticker")
+    df = df[df["Ticker"].astype(str).str.strip() != ""]
     df = df.sort_values(["Ticker", "Company"]).reset_index(drop=True)
     df["Label"] = df["Ticker"] + " — " + df["Company"]
+    df.attrs["directory_source"] = directory_source
+    df.attrs["directory_degraded"] = degraded
     return df
 
 # ---------------------------
@@ -1624,6 +1658,7 @@ def _provider_number(value):
 def yahoo_direct_fundamentals(symbol):
     """Secondary Yahoo HTTP route used only to repair missing yfinance metadata fields."""
     result = {
+        "company_name": "",
         "sector": "", "industry": "", "market_cap": np.nan,
         "trailing_pe": np.nan, "forward_pe": np.nan, "trailing_eps": np.nan,
         "route_notes": [],
@@ -1642,6 +1677,7 @@ def yahoo_direct_fundamentals(symbol):
         rows = ((response.json().get("quoteResponse") or {}).get("result") or [])
         if rows:
             row = rows[0]
+            result["company_name"] = str(row.get("longName") or row.get("shortName") or "").strip()
             result["market_cap"] = _provider_number(row.get("marketCap"))
             result["trailing_pe"] = _provider_number(row.get("trailingPE"))
             result["forward_pe"] = _provider_number(row.get("forwardPE"))
@@ -1664,6 +1700,10 @@ def yahoo_direct_fundamentals(symbol):
         summary = payload.get("summaryDetail") or {}
         stats = payload.get("defaultKeyStatistics") or {}
         price = payload.get("price") or {}
+        if not result["company_name"]:
+            result["company_name"] = str(
+                price.get("longName") or price.get("shortName") or ""
+            ).strip()
         result["sector"] = str(profile.get("sector", "") or "")
         result["industry"] = str(profile.get("industry", "") or "")
         if pd.isna(result["market_cap"]):
@@ -2081,6 +2121,7 @@ def event_override_for_symbol(symbol):
 def get_company_snapshot(symbol, fallback_close=None):
     """Phase 2C metadata pipeline with provenance, fallback repair and event corroboration."""
     snapshot = {
+        "company_name": "",
         "sector": "",
         "industry": "",
         "market_cap": np.nan,
@@ -2129,6 +2170,9 @@ def get_company_snapshot(symbol, fallback_close=None):
         y_start = time.perf_counter()
         try:
             info = ticker.info or {}
+            company_name = str(info.get("longName") or info.get("shortName") or "").strip()
+            if company_name:
+                snapshot["company_name"] = company_name
             _record_provider_transport_event(
                 "Yahoo / yfinance", True, (time.perf_counter() - y_start) * 1000.0,
                 status_code="OK", route="metadata info",
@@ -2241,6 +2285,8 @@ def get_company_snapshot(symbol, fallback_close=None):
     )
     if needs_yahoo_repair:
         direct = yahoo_direct_fundamentals(symbol)
+        if not snapshot.get("company_name") and direct.get("company_name"):
+            snapshot["company_name"] = str(direct["company_name"]).strip()
         for key, label in [
             ("sector", "Sector"), ("industry", "Industry"), ("market_cap", "Market Cap"),
             ("trailing_pe", "Trailing P/E"), ("forward_pe", "Forward P/E"),
@@ -4890,29 +4936,93 @@ with ticker_tab:
     company_dir = load_company_directory()
     labels = company_dir["Label"].tolist()
 
-    chosen = st.selectbox(
-        "Ticker / company",
-        labels,
-        index=None,
-        placeholder="Start typing CRDO, Cisco, NVIDIA...",
-        help="Type a ticker or company name. The list filters immediately; no Enter key is required.",
-    )
+    # Exact ticker lookup must not depend on the ancillary company-directory
+    # provider. Newer Streamlit versions support free-entry selectbox values.
+    # Older supported deployments get a small direct-ticker form instead.
+    selectbox_supports_new = False
+    try:
+        selectbox_supports_new = "accept_new_options" in inspect.signature(st.selectbox).parameters
+    except Exception:
+        selectbox_supports_new = False
+
+    if selectbox_supports_new:
+        chosen = st.selectbox(
+            "Ticker / company",
+            labels,
+            index=None,
+            placeholder="Type SMTC, CRDO, Cisco, NVIDIA...",
+            help=(
+                "Choose a company suggestion, or type an exact ticker such as SMTC and press Enter. "
+                "Exact ticker entry works even if the company-directory provider is unavailable."
+            ),
+            accept_new_options=True,
+        )
+    else:
+        chosen = st.selectbox(
+            "Ticker / company",
+            labels,
+            index=None,
+            placeholder="Start typing CRDO, Cisco, NVIDIA...",
+            help="Choose a company suggestion, or use Direct ticker lookup below.",
+        )
+        with st.form("direct_ticker_lookup_form", clear_on_submit=False):
+            direct_ticker_value = st.text_input(
+                "Direct ticker lookup",
+                placeholder="e.g. SMTC",
+                help="Enter an exact ticker symbol. This route does not depend on the company directory.",
+            )
+            direct_ticker_submit = st.form_submit_button("Analyze ticker")
+        if direct_ticker_submit and str(direct_ticker_value).strip():
+            chosen = str(direct_ticker_value).strip()
+
+    if company_dir.attrs.get("directory_degraded", False):
+        st.caption(
+            "Company-name autocomplete is using a fallback directory because the primary directory "
+            "is unavailable. Exact ticker entry remains fully available."
+        )
 
     if chosen:
-        selected_ticker = chosen.split(" — ", 1)[0]
-        selected_company = chosen.split(" — ", 1)[1] if " — " in chosen else selected_ticker
+        chosen_text = str(chosen).strip()
+        if " — " in chosen_text:
+            selected_ticker = clean_symbol(chosen_text.split(" — ", 1)[0])
+            selected_company = chosen_text.split(" — ", 1)[1].strip() or selected_ticker
+        else:
+            # A new value is treated only as a direct ticker token. Company-name
+            # free text should be selected from the autocomplete suggestions.
+            direct_token = chosen_text.upper().strip()
+            if not re.fullmatch(r"[A-Z0-9][A-Z0-9.\-]{0,14}", direct_token):
+                st.warning(
+                    "For a direct lookup, enter an exact ticker symbol (for example SMTC). "
+                    "For a company name, choose one of the autocomplete suggestions."
+                )
+                selected_ticker = ""
+                selected_company = ""
+            else:
+                selected_ticker = clean_symbol(direct_token)
+                known = company_dir[company_dir["Ticker"] == selected_ticker]
+                selected_company = (
+                    str(known.iloc[0]["Company"])
+                    if not known.empty else selected_ticker
+                )
 
-        with st.spinner(f"Analyzing {selected_ticker}..."):
-            df = download_one(selected_ticker, "5y")
-            completed_for_meta = completed_session_frame(df)
-            fallback_close = (
-                float(completed_for_meta["Close"].iloc[-1])
-                if not completed_for_meta.empty and "Close" in completed_for_meta.columns else np.nan
-            )
-            metadata = get_company_snapshot(selected_ticker, fallback_close)
-            diag = compute_search_diagnostic(selected_ticker, selected_company, df, metadata)
+        if selected_ticker:
+            with st.spinner(f"Analyzing {selected_ticker}..."):
+                df = download_one(selected_ticker, "5y")
+                completed_for_meta = completed_session_frame(df)
+                fallback_close = (
+                    float(completed_for_meta["Close"].iloc[-1])
+                    if not completed_for_meta.empty and "Close" in completed_for_meta.columns else np.nan
+                )
+                metadata = get_company_snapshot(selected_ticker, fallback_close)
+                if selected_company == selected_ticker and metadata.get("company_name"):
+                    selected_company = str(metadata["company_name"]).strip() or selected_ticker
+                diag = compute_search_diagnostic(selected_ticker, selected_company, df, metadata)
+        else:
+            diag = None
 
-        if diag is None or not diag.get("Data Valid", False):
+        if not selected_ticker:
+            pass
+        elif diag is None or not diag.get("Data Valid", False):
             reason = "No usable market data returned." if diag is None else diag.get("Data Error", "Market data validation failed.")
             st.error(
                 f"⚠️ **Market data unavailable for {selected_ticker}.** {reason} "
