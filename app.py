@@ -1,4 +1,4 @@
-# Quality Engine v7.6.0 — Phase 2D.3 (Operational Resilience / Circuit Breakers)
+# Quality Engine v7.7.0 — Phase 2E.1 (Responsive Decision UX)
 
 import base64
 import hashlib
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.6.0-P2D3-CIRCUIT-BREAKER"
+APP_BUILD_VERSION = "v7.7.0-P2E1-RESPONSIVE-DECISION-UX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -5162,15 +5162,122 @@ def fmt_ratio(value):
     return "N/A" if pd.isna(value) else f"{value:.1f}R"
 
 
+def _metric_text(value):
+    """Safe display text for responsive metric cards."""
+    if value is None:
+        return "N/A"
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except Exception:
+        pass
+    return str(value)
+
+
+def render_responsive_metrics(items, desktop_columns=None):
+    """Render high-value metrics without squeezing text on narrow screens.
+
+    Desktop keeps the intended dense dashboard layout. Tablet-sized screens
+    use two columns and narrow phones use a single readable column.
+    This is presentation-only and does not alter any diagnostic or trading logic.
+    """
+    normalized = [(str(label), _metric_text(value)) for label, value in list(items)]
+    if not normalized:
+        return
+
+    if desktop_columns is None:
+        desktop_columns = len(normalized)
+    desktop_columns = max(1, min(int(desktop_columns), 6))
+
+    cards = []
+    for label, value in normalized:
+        cards.append(
+            '<div class="qe-responsive-metric">'
+            f'<div class="qe-responsive-metric-label">{html_lib.escape(label)}</div>'
+            f'<div class="qe-responsive-metric-value">{html_lib.escape(value)}</div>'
+            '</div>'
+        )
+
+    st.markdown(
+        (
+            f'<div class="qe-responsive-metric-grid" style="--qe-desktop-cols:{desktop_columns};">'
+            + "".join(cards)
+            + "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+st.markdown(
+    """
+    <style>
+    .qe-responsive-metric-grid {
+        display: grid;
+        grid-template-columns: repeat(var(--qe-desktop-cols), minmax(0, 1fr));
+        gap: 0.75rem;
+        margin: 0.25rem 0 0.65rem 0;
+        width: 100%;
+    }
+    .qe-responsive-metric {
+        min-width: 0;
+        padding: 0.58rem 0.7rem 0.62rem 0.7rem;
+        border: 1px solid rgba(127, 127, 127, 0.22);
+        border-radius: 0.55rem;
+        background: rgba(127, 127, 127, 0.035);
+    }
+    .qe-responsive-metric-label {
+        font-size: 0.82rem;
+        line-height: 1.2;
+        opacity: 0.82;
+        margin-bottom: 0.28rem;
+        overflow-wrap: anywhere;
+    }
+    .qe-responsive-metric-value {
+        font-size: clamp(1.28rem, 2.25vw, 2rem);
+        line-height: 1.15;
+        font-weight: 400;
+        overflow-wrap: anywhere;
+        word-break: normal;
+    }
+    @media (max-width: 900px) {
+        .qe-responsive-metric-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .qe-responsive-metric-value {
+            font-size: 1.45rem;
+        }
+    }
+    @media (max-width: 480px) {
+        .qe-responsive-metric-grid {
+            grid-template-columns: minmax(0, 1fr);
+            gap: 0.5rem;
+        }
+        .qe-responsive-metric {
+            padding: 0.52rem 0.62rem;
+        }
+        .qe-responsive-metric-value {
+            font-size: 1.38rem;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
 # ---------------------------
 # Compact market-regime header
 # ---------------------------
 st.subheader("Market Regime")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Regime", regime["label"])
-m2.metric("Score", f"{regime['score']:.1f}")
-m3.metric("VIX", f"{regime['vix']:.1f}" if pd.notna(regime["vix"]) else "N/A")
-m4.metric("Bias", regime["bias"])
+render_responsive_metrics(
+    [
+        ("Regime", regime["label"]),
+        ("Score", f"{regime['score']:.1f}"),
+        ("VIX", f"{regime['vix']:.1f}" if pd.notna(regime["vix"]) else "N/A"),
+        ("Bias", regime["bias"]),
+    ],
+    desktop_columns=4,
+)
 
 with st.expander("Regime details", expanded=False):
     st.dataframe(
@@ -5361,11 +5468,15 @@ with ticker_tab:
                 entry_quality = "C — NOT READY"
                 action_label = diag["Trade State"]
 
-            cq1, cq2, cq3, cq4 = st.columns(4)
-            cq1.metric("Candidate Quality", candidate_quality)
-            cq2.metric("Entry Quality", entry_quality)
-            cq3.metric("Action", action_label)
-            cq4.metric("Price Data Confidence", confidence["level"])
+            render_responsive_metrics(
+                [
+                    ("Candidate Quality", candidate_quality),
+                    ("Entry Quality", entry_quality),
+                    ("Action", action_label),
+                    ("Price Data Confidence", confidence["level"]),
+                ],
+                desktop_columns=4,
+            )
             st.caption(
                 "Quality Engine: **Candidate Quality** asks whether the stock is worth watching; "
                 "**Entry Quality** asks whether the latest completed-session location/risk is acceptable; "
@@ -5379,11 +5490,15 @@ with ticker_tab:
                 session_note += " The provider's in-progress same-day daily candle was excluded from scoring."
             st.info(session_note)
 
-            v1, v2, v3, v4 = st.columns(4)
-            v1.metric("Signal Close", fmt_price(diag["Close"]))
-            v2.metric("Momentum Score", f"{diag['Momentum Score']:.1f}")
-            v3.metric("Trend", diag["Trend"])
-            v4.metric("RS vs SPY", diag["RS vs SPY"])
+            render_responsive_metrics(
+                [
+                    ("Signal Close", fmt_price(diag["Close"])),
+                    ("Momentum Score", f"{diag['Momentum Score']:.1f}"),
+                    ("Trend", diag["Trend"]),
+                    ("RS vs SPY", diag["RS vs SPY"]),
+                ],
+                desktop_columns=4,
+            )
 
             prev_mom = diag.get("Previous Momentum Score", np.nan)
             mom_delta = diag.get("Acceleration Delta", np.nan)
@@ -5419,11 +5534,15 @@ with ticker_tab:
                 "Relative Strength = the stock's return minus SPY's return. "
                 "Positive = outperforming SPY; negative = underperforming."
             )
-            rs1, rs2, rs3, rs4 = st.columns(4)
-            rs1.metric("RS 1M", "N/A" if pd.isna(diag["RS 1M vs SPY"]) else f"{diag['RS 1M vs SPY']:+.1f} pp")
-            rs2.metric("RS 3M", "N/A" if pd.isna(diag["RS 3M vs SPY"]) else f"{diag['RS 3M vs SPY']:+.1f} pp")
-            rs3.metric("RS 6M", "N/A" if pd.isna(diag["RS 6M vs SPY"]) else f"{diag['RS 6M vs SPY']:+.1f} pp")
-            rs4.metric("RS Edge", "N/A" if pd.isna(diag["RS Edge"]) else f"{diag['RS Edge']:+.1f}")
+            render_responsive_metrics(
+                [
+                    ("RS 1M", "N/A" if pd.isna(diag["RS 1M vs SPY"]) else f"{diag['RS 1M vs SPY']:+.1f} pp"),
+                    ("RS 3M", "N/A" if pd.isna(diag["RS 3M vs SPY"]) else f"{diag['RS 3M vs SPY']:+.1f} pp"),
+                    ("RS 6M", "N/A" if pd.isna(diag["RS 6M vs SPY"]) else f"{diag['RS 6M vs SPY']:+.1f} pp"),
+                    ("RS Edge", "N/A" if pd.isna(diag["RS Edge"]) else f"{diag['RS Edge']:+.1f}"),
+                ],
+                desktop_columns=4,
+            )
 
             st.caption(
                 "RS Edge = 20% × RS 1M + 35% × RS 3M + 45% × RS 6M. "
@@ -5437,10 +5556,14 @@ with ticker_tab:
                 "Each component is scaled/capped to a -100 to +100 score, so the final Momentum Score is a weighted momentum reading, not a % return."
             )
 
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Daily score", f"{diag['Daily']:.1f}")
-            m2.metric("Weekly score", f"{diag['Weekly']:.1f}")
-            m3.metric("Monthly score", f"{diag['Monthly']:.1f}")
+            render_responsive_metrics(
+                [
+                    ("Daily score", f"{diag['Daily']:.1f}"),
+                    ("Weekly score", f"{diag['Weekly']:.1f}"),
+                    ("Monthly score", f"{diag['Monthly']:.1f}"),
+                ],
+                desktop_columns=3,
+            )
 
             accel_delta = diag["Acceleration Delta"]
             st.caption(
@@ -5449,14 +5572,15 @@ with ticker_tab:
                 "A ≥10-point increase in magnitude = Accelerating; a ≥10-point decrease in magnitude = Decelerating."
             )
 
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("RSI(14)", f"{diag['RSI14']:.1f}")
-            q2.metric(
-                "Volume Ratio",
-                f"{diag['Volume Ratio']:.2f}x" if pd.notna(diag["Volume Ratio"]) else "N/A",
+            render_responsive_metrics(
+                [
+                    ("RSI(14)", f"{diag['RSI14']:.1f}"),
+                    ("Volume Ratio", f"{diag['Volume Ratio']:.2f}x" if pd.notna(diag["Volume Ratio"]) else "N/A"),
+                    ("Extension", diag["Extension"]),
+                    ("Sector", diag["Sector"]),
+                ],
+                desktop_columns=4,
             )
-            q3.metric("Extension", diag["Extension"])
-            q4.metric("Sector", diag["Sector"])
 
             ema20_dist = diag["Distance EMA20"]
             extension_note = (
@@ -5498,9 +5622,13 @@ with ticker_tab:
             if nm_notes:
                 st.info(" • ".join(nm_notes) + " This is not a data-quality failure.")
 
-            md1, md2 = st.columns(2)
-            md1.metric("Fundamental Data Confidence", diag["Fundamental Data Confidence"])
-            md2.metric("Event Data Confidence", diag["Event Data Confidence"])
+            render_responsive_metrics(
+                [
+                    ("Fundamental Data Confidence", diag["Fundamental Data Confidence"]),
+                    ("Event Data Confidence", diag["Event Data Confidence"]),
+                ],
+                desktop_columns=2,
+            )
 
             event_state = diag.get("Earnings Risk State", "UNKNOWN")
             source_text = diag.get("Earnings Source", "Unverified")
@@ -5775,13 +5903,14 @@ with ticker_tab:
                             "recalculate the setup from completed daily bars."
                         )
                 elif publish_price_repair:
-                    r1, r2, r3 = st.columns(3)
-                    r1.metric("Preferred Repair Area", f"{fmt_price(preferred_low)} – {fmt_price(preferred_high)}")
-                    r2.metric(
-                        "No-Chase Boundary",
-                        fmt_price(repair_boundary)
+                    render_responsive_metrics(
+                        [
+                            ("Preferred Repair Area", f"{fmt_price(preferred_low)} – {fmt_price(preferred_high)}"),
+                            ("No-Chase Boundary", fmt_price(repair_boundary)),
+                            ("Structure Invalidation", fmt_price(invalidation)),
+                        ],
+                        desktop_columns=3,
                     )
-                    r3.metric("Structure Invalidation", fmt_price(invalidation))
 
                     st.caption(
                         "**Preferred Repair Area** = where location/risk may become more attractive; it is not an order instruction. "
@@ -5899,33 +6028,39 @@ with ticker_tab:
                         "Reassess only after the identified defects repair."
                     )
             else:
-                p1, p2, p3, p4, p5 = st.columns(5)
-                p1.metric("Bias", diag["Bias"])
-                p2.metric(
-                    "Entry Zone",
-                    f"{fmt_price(diag['Entry Low'])} – {fmt_price(diag['Entry High'])}"
+                render_responsive_metrics(
+                    [
+                        ("Bias", diag["Bias"]),
+                        ("Entry Zone", f"{fmt_price(diag['Entry Low'])} – {fmt_price(diag['Entry High'])}"),
+                        ("Stop", fmt_price(diag["Stop"])),
+                        ("Stop Distance", "N/A" if pd.isna(diag["Stop %"]) else f"{diag['Stop %']:.1%}"),
+                        ("R:R @ midpoint", fmt_ratio(diag.get("RR Midpoint", diag["RR"]))),
+                    ],
+                    desktop_columns=5,
                 )
-                p3.metric("Stop", fmt_price(diag["Stop"]))
-                p4.metric(
-                    "Stop Distance",
-                    "N/A" if pd.isna(diag["Stop %"]) else f"{diag['Stop %']:.1%}"
+
+                render_responsive_metrics(
+                    [
+                        ("Target 1", fmt_price(diag["Target 1"])),
+                        ("Target 2", fmt_price(diag["Target 2"])),
+                    ],
+                    desktop_columns=2,
                 )
-                p5.metric("R:R @ midpoint", fmt_ratio(diag.get("RR Midpoint", diag["RR"])))
 
-                t1, t2 = st.columns(2)
-                t1.metric("Target 1", fmt_price(diag["Target 1"]))
-                t2.metric("Target 2", fmt_price(diag["Target 2"]))
-
-                rr1, rr2, rr3 = st.columns(3)
-                rr1.metric("T1 R @ midpoint", fmt_ratio(diag.get("T1 R", np.nan)))
-                rr2.metric("T2 R @ midpoint", fmt_ratio(diag.get("T2 R", np.nan)))
                 zone_min = diag.get("RR Zone Min", np.nan)
                 zone_max = diag.get("RR Zone Max", np.nan)
                 zone_text = (
                     f"{zone_min:.1f}R – {zone_max:.1f}R"
                     if pd.notna(zone_min) and pd.notna(zone_max) else "N/A"
                 )
-                rr3.metric("T2 R across entry zone", zone_text)
+                render_responsive_metrics(
+                    [
+                        ("T1 R @ midpoint", fmt_ratio(diag.get("T1 R", np.nan))),
+                        ("T2 R @ midpoint", fmt_ratio(diag.get("T2 R", np.nan))),
+                        ("T2 R across entry zone", zone_text),
+                    ],
+                    desktop_columns=3,
+                )
 
                 if diag.get("Entry Cautions"):
                     for caution in diag["Entry Cautions"]:
@@ -5954,7 +6089,6 @@ with ticker_tab:
                 st.dataframe(pd.DataFrame(rows, columns=["Signal", "Rule"]), hide_index=True, use_container_width=True)
 
             with st.expander("Fundamental snapshot", expanded=False):
-                f1, f2, f3 = st.columns(3)
                 mc = diag["Market Cap"]
                 field_status = diag.get("Fundamental Field Status", {}) or {}
                 field_notes = diag.get("Fundamental Field Notes", {}) or {}
@@ -5962,9 +6096,14 @@ with ticker_tab:
                     "N/M" if field_status.get("Trailing P/E") == "NOT_MEANINGFUL"
                     else ("N/A" if pd.isna(diag["Trailing PE"]) else f"{diag['Trailing PE']:.1f}")
                 )
-                f1.metric("Market Cap", "N/A" if pd.isna(mc) else f"${mc/1e9:,.1f}B")
-                f2.metric("Trailing P/E", trailing_pe_display)
-                f3.metric("Forward P/E", "N/A" if pd.isna(diag["Forward PE"]) else f"{diag['Forward PE']:.1f}")
+                render_responsive_metrics(
+                    [
+                        ("Market Cap", "N/A" if pd.isna(mc) else f"${mc/1e9:,.1f}B"),
+                        ("Trailing P/E", trailing_pe_display),
+                        ("Forward P/E", "N/A" if pd.isna(diag["Forward PE"]) else f"{diag['Forward PE']:.1f}"),
+                    ],
+                    desktop_columns=3,
+                )
 
 
                 fundamental_sources = diag.get("Fundamental Sources", {}) or {}
