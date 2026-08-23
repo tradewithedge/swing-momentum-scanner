@@ -53,14 +53,24 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.7.0-P2E1-RESPONSIVE-DECISION-UX"
+APP_BUILD_VERSION = "v8.0-V10-SHARED-GATE-MIGRATION-PHASE2"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
 NEAR_STOP_CAUTION_PCT = 0.07
-EARNINGS_HARD_BLOCK_DAYS = 3
+# v10 Shared Gate Architecture — Phase 2 migration constants.
+# Scores rank candidates; gates decide actionability.
+EXTENSION_WAIT_EMA20_PCT = 8.0
+EXTENSION_ELEVATED_EMA20_PCT = 6.0
+EXTENSION_CHASE_BLOCK_EMA20_PCT = 12.0
+EXTENSION_HOT_RSI = 75.0
+EXTENSION_EXTREME_RSI = 82.0
+FALLING_KNIFE_MIN_DOWN_PCT = -5.0
+FALLING_KNIFE_MIN_RANGE_ATR = 1.5
+FALLING_KNIFE_MAX_CLOSE_LOCATION = 0.35
+EARNINGS_HARD_BLOCK_DAYS = 5
 EARNINGS_CAUTION_DAYS = 14
 RECENT_EARNINGS_GRACE_DAYS = 5
 COMPANY_SNAPSHOT_TTL = 30 * 60
@@ -2712,6 +2722,29 @@ def get_company_snapshot(symbol, fallback_close=None):
     return snapshot
 
 
+def trading_sessions_until(start_date, end_date):
+    """Count XNYS sessions strictly after start_date through end_date, inclusive.
+
+    Falls back to weekdays if exchange_calendars is unavailable. This is the
+    canonical v10 event-proximity clock; calendar-day distance is not used for
+    the hard earnings gate.
+    """
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end < start:
+        return -1
+    cal = get_nyse_calendar()
+    if cal is not None:
+        try:
+            sessions = cal.sessions_in_range(start, end)
+            dates = pd.DatetimeIndex(sessions).tz_localize(None).normalize()
+            return int(((dates > start) & (dates <= end)).sum())
+        except Exception:
+            pass
+    days = pd.date_range(start + pd.Timedelta(days=1), end, freq="B")
+    return int(len(days))
+
+
 def evaluate_earnings_event(metadata, today=None):
     """Convert earnings metadata into a conservative event-risk state.
 
@@ -2789,9 +2822,10 @@ def evaluate_earnings_event(metadata, today=None):
 
     if next_date is not None and not pd.isna(next_date):
         event_date = pd.Timestamp(next_date).normalize()
-        days = (event_date - market_day).days
+        calendar_days = (event_date - market_day).days
+        trading_days = trading_sessions_until(market_day, event_date)
         confidence = _confidence_for(certainty)
-        if days < 0:
+        if calendar_days < 0:
             return {
                 "text": f"{_fmt(event_date)} — provider date has passed; next date needs re-verification",
                 "risk": False, "state": "UNKNOWN", "block": True,
@@ -2800,24 +2834,27 @@ def evaluate_earnings_event(metadata, today=None):
                 "certainty": "UNKNOWN",
             }
 
-        text = f"{_fmt(event_date)} — Today" if days == 0 else f"{_fmt(event_date)} — {days} days away"
+        text = (
+            f"{_fmt(event_date)} — Today" if calendar_days == 0 else
+            f"{_fmt(event_date)} — {trading_days} trading days away ({calendar_days} calendar days)"
+        )
         label = (
             "Confirmed earnings" if certainty == "CONFIRMED" else
             "Corroborated earnings estimate" if certainty == "CORROBORATED" else
             "Estimated earnings date"
         )
 
-        if days <= EARNINGS_HARD_BLOCK_DAYS:
+        if trading_days <= EARNINGS_HARD_BLOCK_DAYS:
             return {
                 "text": text, "risk": True, "state": "HIGH", "block": True,
                 "block_reason": (
                     f"{label} is {text}. New swing entries are blocked inside the "
-                    f"{EARNINGS_HARD_BLOCK_DAYS}-day earnings danger window."
+                    f"{EARNINGS_HARD_BLOCK_DAYS}-day trading-day earnings danger window."
                 ),
                 "event_date": event_date, "source": source, "confidence": confidence,
                 "certainty": certainty,
             }
-        if days <= EARNINGS_CAUTION_DAYS:
+        if trading_days <= EARNINGS_CAUTION_DAYS:
             return {
                 "text": text, "risk": True, "state": "CAUTION", "block": False,
                 "block_reason": "", "event_date": event_date, "source": source,
@@ -3343,6 +3380,59 @@ def directional_repair_requirements(trend, momentum_score, rs_edge):
     return unique_text_items(items)
 
 
+def shared_extension_gate(direction, close, ema8, ema20, atr14, rsi14):
+    """v10 shared extension classifier. Candidate strength cannot override this gate.
+
+    Returns E0/E1/E2/E3 severity. E2 is WAIT/REPAIR; E3 is CHASE BLOCK.
+    RSI alone is not a hard block; it becomes decisive in combination with location.
+    """
+    d = str(direction or "").upper()
+    vals = [finite_or_nan(v) for v in [close, ema8, ema20, atr14, rsi14]]
+    c, e8, e20, atr, rsi_v = vals
+    if d not in {"LONG", "SHORT"} or not all(np.isfinite(v) for v in [c, e20, atr, rsi_v]) or atr <= 0 or e20 <= 0:
+        return {"severity":"UNKNOWN", "state":"WAIT FOR STRUCTURE", "block":True, "reason":"Extension state could not be validated.", "ema20_pct":np.nan, "ema20_atr":np.nan}
+    dist_pct = (c / e20 - 1.0) * 100.0
+    dist_atr = (c - e20) / atr
+    if d == "SHORT":
+        dist_pct, dist_atr = -dist_pct, -dist_atr
+        hot = rsi_v <= (100.0 - EXTENSION_HOT_RSI)
+        extreme_rsi = rsi_v <= (100.0 - EXTENSION_EXTREME_RSI)
+    else:
+        hot = rsi_v >= EXTENSION_HOT_RSI
+        extreme_rsi = rsi_v >= EXTENSION_EXTREME_RSI
+
+    # E3 requires truly extreme price displacement; this keeps ABT-like +7%/hot-RSI
+    # cases in WAIT while GLXY-like +20%+ chases are hard-blocked.
+    if dist_pct >= EXTENSION_CHASE_BLOCK_EMA20_PCT or (dist_pct >= 10.0 and extreme_rsi):
+        sev, state, block = "E3", "BLOCK — EXTREME EXTENSION", True
+    elif dist_pct >= EXTENSION_WAIT_EMA20_PCT or (dist_pct >= EXTENSION_ELEVATED_EMA20_PCT and hot) or (dist_atr >= 2.5 and hot):
+        sev, state, block = "E2", "WAIT FOR ENTRY REPAIR", True
+    elif dist_pct >= EXTENSION_ELEVATED_EMA20_PCT or dist_atr >= 2.0 or hot:
+        sev, state, block = "E1", "ELEVATED", False
+    else:
+        sev, state, block = "E0", "NORMAL", False
+    reason = f"{sev}: directional EMA20 extension {dist_pct:+.1f}% ({dist_atr:+.2f} ATR), RSI {rsi_v:.1f}."
+    return {"severity":sev, "state":state, "block":block, "reason":reason, "ema20_pct":dist_pct, "ema20_atr":dist_atr}
+
+
+def falling_knife_gate(direction, latest, ema8, ema20, atr14, rs_edge=np.nan):
+    """Completed-session v10 downside-volatility gate for ordinary long swing entries."""
+    if str(direction or "").upper() != "LONG":
+        return {"triggered":False, "state":"CLEAR", "block":False, "reason":""}
+    try:
+        c=float(latest["Close"]); h=float(latest["High"]); l=float(latest["Low"]); ret=float(latest["1D %"])*100.0
+        atr=float(atr14); e8=float(ema8); e20=float(ema20)
+    except Exception:
+        return {"triggered":False, "state":"UNKNOWN", "block":False, "reason":""}
+    rng=max(h-l, 1e-9); range_atr=rng/atr if atr>0 else np.nan; close_loc=(c-l)/rng
+    triggered = (ret <= FALLING_KNIFE_MIN_DOWN_PCT and range_atr >= FALLING_KNIFE_MIN_RANGE_ATR and c < e8 and c < e20 and close_loc <= FALLING_KNIFE_MAX_CLOSE_LOCATION)
+    if triggered:
+        rs_txt = f", RS Edge {float(rs_edge):+.1f} pp" if np.isfinite(finite_or_nan(rs_edge)) else ""
+        return {"triggered":True, "state":"BLOCK FOR SESSION — FALLING KNIFE", "block":True,
+                "reason":f"Down {ret:.1f}% with {range_atr:.2f} ATR session range, close in bottom {close_loc:.0%}, below EMA8/EMA20{rs_txt}. Wait for a new completed-session confirmation/reclaim before ordinary swing entry."}
+    return {"triggered":False, "state":"CLEAR", "block":False, "reason":""}
+
+
 def entry_caution_items(direction, ema20_distance_pct, stop_pct):
     """Soft caution bands inside the hard entry limits."""
     direction = str(direction or "").upper()
@@ -3477,7 +3567,7 @@ def candidate_strengths_and_risks(diag):
     return unique_text_items(strengths), unique_text_items(risks)
 
 
-def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan, event_block=False, event_reason="", event_unknown=False, structure_reason=""):
+def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan, event_block=False, event_reason="", event_unknown=False, structure_reason="", extension_gate=None, falling_knife=None):
     """Canonical price-entry gate shared by scanner and ticker diagnostics.
 
     `ema20_distance_pct` is expressed in percentage points (e.g. +8.5, not 0.085).
@@ -3506,16 +3596,18 @@ def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan
     if not np.isfinite(dist) or not np.isfinite(rsi_value):
         return {"state": "NO TRADE", "quality": "UNKNOWN", "block": True, "reason": "Entry location could not be validated."}
 
-    if direction == "LONG" and (dist > 8.0 or rsi_value >= 75):
-        return {
-            "state": "WAIT FOR PULLBACK", "quality": "WAIT", "block": True,
-            "reason": f"Extended: price is {dist:+.1f}% vs EMA20 and RSI is {rsi_value:.1f}. Do not chase.",
-        }
-    if direction == "SHORT" and (dist < -8.0 or rsi_value <= 25):
-        return {
-            "state": "WAIT FOR BOUNCE", "quality": "WAIT", "block": True,
-            "reason": f"Oversold: price is {dist:+.1f}% vs EMA20 and RSI is {rsi_value:.1f}. Do not chase weakness.",
-        }
+    if falling_knife and falling_knife.get("block"):
+        return {"state": falling_knife.get("state", "BLOCK FOR SESSION — FALLING KNIFE"), "quality":"WAIT", "block":True, "reason":falling_knife.get("reason", "Falling-knife conditions detected.")}
+
+    if extension_gate is not None:
+        if extension_gate.get("block"):
+            return {"state": extension_gate.get("state", "WAIT FOR ENTRY REPAIR"), "quality":"WAIT", "block":True, "reason":extension_gate.get("reason", "Entry is extended.")}
+    else:
+        # Backward-compatible fallback for callers that have not supplied the v10 classifier.
+        if direction == "LONG" and dist > EXTENSION_WAIT_EMA20_PCT:
+            return {"state":"WAIT FOR ENTRY REPAIR", "quality":"WAIT", "block":True, "reason":f"Extended: price is {dist:+.1f}% vs EMA20."}
+        if direction == "SHORT" and dist < -EXTENSION_WAIT_EMA20_PCT:
+            return {"state":"WAIT FOR ENTRY REPAIR", "quality":"WAIT", "block":True, "reason":f"Downside extension: price is {dist:+.1f}% vs EMA20."}
 
     if np.isfinite(stop_value):
         if stop_value > 0.10:
@@ -3880,6 +3972,7 @@ def compute_record(symbol, company, sector, df):
         return None
 
     x = completed_session_frame(df)
+    x["EMA8"] = x["Close"].ewm(span=8, adjust=False).mean()
     x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
     x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
     x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
@@ -4356,6 +4449,11 @@ def build_ranked_master(df):
         (x["Close"] / x["EMA20"] - 1.0) * 100.0,
         np.nan,
     )
+    x["EMA20 Extension ATR"] = np.where(
+        x["ATR14"].gt(0),
+        (x["Close"] - x["EMA20"]) / x["ATR14"],
+        np.nan,
+    )
     x["20D High Distance %"] = np.where(
         x["High20"].gt(0),
         (x["Close"] / x["High20"] - 1.0) * 100.0,
@@ -4571,12 +4669,17 @@ def build_ranked_master(df):
                     structure_reason = "Bearish trend lacks negative RS Edge versus SPY."
             else:
                 structure_reason = "EMA trend structure is mixed; wait for directional structure."
+        ext_gate = shared_extension_gate(
+            direction, row.get("Close", np.nan), row.get("EMA8", row.get("EMA20", np.nan)),
+            row.get("EMA20", np.nan), row.get("ATR14", np.nan), row.get("RSI14", np.nan)
+        ) if direction else None
         entry_results.append(
             evaluate_entry_quality(
                 direction,
                 row.get("EMA20 Distance %", np.nan),
                 row.get("RSI14", np.nan),
                 structure_reason=structure_reason,
+                extension_gate=ext_gate,
             )
         )
     x["Price Entry State"] = [r["state"] for r in entry_results]
@@ -4709,6 +4812,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         return {"Data Valid": False, "Data Error": reason}
 
     x = completed_session_frame(df)
+    x["EMA8"] = x["Close"].ewm(span=8, adjust=False).mean()
     x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
     x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
     x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
@@ -4774,11 +4878,12 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         acceleration = "N/A"
 
     close = finite_or_nan(latest["Close"])
+    ema8 = finite_or_nan(latest["EMA8"])
     ema20 = finite_or_nan(latest["EMA20"])
     ema50 = finite_or_nan(latest["EMA50"])
     ema200 = finite_or_nan(latest["EMA200"])
 
-    if not all(np.isfinite(v) and v > 0 for v in [close, ema20, ema50, ema200]):
+    if not all(np.isfinite(v) and v > 0 for v in [close, ema8, ema20, ema50, ema200]):
         return {
             "Data Valid": False,
             "Data Error": "Latest price/trend values are incomplete, so no trading assessment was generated.",
@@ -4979,8 +5084,14 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         trade_state = "NO TRADE"
         trade_block_reason = "Momentum/trend alignment is mixed."
 
-    # Shared Phase-1 entry gate is authoritative for extension, stop geometry and event risk.
+    # v10 Shared Gate Architecture: extension severity and falling-knife state are
+    # independent veto/repair gates. Candidate score cannot average them away.
     gate_direction = "LONG" if long_bias else "SHORT" if short_bias else ""
+    extension_gate_v10 = shared_extension_gate(gate_direction, close, ema8, ema20, atr, rsi14) if gate_direction else {"severity":"UNKNOWN", "state":"WAIT FOR STRUCTURE", "block":True, "reason":"No aligned direction.", "ema20_pct":np.nan, "ema20_atr":np.nan}
+    falling_knife_v10 = falling_knife_gate(gate_direction, latest, ema8, ema20, atr, rs_score) if gate_direction else {"triggered":False, "state":"CLEAR", "block":False, "reason":""}
+    extension = ("Extreme" if extension_gate_v10.get("severity") == "E3" else "Extended" if extension_gate_v10.get("severity") == "E2" else "Elevated" if extension_gate_v10.get("severity") == "E1" else "Normal")
+
+    # Shared Phase-1 entry gate is authoritative for extension, stop geometry and event risk.
     entry_gate = evaluate_entry_quality(
         gate_direction,
         dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
@@ -4990,6 +5101,8 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         event_reason=earnings_event_block_reason,
         event_unknown=earnings_risk_state in {"UNKNOWN", "WINDOW"},
         structure_reason=alignment_reason,
+        extension_gate=extension_gate_v10,
+        falling_knife=falling_knife_v10,
     )
     # Preserve the independent price/risk geometry assessment even when candidate
     # quality later blocks actionability. This allows e.g. C Candidate + B+ entry
@@ -5108,6 +5221,10 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Previous Momentum Score": prev_momentum_score,
         "Trend": trend, "RSI14": rsi14,
         "Volume Ratio": vol_ratio, "Extension": extension,
+        "Extension Severity": extension_gate_v10.get("severity", "UNKNOWN"),
+        "EMA20 Extension ATR": extension_gate_v10.get("ema20_atr", np.nan),
+        "Falling Knife": falling_knife_v10.get("triggered", False),
+        "Price State": falling_knife_v10.get("state", "CLEAR"),
         "Distance EMA20": dist_ema20,
         "RS vs SPY": rs_text,
         "RS 1M vs SPY": rs_1m,
@@ -5143,7 +5260,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Trade State": trade_state,
         "Trade Block Reason": trade_block_reason,
         "Stop %": stop_pct,
-        "EMA20": ema20, "EMA50": ema50, "EMA200": ema200,
+        "EMA8": ema8, "EMA20": ema20, "EMA50": ema50, "EMA200": ema200,
         "ATR14": atr,
         "Latest High": float(latest["High"]) if pd.notna(latest["High"]) else np.nan,
         "Latest Low": float(latest["Low"]) if pd.notna(latest["Low"]) else np.nan,
@@ -5588,7 +5705,7 @@ with ticker_tab:
                 "Rule: **Extended** if price is >8% above EMA20 OR RSI ≥75. "
                 "**Oversold** if price is >8% below EMA20 OR RSI ≤25."
                 if pd.notna(ema20_dist)
-                else "Extension rule: Extended if >8% above EMA20 or RSI ≥75; Oversold if >8% below EMA20 or RSI ≤25."
+                else "v10 Extension Gate: combines EMA20 distance, ATR-normalized displacement and RSI. E2 = WAIT/REPAIR; E3 = extreme chase block. RSI alone is not a hard block."
             )
             st.caption(extension_note)
 
@@ -6083,7 +6200,7 @@ with ticker_tab:
                     ("Trend", "Price/EMA20/EMA50/EMA200 stacking"),
                     ("RS vs SPY", "1M / 3M / 6M excess return vs SPY; RS Edge weights 20% / 35% / 45%"),
                     ("Volume Ratio", "Current volume ÷ 20-day average volume"),
-                    ("Extension", ">8% above EMA20 or RSI≥75 = Extended; >8% below EMA20 or RSI≤25 = Oversold"),
+                    ("Extension", "v10 shared extension severity: EMA20 distance + ATR-normalized displacement + RSI; E2 WAIT, E3 BLOCK"),
                     ("Trade Plan", "Requires candidate-quality gate + entry-quality gate; R:R uses midpoint entry and also shows T1/T2 plus the full entry-zone T2 range"),
                 ]
                 st.dataframe(pd.DataFrame(rows, columns=["Signal", "Rule"]), hide_index=True, use_container_width=True)
