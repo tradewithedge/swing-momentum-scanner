@@ -5382,6 +5382,131 @@ st.markdown(
 )
 
 
+
+# ---------------------------
+# v10 Frozen Regression Harness
+# ---------------------------
+# These fixtures are intentionally independent of live ticker data. They encode
+# historical decision-time conditions so future code changes can be regression-
+# tested without the test itself drifting with today's price, EMA, ATR or event date.
+V10_REGRESSION_FIXTURES = {
+    "ABT-EXT-001": {
+        "label": "ABT — Extension E2 / WAIT",
+        "scope": "PHASE2",
+        "expected": "WAIT FOR ENTRY REPAIR",
+        "notes": "Strong momentum context, but +7% EMA20 / ~3.25 ATR / RSI 77.9 must remain E2; RSI alone is not the blocker.",
+    },
+    "CSCO-EVT-001": {
+        "label": "CSCO — Confirmed earnings ≤5 sessions / BLOCK",
+        "scope": "PHASE2",
+        "expected": "WAIT — EVENT RISK",
+        "notes": "Historical fixture: 07-Aug-2026 decision date; confirmed earnings 12-Aug-2026 after close (~3 XNYS sessions).",
+    },
+    "GLXY-EXT-001": {
+        "label": "GLXY — Extreme extension E3 / BLOCK",
+        "scope": "PHASE2",
+        "expected": "BLOCK — EXTREME EXTENSION",
+        "notes": "Historical momentum chase: roughly +22% vs EMA20 and ~2.8 ATR displacement.",
+    },
+    "SOFI-FK-001": {
+        "label": "SOFI — Falling knife / session block",
+        "scope": "PHASE2",
+        "expected": "BLOCK FOR SESSION — FALLING KNIFE",
+        "notes": "Historical 06-Nov-2025 downside expansion: ~2.1 ATR session, close near low, below EMA8/EMA20.",
+    },
+    "GEN-SIZE-001": {
+        "label": "GEN — Account sizing / Phase 3",
+        "scope": "PHASE3",
+        "expected": "DEFERRED",
+        "notes": "Position sizing/account compatibility belongs to Trade With Edge migration, not Regime-Aware Phase 2.",
+    },
+    "FUTU-FIT-001": {
+        "label": "FUTU — Account fit/friction / Phase 3",
+        "scope": "PHASE3",
+        "expected": "DEFERRED",
+        "notes": "Risk geometry + transaction-friction regression belongs to Trade With Edge migration.",
+    },
+    "GLW-DEF-001": {
+        "label": "GLW — In-trade defense / later phase",
+        "scope": "IN-TRADE",
+        "expected": "DEFERRED",
+        "notes": "MFE state transition / failed-breakout defense is intentionally outside the pre-trade Regime-Aware engine.",
+    },
+}
+
+
+def run_v10_regression_fixture(case_id):
+    """Run one frozen fixture through the same v10 gate functions used by live diagnostics."""
+    case_id = str(case_id)
+    if case_id == "ABT-EXT-001":
+        close = 116.64
+        ema20 = close / 1.07
+        atr = (close - ema20) / 3.25
+        gate = shared_extension_gate("LONG", close, 113.5, ema20, atr, 77.9)
+        actual = gate.get("state", "UNKNOWN")
+        return {
+            "case": case_id, "expected": "WAIT FOR ENTRY REPAIR", "actual": actual,
+            "pass": gate.get("severity") == "E2" and actual == "WAIT FOR ENTRY REPAIR",
+            "details": gate.get("reason", ""),
+        }
+
+    if case_id == "CSCO-EVT-001":
+        metadata = {
+            "next_earnings_date": pd.Timestamp("2026-08-12"),
+            "last_earnings_date": None,
+            "earnings_date": pd.Timestamp("2026-08-12"),
+            "earnings_source": "Frozen historical fixture — Cisco IR",
+            "earnings_certainty": "CONFIRMED",
+        }
+        event = evaluate_earnings_event(metadata, today=pd.Timestamp("2026-08-07"))
+        entry = evaluate_entry_quality(
+            "LONG", 0.0, 55.0, stop_pct=0.05,
+            event_block=event.get("block", False),
+            event_reason=event.get("block_reason", ""),
+            event_unknown=event.get("state") in {"UNKNOWN", "WINDOW"},
+            extension_gate={"severity":"E0","state":"NORMAL","block":False,"reason":"fixture normal"},
+            falling_knife={"triggered":False,"state":"CLEAR","block":False,"reason":""},
+        )
+        actual = entry.get("state", "UNKNOWN")
+        return {
+            "case": case_id, "expected": "WAIT — EVENT RISK", "actual": actual,
+            "pass": event.get("state") == "HIGH" and event.get("certainty") == "CONFIRMED" and actual == "WAIT — EVENT RISK",
+            "details": f"{event.get('text','')} | {event.get('block_reason','')}",
+        }
+
+    if case_id == "GLXY-EXT-001":
+        gate = shared_extension_gate("LONG", 33.15, 29.30, 27.20, 2.10, 80.0)
+        actual = gate.get("state", "UNKNOWN")
+        return {
+            "case": case_id, "expected": "BLOCK — EXTREME EXTENSION", "actual": actual,
+            "pass": gate.get("severity") == "E3" and actual == "BLOCK — EXTREME EXTENSION",
+            "details": gate.get("reason", ""),
+        }
+
+    if case_id == "SOFI-FK-001":
+        latest = {"Close":27.16, "High":30.85, "Low":27.13, "1D %":-0.0968}
+        gate = falling_knife_gate("LONG", latest, 29.75, 28.98, 1.78, rs_edge=-5.0)
+        actual = gate.get("state", "UNKNOWN")
+        return {
+            "case": case_id, "expected": "BLOCK FOR SESSION — FALLING KNIFE", "actual": actual,
+            "pass": bool(gate.get("triggered")) and actual == "BLOCK FOR SESSION — FALLING KNIFE",
+            "details": gate.get("reason", ""),
+        }
+
+    fixture = V10_REGRESSION_FIXTURES.get(case_id, {})
+    return {
+        "case": case_id,
+        "expected": fixture.get("expected", "DEFERRED"),
+        "actual": "DEFERRED — OUTSIDE PHASE 2",
+        "pass": None,
+        "details": fixture.get("notes", "This fixture is not executable in the Regime-Aware pre-trade engine."),
+    }
+
+
+def run_phase2_regression_suite():
+    executable = ["ABT-EXT-001", "CSCO-EVT-001", "GLXY-EXT-001", "SOFI-FK-001"]
+    return [run_v10_regression_fixture(case_id) for case_id in executable]
+
 # ---------------------------
 # Compact market-regime header
 # ---------------------------
@@ -5406,7 +5531,7 @@ with st.expander("Regime details", expanded=False):
 # ---------------------------
 # Tabs
 # ---------------------------
-ticker_tab, scanner_tab = st.tabs(["🔎 Ticker Search", "📊 Market Scanner"])
+ticker_tab, scanner_tab, regression_tab = st.tabs(["🔎 Ticker Search", "📊 Market Scanner", "🧪 v10 Regression"])
 
 # ---------------------------
 # Ticker autocomplete
@@ -5693,7 +5818,10 @@ with ticker_tab:
                 [
                     ("RSI(14)", f"{diag['RSI14']:.1f}"),
                     ("Volume Ratio", f"{diag['Volume Ratio']:.2f}x" if pd.notna(diag["Volume Ratio"]) else "N/A"),
-                    ("Extension", f"{diag['Extension']} · {diag.get('Extension Severity','UNKNOWN')}"),
+                    ("Extension", (
+                        "UNKNOWN" if str(diag.get("Extension Severity", "UNKNOWN")) == "UNKNOWN"
+                        else f"{diag['Extension']} · {diag.get('Extension Severity','UNKNOWN')}"
+                    )),
                     ("Sector", diag["Sector"]),
                 ],
                 desktop_columns=4,
@@ -7001,3 +7129,62 @@ st.caption(
     "Research / decision-support tool only. Yahoo Finance data is accessed through yfinance. "
     "Constituent lists are cached to reduce network load and improve responsiveness."
 )
+
+
+# ---------------------------
+# v10 Regression Harness UI
+# ---------------------------
+with regression_tab:
+    st.subheader("v10 Shared Gate — Frozen Regression Harness")
+    st.caption(
+        "Regression fixtures use frozen historical decision-time inputs. They do not use today's ticker price, EMA, ATR or earnings date. "
+        "This keeps software tests stable while Live Ticker Search remains a separate current-state diagnostic."
+    )
+
+    suite = run_phase2_regression_suite()
+    pass_count = sum(1 for r in suite if r.get("pass") is True)
+    fail_count = sum(1 for r in suite if r.get("pass") is False)
+    render_responsive_metrics(
+        [
+            ("Phase 2 executable fixtures", str(len(suite))),
+            ("PASS", str(pass_count)),
+            ("FAIL", str(fail_count)),
+            ("Status", "PASS" if fail_count == 0 and pass_count == len(suite) else "REVIEW"),
+        ],
+        desktop_columns=4,
+    )
+
+    rows = []
+    for result in suite:
+        fixture = V10_REGRESSION_FIXTURES[result["case"]]
+        rows.append({
+            "Case": result["case"],
+            "Fixture": fixture["label"],
+            "Expected": result["expected"],
+            "Actual": result["actual"],
+            "Result": "PASS ✅" if result.get("pass") else "FAIL ❌",
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    selected_case = st.selectbox(
+        "Inspect frozen fixture",
+        list(V10_REGRESSION_FIXTURES.keys()),
+        format_func=lambda cid: f"{cid} — {V10_REGRESSION_FIXTURES[cid]['label']}",
+    )
+    selected = run_v10_regression_fixture(selected_case)
+    fixture = V10_REGRESSION_FIXTURES[selected_case]
+    st.write(f"**Scope:** {fixture['scope']}")
+    st.write(f"**Expected:** {selected['expected']}")
+    st.write(f"**Actual:** {selected['actual']}")
+    if selected.get("pass") is True:
+        st.success("PASS — frozen regression output matches the expected v10 gate behavior.")
+    elif selected.get("pass") is False:
+        st.error("FAIL — gate behavior has regressed from the frozen specification.")
+    else:
+        st.info("DEFERRED — this regression belongs to a later engine/phase and is shown here only as a cross-system anchor.")
+    st.caption(selected.get("details", ""))
+
+    st.markdown("### Live vs Frozen — do not mix them")
+    st.write("• **Ticker Search** = current live/completed-session analysis; results are allowed to change with market data.")
+    st.write("• **v10 Regression** = frozen historical fixtures; expected outputs must not drift when current market conditions change.")
+    st.write("• A live ticker can be correctly WAIT today without proving that its historical regression gate is working.")
