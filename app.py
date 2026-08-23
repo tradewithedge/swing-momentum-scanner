@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v8.0-V10-SHARED-GATE-MIGRATION-PHASE2"
+APP_BUILD_VERSION = "v8.0.1-V10-SHARED-GATE-ABT-UI-HOTFIX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -5693,20 +5693,23 @@ with ticker_tab:
                 [
                     ("RSI(14)", f"{diag['RSI14']:.1f}"),
                     ("Volume Ratio", f"{diag['Volume Ratio']:.2f}x" if pd.notna(diag["Volume Ratio"]) else "N/A"),
-                    ("Extension", diag["Extension"]),
+                    ("Extension", f"{diag['Extension']} · {diag.get('Extension Severity','UNKNOWN')}"),
                     ("Sector", diag["Sector"]),
                 ],
                 desktop_columns=4,
             )
 
             ema20_dist = diag["Distance EMA20"]
-            extension_note = (
-                f"Price vs EMA20: **{ema20_dist:+.1%}** • RSI(14): **{diag['RSI14']:.1f}**. "
-                "Rule: **Extended** if price is >8% above EMA20 OR RSI ≥75. "
-                "**Oversold** if price is >8% below EMA20 OR RSI ≤25."
-                if pd.notna(ema20_dist)
-                else "v10 Extension Gate: combines EMA20 distance, ATR-normalized displacement and RSI. E2 = WAIT/REPAIR; E3 = extreme chase block. RSI alone is not a hard block."
-            )
+            ema20_atr = diag.get("EMA20 Extension ATR", np.nan)
+            if pd.notna(ema20_dist):
+                atr_txt = f" • EMA20 displacement: **{ema20_atr:+.2f} ATR**" if pd.notna(ema20_atr) else ""
+                extension_note = (
+                    f"Price vs EMA20: **{ema20_dist:+.1%}**{atr_txt} • RSI(14): **{diag['RSI14']:.1f}**. "
+                    "**v10 Shared Extension Gate:** E0 Normal; E1 Elevated; E2 WAIT/REPAIR; E3 Extreme/CHASE BLOCK. "
+                    "Classification combines EMA20 distance, ATR-normalized displacement and RSI; **RSI ≥75 alone is not a hard block**."
+                )
+            else:
+                extension_note = "v10 Shared Extension Gate: EMA20 distance + ATR-normalized displacement + RSI; E2 WAIT/REPAIR, E3 BLOCK."
             st.caption(extension_note)
 
             if diag["Industry"]:
@@ -5958,13 +5961,15 @@ with ticker_tab:
                     preferred_high = max(raw_high, preferred_low)
                     repair_boundary = ema20_now * 1.08
 
-                    if pd.notna(dist_now) and dist_now > 0.08:
+                    ext_sev = str(diag.get("Extension Severity", "UNKNOWN"))
+                    ext_atr = diag.get("EMA20 Extension ATR", np.nan)
+                    if ext_sev in {"E2", "E3"}:
+                        atr_txt = f", {ext_atr:+.2f} ATR from EMA20" if pd.notna(ext_atr) else ""
                         repair_items.append(
-                            f"Price extension must repair from {dist_now:+.1%} vs EMA20 to **≤ +8.0%**. "
-                            f"Current no-chase boundary: {fmt_price(repair_boundary)}."
+                            f"v10 Extension Gate is **{ext_sev}**: current price is {dist_now:+.1%} vs EMA20{atr_txt}, RSI {rsi_now:.1f}. "
+                            "The setup must be recalculated after pullback/base/EMA catch-up until the shared gate improves to **E0/E1**; "
+                            "RSI does not need to fall below 75 by itself if price/ATR location has repaired."
                         )
-                    if pd.notna(rsi_now) and rsi_now >= 75:
-                        repair_items.append(f"RSI must cool from {rsi_now:.1f} to **below 75**.")
                     if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
                         repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed entry.")
                     if diag["Acceleration"] == "Decelerating":
