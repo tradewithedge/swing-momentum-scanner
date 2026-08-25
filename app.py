@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v8.1.3-PHASE2E3-CANDIDATE-ENTRY-CLEANUP"
+APP_BUILD_VERSION = "v8.1.4-PHASE2E3-STATE-INTEGRITY-HOTFIX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -3498,8 +3498,8 @@ def assess_trade_plan_quality(candidate_quality, extension_severity, stop_pct, s
 
     if not np.isfinite(stop_value) or not np.isfinite(stop_atr) or stop_atr <= 0:
         return {
-            "grade": "C — NOT READY", "state": "READY", "high_edge": False,
-            "reason": "Trade-plan geometry could not be fully normalized to ATR; do not promote to high-edge ACTIONABLE.",
+            "grade": "C — NOT READY", "state": "WAIT FOR STRUCTURE", "high_edge": False,
+            "reason": "Trade-plan geometry could not be fully normalized to ATR; the setup is not READY until valid entry/stop geometry is available.",
         }
 
     # Quality bands. The 10% value remains an emergency hard ceiling upstream,
@@ -5199,19 +5199,41 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "UNKNOWN"
     )
 
-    # Shared Phase-1 entry gate is authoritative for extension, stop geometry and event risk.
-    entry_gate = evaluate_entry_quality(
-        gate_direction,
-        dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
-        rsi14,
-        stop_pct=stop_pct,
-        event_block=earnings_event_block,
-        event_reason=earnings_event_block_reason,
-        event_unknown=earnings_risk_state in {"UNKNOWN", "WINDOW"},
-        structure_reason=alignment_reason,
-        extension_gate=extension_gate_v10,
-        falling_knife=falling_knife_v10,
-    )
+    # Shared Phase-1 entry gate is authoritative for actionability. Candidate/trend
+    # direction may still be used to *measure* extension while short-term confirmation
+    # is incomplete, but that fallback direction must never manufacture a READY state.
+    # Gate priority here is Event -> Directional confirmation -> Location/extension -> Stop.
+    if earnings_event_block:
+        entry_gate = evaluate_entry_quality(
+            gate_direction,
+            dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
+            rsi14,
+            stop_pct=stop_pct,
+            event_block=True,
+            event_reason=earnings_event_block_reason,
+            event_unknown=earnings_risk_state in {"UNKNOWN", "WINDOW"},
+            structure_reason=alignment_reason,
+            extension_gate=extension_gate_v10,
+            falling_knife=falling_knife_v10,
+        )
+    elif aligned_direction not in {"LONG", "SHORT"}:
+        entry_gate = {
+            "state": "WAIT FOR STRUCTURE", "quality": "WAIT", "block": True,
+            "reason": alignment_reason or "Trend, momentum and relative strength are not sufficiently aligned for entry confirmation.",
+        }
+    else:
+        entry_gate = evaluate_entry_quality(
+            aligned_direction,
+            dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
+            rsi14,
+            stop_pct=stop_pct,
+            event_block=False,
+            event_reason="",
+            event_unknown=False,
+            structure_reason=alignment_reason,
+            extension_gate=extension_gate_v10,
+            falling_knife=falling_knife_v10,
+        )
     # Preserve the independent price/risk geometry assessment even when candidate
     # quality later blocks actionability. This allows e.g. C Candidate + B+ entry
     # geometry to display honestly while still producing NO TRADE / WAIT FOR QUALITY.
@@ -6564,7 +6586,7 @@ with ticker_tab:
 
                 if diag["Trade State"] == "READY":
                     st.info(
-                        "JISTS distinction: **permissible/valid ≠ READY ≠ HIGH-EDGE ACTIONABLE**. "
+                        "JISTS distinction: **Hard-gate PASS does not automatically mean READY, and READY does not automatically mean HIGH-EDGE ACTIONABLE.** "
                         "Do not size this as a premium setup until the repair map improves the plan geometry and the ticker is recalculated."
                     )
                 elif pd.notna(diag.get("RR", np.nan)) and diag["RR"] >= 2:
