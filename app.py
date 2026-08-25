@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v8.1.1-JISTS-HIGH-EDGE-BOUNDARY-REGRESSION"
+APP_BUILD_VERSION = "v8.1.2-PHASE2E3-CANDIDATE-ENTRY-ATTRIBUTION"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -3322,15 +3322,22 @@ def assess_candidate_quality(trend, momentum_score, rs_edge, volume_ratio=np.nan
 
     if candidate_dir == "LONG":
         if np.isfinite(mom):
-            points += 2 if mom >= 70 else 1 if mom >= 40 else -2 if mom <= -15 else -1 if mom < 15 else 0
+            # Phase 2E.3 attribution repair: weak/flat short-term momentum is an
+            # entry-confirmation issue, not by itself a reason to demote an
+            # otherwise strong trend/RS candidate. Only genuinely opposing
+            # momentum penalizes candidate quality.
+            points += 2 if mom >= 70 else 1 if mom >= 40 else -2 if mom <= -15 else 0
         if np.isfinite(rs):
             points += 2 if rs >= 15 else 1 if rs >= 5 else -2 if rs <= -10 else -1 if rs < 0 else 0
     elif candidate_dir == "SHORT":
         if np.isfinite(mom):
-            points += 2 if mom <= -70 else 1 if mom <= -40 else -2 if mom >= 15 else -1 if mom > -15 else 0
+            points += 2 if mom <= -70 else 1 if mom <= -40 else -2 if mom >= 15 else 0
         if np.isfinite(rs):
             points += 2 if rs <= -15 else 1 if rs <= -5 else -2 if rs >= 10 else -1 if rs > 0 else 0
 
+    # Volume confirmation remains useful as a positive candidate-quality bonus,
+    # but low volume is not a candidate-quality penalty because the same reading
+    # can mean weak breakout demand or constructive contraction on a pullback.
     if np.isfinite(vol) and vol >= 1.2:
         points += 1
     if str(acceleration) == "Decelerating":
@@ -3626,7 +3633,10 @@ def candidate_strengths_and_risks(diag):
             if mom >= 40:
                 strengths.append(f"Momentum Score: {mom:.1f}")
             elif mom < 15:
-                risks.append(f"Momentum is insufficient for bullish alignment: {mom:.1f} (need ≥ +15).")
+                risks.append(
+                    f"Short-term bullish confirmation is incomplete: Momentum Score {mom:.1f} (entry alignment needs ≥ +15). "
+                    "This is an entry-quality issue, not an automatic candidate-quality downgrade."
+                )
     elif candidate_dir == "SHORT":
         if np.isfinite(rs):
             if rs <= -5:
@@ -3637,7 +3647,10 @@ def candidate_strengths_and_risks(diag):
             if mom <= -40:
                 strengths.append(f"Bearish Momentum Score: {mom:.1f}")
             elif mom > -15:
-                risks.append(f"Momentum is insufficient for bearish alignment: {mom:.1f} (need ≤ -15).")
+                risks.append(
+                    f"Short-term bearish confirmation is incomplete: Momentum Score {mom:.1f} (entry alignment needs ≤ -15). "
+                    "This is an entry-quality issue, not an automatic candidate-quality downgrade."
+                )
     else:
         if np.isfinite(mom) and abs(mom) >= 15:
             risks.append(f"Momentum ({mom:.1f}) is not aligned with a confirmed EMA trend structure.")
@@ -3647,7 +3660,10 @@ def candidate_strengths_and_risks(diag):
     if np.isfinite(vol) and vol >= 1.2:
         strengths.append(f"Volume confirmation: {vol:.2f}x")
     elif np.isfinite(vol) and vol < 0.75:
-        risks.append(f"Volume is weak: {vol:.2f}x")
+        risks.append(
+            f"Volume participation is light: {vol:.2f}x. Treat this as confirmation context, not an automatic bearish signal; "
+            "low volume on a controlled pullback can be constructive, while a breakout still needs renewed demand."
+        )
 
     return unique_text_items(strengths), unique_text_items(risks)
 
