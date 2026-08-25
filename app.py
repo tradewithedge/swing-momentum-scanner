@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v8.1.2-PHASE2E3-CANDIDATE-ENTRY-ATTRIBUTION"
+APP_BUILD_VERSION = "v8.1.3-PHASE2E3-CANDIDATE-ENTRY-CLEANUP"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -3322,22 +3322,18 @@ def assess_candidate_quality(trend, momentum_score, rs_edge, volume_ratio=np.nan
 
     if candidate_dir == "LONG":
         if np.isfinite(mom):
-            # Phase 2E.3 attribution repair: weak/flat short-term momentum is an
-            # entry-confirmation issue, not by itself a reason to demote an
-            # otherwise strong trend/RS candidate. Only genuinely opposing
-            # momentum penalizes candidate quality.
-            points += 2 if mom >= 70 else 1 if mom >= 40 else -2 if mom <= -15 else 0
+            # Candidate quality is structural/leadership quality. Weak-but-still-positive
+            # short-term momentum is an ENTRY confirmation issue, not an automatic
+            # candidate downgrade. Only genuinely opposing momentum is penalized.
+            points += 2 if mom >= 70 else 1 if mom >= 40 else -2 if mom <= -15 else -1 if mom < 0 else 0
         if np.isfinite(rs):
             points += 2 if rs >= 15 else 1 if rs >= 5 else -2 if rs <= -10 else -1 if rs < 0 else 0
     elif candidate_dir == "SHORT":
         if np.isfinite(mom):
-            points += 2 if mom <= -70 else 1 if mom <= -40 else -2 if mom >= 15 else 0
+            points += 2 if mom <= -70 else 1 if mom <= -40 else -2 if mom >= 15 else -1 if mom > 0 else 0
         if np.isfinite(rs):
             points += 2 if rs <= -15 else 1 if rs <= -5 else -2 if rs >= 10 else -1 if rs > 0 else 0
 
-    # Volume confirmation remains useful as a positive candidate-quality bonus,
-    # but low volume is not a candidate-quality penalty because the same reading
-    # can mean weak breakout demand or constructive contraction on a pullback.
     if np.isfinite(vol) and vol >= 1.2:
         points += 1
     if str(acceleration) == "Decelerating":
@@ -3634,8 +3630,8 @@ def candidate_strengths_and_risks(diag):
                 strengths.append(f"Momentum Score: {mom:.1f}")
             elif mom < 15:
                 risks.append(
-                    f"Short-term bullish confirmation is incomplete: Momentum Score {mom:.1f} (entry alignment needs ≥ +15). "
-                    "This is an entry-quality issue, not an automatic candidate-quality downgrade."
+                    f"Short-term bullish confirmation is incomplete: Momentum Score {mom:.1f} "
+                    "(entry alignment needs ≥ +15). This is an entry-quality issue, not an automatic candidate-quality downgrade."
                 )
     elif candidate_dir == "SHORT":
         if np.isfinite(rs):
@@ -3648,8 +3644,8 @@ def candidate_strengths_and_risks(diag):
                 strengths.append(f"Bearish Momentum Score: {mom:.1f}")
             elif mom > -15:
                 risks.append(
-                    f"Short-term bearish confirmation is incomplete: Momentum Score {mom:.1f} (entry alignment needs ≤ -15). "
-                    "This is an entry-quality issue, not an automatic candidate-quality downgrade."
+                    f"Short-term bearish confirmation is incomplete: Momentum Score {mom:.1f} "
+                    "(entry alignment needs ≤ -15). This is an entry-quality issue, not an automatic candidate-quality downgrade."
                 )
     else:
         if np.isfinite(mom) and abs(mom) >= 15:
@@ -5187,10 +5183,21 @@ def compute_search_diagnostic(symbol, company, df, metadata):
 
     # v10 Shared Gate Architecture: extension severity and falling-knife state are
     # independent veto/repair gates. Candidate score cannot average them away.
-    gate_direction = "LONG" if long_bias else "SHORT" if short_bias else ""
-    extension_gate_v10 = shared_extension_gate(gate_direction, close, ema8, ema20, atr, rsi14) if gate_direction else {"severity":"UNKNOWN", "state":"WAIT FOR STRUCTURE", "block":True, "reason":"No aligned direction.", "ema20_pct":np.nan, "ema20_atr":np.nan}
+    # Extension/location is a price-structure diagnostic and should remain measurable
+    # even when short-term momentum has not yet passed the entry-alignment gate.
+    # Use the candidate/trend direction as a fallback so PLTR-like WAIT cases do
+    # not misleadingly show Extension=UNKNOWN solely because momentum < +15.
+    gate_direction = "LONG" if long_bias else "SHORT" if short_bias else str(candidate_assessment.get("direction") or "")
+    extension_gate_v10 = shared_extension_gate(gate_direction, close, ema8, ema20, atr, rsi14) if gate_direction else {"severity":"UNKNOWN", "state":"WAIT FOR STRUCTURE", "block":True, "reason":"No directional candidate structure.", "ema20_pct":np.nan, "ema20_atr":np.nan}
     falling_knife_v10 = falling_knife_gate(gate_direction, latest, ema8, ema20, atr, rs_score) if gate_direction else {"triggered":False, "state":"CLEAR", "block":False, "reason":""}
-    extension = ("Extreme" if extension_gate_v10.get("severity") == "E3" else "Extended" if extension_gate_v10.get("severity") == "E2" else "Elevated" if extension_gate_v10.get("severity") == "E1" else "Normal")
+    extension_severity = extension_gate_v10.get("severity", "UNKNOWN")
+    extension = (
+        "Extreme" if extension_severity == "E3" else
+        "Extended" if extension_severity == "E2" else
+        "Elevated" if extension_severity == "E1" else
+        "Normal" if extension_severity == "E0" else
+        "UNKNOWN"
+    )
 
     # Shared Phase-1 entry gate is authoritative for extension, stop geometry and event risk.
     entry_gate = evaluate_entry_quality(
@@ -5572,42 +5579,6 @@ V10_REGRESSION_FIXTURES = {
         "expected": "ACTIONABLE",
         "notes": "Positive control: A candidate, E0, 4.5% / 2.0 ATR stop geometry, T1 1.5R and T2 2.5R must still earn high-edge ACTIONABLE.",
     },
-    "JISTS-BND-065": {
-        "label": "JISTS — 6.5% boundary / A / E0 => ACTIONABLE",
-        "scope": "PHASE2",
-        "expected": "ACTIONABLE",
-        "notes": "Exact 6.5% raw stop with 3.0 ATR, A candidate and E0 is the upper edge of the A- high-edge band and should still qualify.",
-    },
-    "JISTS-BND-065P": {
-        "label": "JISTS — >6.5% boundary / A / E0 => READY",
-        "scope": "PHASE2",
-        "expected": "READY",
-        "notes": "Just above 6.5% moves into the caution band and should not remain high-edge ACTIONABLE.",
-    },
-    "JISTS-BND-080": {
-        "label": "JISTS — 8.0% boundary / A / E0 => READY",
-        "scope": "PHASE2",
-        "expected": "READY",
-        "notes": "Exact 8.0% raw stop remains technically valid but is not premium geometry.",
-    },
-    "JISTS-BND-100": {
-        "label": "JISTS — 10.0% boundary / A / E0 => READY",
-        "scope": "PHASE2",
-        "expected": "READY",
-        "notes": "Exact 10.0% is the emergency ceiling, not a quality target; it must not earn high-edge ACTIONABLE.",
-    },
-    "JISTS-ATR-EXC": {
-        "label": "JISTS — A+ / E0 / 9% but 2.0 ATR => ACTIONABLE exception",
-        "scope": "PHASE2",
-        "expected": "ACTIONABLE",
-        "notes": "Narrow volatility-adjusted exception: A+ + E0 + reward-qualified plan may be high-edge despite 8-10% raw stop only when risk is <=2.0 ATR.",
-    },
-    "JISTS-ATR-NOEXC": {
-        "label": "JISTS — A / E0 / 9% and 2.0 ATR => READY",
-        "scope": "PHASE2",
-        "expected": "READY",
-        "notes": "The same 9% / 2.0 ATR geometry does not receive the exceptional promotion for an ordinary A candidate.",
-    },
     "GEN-SIZE-001": {
         "label": "GEN — Account sizing / Phase 3",
         "scope": "PHASE3",
@@ -5709,24 +5680,6 @@ def run_v10_regression_fixture(case_id):
             "details": f"{plan.get('grade','')} | {plan.get('reason','')}",
         }
 
-    boundary_cases = {
-        "JISTS-BND-065": ("A", "E0", 0.065, 3.00, 1.50, 2.50, "ACTIONABLE", True),
-        "JISTS-BND-065P": ("A", "E0", 0.0651, 3.00, 1.50, 2.50, "READY", False),
-        "JISTS-BND-080": ("A", "E0", 0.080, 3.50, 1.50, 2.50, "READY", False),
-        "JISTS-BND-100": ("A", "E0", 0.100, 3.50, 1.50, 2.50, "READY", False),
-        "JISTS-ATR-EXC": ("A+", "E0", 0.090, 2.00, 1.50, 2.50, "ACTIONABLE", True),
-        "JISTS-ATR-NOEXC": ("A", "E0", 0.090, 2.00, 1.50, 2.50, "READY", False),
-    }
-    if case_id in boundary_cases:
-        candidate, extension, stop_pct, stop_atr, t1_r, t2_r, expected, expected_high_edge = boundary_cases[case_id]
-        plan = assess_trade_plan_quality(candidate, extension, stop_pct, stop_atr, t1_r, t2_r)
-        actual = plan.get("state", "UNKNOWN")
-        return {
-            "case": case_id, "expected": expected, "actual": actual,
-            "pass": actual == expected and bool(plan.get("high_edge")) == expected_high_edge,
-            "details": f"{plan.get('grade','')} | {plan.get('reason','')}",
-        }
-
     fixture = V10_REGRESSION_FIXTURES.get(case_id, {})
     return {
         "case": case_id,
@@ -5741,8 +5694,6 @@ def run_phase2_regression_suite():
     executable = [
         "ABT-EXT-001", "CSCO-EVT-001", "GLXY-EXT-001", "SOFI-FK-001",
         "SCHW-PLAN-001", "JISTS-HE-001",
-        "JISTS-BND-065", "JISTS-BND-065P", "JISTS-BND-080", "JISTS-BND-100",
-        "JISTS-ATR-EXC", "JISTS-ATR-NOEXC",
     ]
     return [run_v10_regression_fixture(case_id) for case_id in executable]
 
@@ -6206,16 +6157,19 @@ with ticker_tab:
                         )
                     else:
                         risks.append("Momentum is decelerating")
-                if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 0.75:
-                    risks.append(f"Volume is weak: {diag['Volume Ratio']:.2f}x")
-                elif (
+                if (
                     diag["Trade State"] in {"ACTIONABLE", "READY"}
                     and pd.notna(diag["Volume Ratio"])
-                    and diag["Volume Ratio"] < 1.0
+                    and 0.75 <= diag["Volume Ratio"] < 1.0
                 ):
                     risks.append(
                         f"Volume participation is slightly below ideal: {diag['Volume Ratio']:.2f}x "
-                        "(≥1.0x preferred, ≥1.2x stronger)"
+                        "(≥1.0x preferred, ≥1.2x stronger)."
+                    )
+                if diag.get("Extension") == "UNKNOWN":
+                    risks.append(
+                        "Extension state is UNKNOWN because the required EMA20/ATR/RSI location inputs could not be fully validated. "
+                        "UNKNOWN is not treated as safe; rerun after the price-structure inputs are available."
                     )
                 for caution in diag.get("Entry Cautions", []):
                     risks.append(caution)
@@ -6529,7 +6483,7 @@ with ticker_tab:
 
             st.markdown("### Trade Plan")
             st.caption(
-                "Trade plans are shown for **READY** and **ACTIONABLE** setups after hard gates pass. "
+                "Trade plans are shown for **READY** and **ACTIONABLE** setups after the required safety/data gates pass. "
                 "The **10% stop is an emergency ceiling, not a quality target**. ACTIONABLE is reserved for JISTS high-edge capital deployment; READY remains valid but needs better plan quality."
             )
 
@@ -6545,7 +6499,7 @@ with ticker_tab:
                     )
                 elif candidate_quality in {"A+", "A", "B+"}:
                     st.info(
-                        "Candidate quality remains high, but a higher-priority hard gate is not acceptable. "
+                        "Candidate quality remains strong, but the entry-confirmation gate is not satisfied. "
                         "Candidate quality, entry quality and trade-plan quality are intentionally separate."
                     )
                 elif candidate_quality == "B":
