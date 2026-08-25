@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v8.1.4-PHASE2E3-STATE-INTEGRITY-HOTFIX"
+APP_BUILD_VERSION = "v8.1.5-PHASE2E3-WORDING-CLEANUP"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -5351,9 +5351,19 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     elif aligned_direction == "SHORT":
         trade_comment = "Trend, momentum and relative weakness are constructive for shorts on completed daily bars."
     elif trend_side(trend) == "LONG":
-        trade_comment = "Price trend is bullish, but momentum and/or relative strength are not sufficiently aligned."
+        if composite < 15 and np.isfinite(rs_score) and rs_score > 0:
+            trade_comment = "Price trend and relative strength remain bullish, but short-term momentum confirmation is incomplete."
+        elif composite >= 15 and (not np.isfinite(rs_score) or rs_score <= 0):
+            trade_comment = "Price trend and momentum are constructive, but relative-strength confirmation is incomplete."
+        else:
+            trade_comment = "Price trend is bullish, but short-term confirmation is not yet fully aligned."
     elif trend_side(trend) == "SHORT":
-        trade_comment = "Price trend is bearish, but momentum and/or relative weakness are not sufficiently aligned."
+        if composite > -15 and np.isfinite(rs_score) and rs_score < 0:
+            trade_comment = "Price trend and relative weakness remain bearish, but short-term downside momentum confirmation is incomplete."
+        elif composite <= -15 and (not np.isfinite(rs_score) or rs_score >= 0):
+            trade_comment = "Price trend and downside momentum are constructive for shorts, but relative-weakness confirmation is incomplete."
+        else:
+            trade_comment = "Price trend is bearish, but short-term confirmation is not yet fully aligned."
     elif composite >= 15 and np.isfinite(rs_score) and rs_score > 0:
         trade_comment = "Momentum and relative strength are constructive, but EMA trend structure is not yet fully aligned."
     elif composite <= -15 and np.isfinite(rs_score) and rs_score < 0:
@@ -6258,7 +6268,7 @@ with ticker_tab:
                 if diag["Acceleration"] == "Decelerating":
                     defects.append("MOMENTUM DECELERATION")
                 if pd.notna(vol_now) and vol_now < 1.0:
-                    defects.append("WEAK VOLUME")
+                    defects.append("LIGHT VOLUME / CONFIRMATION CONTEXT")
                 if candidate_quality not in MIN_ACTIONABLE_CANDIDATE_GRADES:
                     defects.append("CANDIDATE QUALITY")
                 if not bullish_candidate and not bearish_candidate:
@@ -6285,7 +6295,7 @@ with ticker_tab:
                     repair_mode = "HIGH-EDGE PLAN REPAIR"
                 elif "MOMENTUM DECELERATION" in defects:
                     repair_mode = "MOMENTUM STABILIZATION"
-                elif "WEAK VOLUME" in defects:
+                elif "LIGHT VOLUME / CONFIRMATION CONTEXT" in defects:
                     repair_mode = "PARTICIPATION CONFIRMATION"
                 else:
                     repair_mode = "MAINTAIN QUALITY"
