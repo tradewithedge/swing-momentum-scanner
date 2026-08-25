@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v8.1.5-PHASE2E3-WORDING-CLEANUP"
+APP_BUILD_VERSION = "v8.1.6-PHASE2E3-SHORT-VOLUME-WORDING-CLEANUP"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -3656,10 +3656,21 @@ def candidate_strengths_and_risks(diag):
     if np.isfinite(vol) and vol >= 1.2:
         strengths.append(f"Volume confirmation: {vol:.2f}x")
     elif np.isfinite(vol) and vol < 0.75:
-        risks.append(
-            f"Volume participation is light: {vol:.2f}x. Treat this as confirmation context, not an automatic bearish signal; "
-            "low volume on a controlled pullback can be constructive, while a breakout still needs renewed demand."
-        )
+        if candidate_dir == "SHORT":
+            risks.append(
+                f"Volume participation is light: {vol:.2f}x. Treat this as confirmation context, not an automatic bullish signal; "
+                "contracting volume on a controlled counter-trend bounce can be constructive for a short, while a downside break still benefits from renewed selling pressure."
+            )
+        elif candidate_dir == "LONG":
+            risks.append(
+                f"Volume participation is light: {vol:.2f}x. Treat this as confirmation context, not an automatic bearish signal; "
+                "contracting volume on a controlled pullback can be constructive for a long, while an upside breakout still benefits from renewed demand."
+            )
+        else:
+            risks.append(
+                f"Volume participation is light: {vol:.2f}x. Treat this as confirmation context rather than a standalone directional signal; "
+                "the next directional break should ideally attract renewed participation."
+            )
 
     return unique_text_items(strengths), unique_text_items(risks)
 
