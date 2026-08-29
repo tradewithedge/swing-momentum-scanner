@@ -1,4 +1,4 @@
-# Quality Engine v8.1.0 — JISTS High-Edge Actionability Gate
+# Quality Engine v7.8.0 — Phase 2E.2 (Decision-First UX / Mobile Polish)
 
 import base64
 import hashlib
@@ -53,24 +53,14 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v8.1.6-PHASE2E3-SHORT-VOLUME-WORDING-CLEANUP"
+APP_BUILD_VERSION = "v7.8.0-P2E2-DECISION-FIRST-UX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
 MIN_ACTIONABLE_CANDIDATE_GRADES = {"A+", "A", "B+"}
 NEAR_EXTENSION_CAUTION_PCT = 6.0
-NEAR_STOP_CAUTION_PCT = 0.065
-# v10 Shared Gate Architecture — Phase 2 migration constants.
-# Scores rank candidates; gates decide actionability.
-EXTENSION_WAIT_EMA20_PCT = 8.0
-EXTENSION_ELEVATED_EMA20_PCT = 6.0
-EXTENSION_CHASE_BLOCK_EMA20_PCT = 12.0
-EXTENSION_HOT_RSI = 75.0
-EXTENSION_EXTREME_RSI = 82.0
-FALLING_KNIFE_MIN_DOWN_PCT = -5.0
-FALLING_KNIFE_MIN_RANGE_ATR = 1.5
-FALLING_KNIFE_MAX_CLOSE_LOCATION = 0.35
-EARNINGS_HARD_BLOCK_DAYS = 5
+NEAR_STOP_CAUTION_PCT = 0.07
+EARNINGS_HARD_BLOCK_DAYS = 3
 EARNINGS_CAUTION_DAYS = 14
 RECENT_EARNINGS_GRACE_DAYS = 5
 COMPANY_SNAPSHOT_TTL = 30 * 60
@@ -2722,29 +2712,6 @@ def get_company_snapshot(symbol, fallback_close=None):
     return snapshot
 
 
-def trading_sessions_until(start_date, end_date):
-    """Count XNYS sessions strictly after start_date through end_date, inclusive.
-
-    Falls back to weekdays if exchange_calendars is unavailable. This is the
-    canonical v10 event-proximity clock; calendar-day distance is not used for
-    the hard earnings gate.
-    """
-    start = pd.Timestamp(start_date).normalize()
-    end = pd.Timestamp(end_date).normalize()
-    if end < start:
-        return -1
-    cal = get_nyse_calendar()
-    if cal is not None:
-        try:
-            sessions = cal.sessions_in_range(start, end)
-            dates = pd.DatetimeIndex(sessions).tz_localize(None).normalize()
-            return int(((dates > start) & (dates <= end)).sum())
-        except Exception:
-            pass
-    days = pd.date_range(start + pd.Timedelta(days=1), end, freq="B")
-    return int(len(days))
-
-
 def evaluate_earnings_event(metadata, today=None):
     """Convert earnings metadata into a conservative event-risk state.
 
@@ -2822,10 +2789,9 @@ def evaluate_earnings_event(metadata, today=None):
 
     if next_date is not None and not pd.isna(next_date):
         event_date = pd.Timestamp(next_date).normalize()
-        calendar_days = (event_date - market_day).days
-        trading_days = trading_sessions_until(market_day, event_date)
+        days = (event_date - market_day).days
         confidence = _confidence_for(certainty)
-        if calendar_days < 0:
+        if days < 0:
             return {
                 "text": f"{_fmt(event_date)} — provider date has passed; next date needs re-verification",
                 "risk": False, "state": "UNKNOWN", "block": True,
@@ -2834,27 +2800,24 @@ def evaluate_earnings_event(metadata, today=None):
                 "certainty": "UNKNOWN",
             }
 
-        text = (
-            f"{_fmt(event_date)} — Today" if calendar_days == 0 else
-            f"{_fmt(event_date)} — {trading_days} trading days away ({calendar_days} calendar days)"
-        )
+        text = f"{_fmt(event_date)} — Today" if days == 0 else f"{_fmt(event_date)} — {days} days away"
         label = (
             "Confirmed earnings" if certainty == "CONFIRMED" else
             "Corroborated earnings estimate" if certainty == "CORROBORATED" else
             "Estimated earnings date"
         )
 
-        if trading_days <= EARNINGS_HARD_BLOCK_DAYS:
+        if days <= EARNINGS_HARD_BLOCK_DAYS:
             return {
                 "text": text, "risk": True, "state": "HIGH", "block": True,
                 "block_reason": (
                     f"{label} is {text}. New swing entries are blocked inside the "
-                    f"{EARNINGS_HARD_BLOCK_DAYS}-day trading-day earnings danger window."
+                    f"{EARNINGS_HARD_BLOCK_DAYS}-day earnings danger window."
                 ),
                 "event_date": event_date, "source": source, "confidence": confidence,
                 "certainty": certainty,
             }
-        if trading_days <= EARNINGS_CAUTION_DAYS:
+        if days <= EARNINGS_CAUTION_DAYS:
             return {
                 "text": text, "risk": True, "state": "CAUTION", "block": False,
                 "block_reason": "", "event_date": event_date, "source": source,
@@ -3322,15 +3285,12 @@ def assess_candidate_quality(trend, momentum_score, rs_edge, volume_ratio=np.nan
 
     if candidate_dir == "LONG":
         if np.isfinite(mom):
-            # Candidate quality is structural/leadership quality. Weak-but-still-positive
-            # short-term momentum is an ENTRY confirmation issue, not an automatic
-            # candidate downgrade. Only genuinely opposing momentum is penalized.
-            points += 2 if mom >= 70 else 1 if mom >= 40 else -2 if mom <= -15 else -1 if mom < 0 else 0
+            points += 2 if mom >= 70 else 1 if mom >= 40 else -2 if mom <= -15 else -1 if mom < 15 else 0
         if np.isfinite(rs):
             points += 2 if rs >= 15 else 1 if rs >= 5 else -2 if rs <= -10 else -1 if rs < 0 else 0
     elif candidate_dir == "SHORT":
         if np.isfinite(mom):
-            points += 2 if mom <= -70 else 1 if mom <= -40 else -2 if mom >= 15 else -1 if mom > 0 else 0
+            points += 2 if mom <= -70 else 1 if mom <= -40 else -2 if mom >= 15 else -1 if mom > -15 else 0
         if np.isfinite(rs):
             points += 2 if rs <= -15 else 1 if rs <= -5 else -2 if rs >= 10 else -1 if rs > 0 else 0
 
@@ -3383,59 +3343,6 @@ def directional_repair_requirements(trend, momentum_score, rs_edge):
     return unique_text_items(items)
 
 
-def shared_extension_gate(direction, close, ema8, ema20, atr14, rsi14):
-    """v10 shared extension classifier. Candidate strength cannot override this gate.
-
-    Returns E0/E1/E2/E3 severity. E2 is WAIT/REPAIR; E3 is CHASE BLOCK.
-    RSI alone is not a hard block; it becomes decisive in combination with location.
-    """
-    d = str(direction or "").upper()
-    vals = [finite_or_nan(v) for v in [close, ema8, ema20, atr14, rsi14]]
-    c, e8, e20, atr, rsi_v = vals
-    if d not in {"LONG", "SHORT"} or not all(np.isfinite(v) for v in [c, e20, atr, rsi_v]) or atr <= 0 or e20 <= 0:
-        return {"severity":"UNKNOWN", "state":"WAIT FOR STRUCTURE", "block":True, "reason":"Extension state could not be validated.", "ema20_pct":np.nan, "ema20_atr":np.nan}
-    dist_pct = (c / e20 - 1.0) * 100.0
-    dist_atr = (c - e20) / atr
-    if d == "SHORT":
-        dist_pct, dist_atr = -dist_pct, -dist_atr
-        hot = rsi_v <= (100.0 - EXTENSION_HOT_RSI)
-        extreme_rsi = rsi_v <= (100.0 - EXTENSION_EXTREME_RSI)
-    else:
-        hot = rsi_v >= EXTENSION_HOT_RSI
-        extreme_rsi = rsi_v >= EXTENSION_EXTREME_RSI
-
-    # E3 requires truly extreme price displacement; this keeps ABT-like +7%/hot-RSI
-    # cases in WAIT while GLXY-like +20%+ chases are hard-blocked.
-    if dist_pct >= EXTENSION_CHASE_BLOCK_EMA20_PCT or (dist_pct >= 10.0 and extreme_rsi):
-        sev, state, block = "E3", "BLOCK — EXTREME EXTENSION", True
-    elif dist_pct >= EXTENSION_WAIT_EMA20_PCT or (dist_pct >= EXTENSION_ELEVATED_EMA20_PCT and hot) or (dist_atr >= 2.5 and hot):
-        sev, state, block = "E2", "WAIT FOR ENTRY REPAIR", True
-    elif dist_pct >= EXTENSION_ELEVATED_EMA20_PCT or dist_atr >= 2.0 or hot:
-        sev, state, block = "E1", "ELEVATED", False
-    else:
-        sev, state, block = "E0", "NORMAL", False
-    reason = f"{sev}: directional EMA20 extension {dist_pct:+.1f}% ({dist_atr:+.2f} ATR), RSI {rsi_v:.1f}."
-    return {"severity":sev, "state":state, "block":block, "reason":reason, "ema20_pct":dist_pct, "ema20_atr":dist_atr}
-
-
-def falling_knife_gate(direction, latest, ema8, ema20, atr14, rs_edge=np.nan):
-    """Completed-session v10 downside-volatility gate for ordinary long swing entries."""
-    if str(direction or "").upper() != "LONG":
-        return {"triggered":False, "state":"CLEAR", "block":False, "reason":""}
-    try:
-        c=float(latest["Close"]); h=float(latest["High"]); l=float(latest["Low"]); ret=float(latest["1D %"])*100.0
-        atr=float(atr14); e8=float(ema8); e20=float(ema20)
-    except Exception:
-        return {"triggered":False, "state":"UNKNOWN", "block":False, "reason":""}
-    rng=max(h-l, 1e-9); range_atr=rng/atr if atr>0 else np.nan; close_loc=(c-l)/rng
-    triggered = (ret <= FALLING_KNIFE_MIN_DOWN_PCT and range_atr >= FALLING_KNIFE_MIN_RANGE_ATR and c < e8 and c < e20 and close_loc <= FALLING_KNIFE_MAX_CLOSE_LOCATION)
-    if triggered:
-        rs_txt = f", RS Edge {float(rs_edge):+.1f} pp" if np.isfinite(finite_or_nan(rs_edge)) else ""
-        return {"triggered":True, "state":"BLOCK FOR SESSION — FALLING KNIFE", "block":True,
-                "reason":f"Down {ret:.1f}% with {range_atr:.2f} ATR session range, close in bottom {close_loc:.0%}, below EMA8/EMA20{rs_txt}. Wait for a new completed-session confirmation/reclaim before ordinary swing entry."}
-    return {"triggered":False, "state":"CLEAR", "block":False, "reason":""}
-
-
 def entry_caution_items(direction, ema20_distance_pct, stop_pct):
     """Soft caution bands inside the hard entry limits."""
     direction = str(direction or "").upper()
@@ -3479,91 +3386,6 @@ def entry_geometry_grade(stop_pct, rr_midpoint, cautions=None):
             grade = "B+"
         return f"{grade} — CAUTION"
     return grade
-
-
-def assess_trade_plan_quality(candidate_quality, extension_severity, stop_pct, stop_risk_atr, t1_r, t2_r):
-    """JISTS trade-plan quality gate: permissible is not the same as high-edge actionable.
-
-    Hard safety gates (data/event/structure/extension E2-E3/stop >10%) are handled
-    upstream. This layer grades the *quality* of a valid plan using both raw stop
-    distance and ATR-normalized structural risk. READY means the plan is technically
-    valid but does not yet clear the higher capital-deployment standard.
-    """
-    candidate = str(candidate_quality or "C").upper()
-    extension = str(extension_severity or "UNKNOWN").upper()
-    stop_value = finite_or_nan(stop_pct)
-    stop_atr = finite_or_nan(stop_risk_atr)
-    t1 = finite_or_nan(t1_r)
-    t2 = finite_or_nan(t2_r)
-
-    if not np.isfinite(stop_value) or not np.isfinite(stop_atr) or stop_atr <= 0:
-        return {
-            "grade": "C — NOT READY", "state": "WAIT FOR STRUCTURE", "high_edge": False,
-            "reason": "Trade-plan geometry could not be fully normalized to ATR; the setup is not READY until valid entry/stop geometry is available.",
-        }
-
-    # Quality bands. The 10% value remains an emergency hard ceiling upstream,
-    # never an implicit acceptance target. A wide raw stop can receive an ATR-aware
-    # exception only when it is unusually compact for the stock's own volatility.
-    volatility_adjusted_exception = 0.08 < stop_value <= 0.10 and stop_atr <= 2.0
-    if stop_value <= 0.05 and stop_atr <= 2.5:
-        grade = "A"
-    elif stop_value <= 0.065 and stop_atr <= 3.0:
-        grade = "A-"
-    elif (stop_value <= 0.08 and stop_atr <= 3.5) or volatility_adjusted_exception:
-        grade = "B+"
-    elif stop_value <= 0.10:
-        grade = "B — CAUTION"
-    else:
-        grade = "C — NOT READY"
-
-    reward_ok = np.isfinite(t1) and np.isfinite(t2) and t1 >= 1.25 and t2 >= 2.25
-    no_plan_caution = stop_value <= 0.065
-
-    # High-edge promotion is intentionally stricter than hard-gate permission.
-    # A+/A candidates may qualify with excellent/very-good geometry. B+ candidates
-    # need truly exceptional geometry (A, E0) to earn the same ACTIONABLE label.
-    high_edge = False
-    if candidate in {"A+", "A"}:
-        high_edge = (
-            grade in {"A", "A-"}
-            and extension in {"E0", "E1"}
-            and reward_ok
-            and no_plan_caution
-        )
-        if volatility_adjusted_exception and candidate == "A+" and extension == "E0" and reward_ok:
-            high_edge = True
-    elif candidate == "B+":
-        high_edge = grade == "A" and extension == "E0" and reward_ok
-
-    if high_edge:
-        reason = (
-            f"High-edge plan: {candidate} candidate, {extension} extension, "
-            f"{stop_value:.1%} structural stop ({stop_atr:.2f} ATR), "
-            f"T1 {t1:.2f}R / T2 {t2:.2f}R."
-        )
-        return {"grade": grade, "state": "ACTIONABLE", "high_edge": True, "reason": reason}
-
-    reasons = []
-    if stop_value > 0.08 and not volatility_adjusted_exception:
-        reasons.append(f"wide {stop_value:.1%} stop ({stop_atr:.2f} ATR)")
-    elif stop_value > 0.065:
-        reasons.append(f"{stop_value:.1%} stop is in the caution band ({stop_atr:.2f} ATR)")
-    elif stop_atr > 3.0:
-        reasons.append(f"structural risk is {stop_atr:.2f} ATR")
-    if extension == "E1":
-        reasons.append("entry location is E1 elevated")
-    if candidate == "B+" and not (grade == "A" and extension == "E0"):
-        reasons.append("B+ candidate requires exceptional A/E0 plan geometry for high-edge promotion")
-    if not reward_ok:
-        reasons.append("reward profile does not meet the high-edge T1/T2 standard")
-    if not reasons:
-        reasons.append("plan passes hard gates but does not meet the high-edge capital-deployment standard")
-
-    return {
-        "grade": grade, "state": "READY", "high_edge": False,
-        "reason": "READY — " + "; ".join(reasons) + ". Wait for better risk geometry or a new micro-structure before promotion to ACTIONABLE.",
-    }
 
 
 def trade_plan_r_metrics(direction, entry_low, entry_high, stop, target1, target2):
@@ -3629,10 +3451,7 @@ def candidate_strengths_and_risks(diag):
             if mom >= 40:
                 strengths.append(f"Momentum Score: {mom:.1f}")
             elif mom < 15:
-                risks.append(
-                    f"Short-term bullish confirmation is incomplete: Momentum Score {mom:.1f} "
-                    "(entry alignment needs ≥ +15). This is an entry-quality issue, not an automatic candidate-quality downgrade."
-                )
+                risks.append(f"Momentum is insufficient for bullish alignment: {mom:.1f} (need ≥ +15).")
     elif candidate_dir == "SHORT":
         if np.isfinite(rs):
             if rs <= -5:
@@ -3643,10 +3462,7 @@ def candidate_strengths_and_risks(diag):
             if mom <= -40:
                 strengths.append(f"Bearish Momentum Score: {mom:.1f}")
             elif mom > -15:
-                risks.append(
-                    f"Short-term bearish confirmation is incomplete: Momentum Score {mom:.1f} "
-                    "(entry alignment needs ≤ -15). This is an entry-quality issue, not an automatic candidate-quality downgrade."
-                )
+                risks.append(f"Momentum is insufficient for bearish alignment: {mom:.1f} (need ≤ -15).")
     else:
         if np.isfinite(mom) and abs(mom) >= 15:
             risks.append(f"Momentum ({mom:.1f}) is not aligned with a confirmed EMA trend structure.")
@@ -3656,26 +3472,12 @@ def candidate_strengths_and_risks(diag):
     if np.isfinite(vol) and vol >= 1.2:
         strengths.append(f"Volume confirmation: {vol:.2f}x")
     elif np.isfinite(vol) and vol < 0.75:
-        if candidate_dir == "SHORT":
-            risks.append(
-                f"Volume participation is light: {vol:.2f}x. Treat this as confirmation context, not an automatic bullish signal; "
-                "contracting volume on a controlled counter-trend bounce can be constructive for a short, while a downside break still benefits from renewed selling pressure."
-            )
-        elif candidate_dir == "LONG":
-            risks.append(
-                f"Volume participation is light: {vol:.2f}x. Treat this as confirmation context, not an automatic bearish signal; "
-                "contracting volume on a controlled pullback can be constructive for a long, while an upside breakout still benefits from renewed demand."
-            )
-        else:
-            risks.append(
-                f"Volume participation is light: {vol:.2f}x. Treat this as confirmation context rather than a standalone directional signal; "
-                "the next directional break should ideally attract renewed participation."
-            )
+        risks.append(f"Volume is weak: {vol:.2f}x")
 
     return unique_text_items(strengths), unique_text_items(risks)
 
 
-def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan, event_block=False, event_reason="", event_unknown=False, structure_reason="", extension_gate=None, falling_knife=None):
+def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan, event_block=False, event_reason="", event_unknown=False, structure_reason=""):
     """Canonical price-entry gate shared by scanner and ticker diagnostics.
 
     `ema20_distance_pct` is expressed in percentage points (e.g. +8.5, not 0.085).
@@ -3704,18 +3506,16 @@ def evaluate_entry_quality(direction, ema20_distance_pct, rsi14, stop_pct=np.nan
     if not np.isfinite(dist) or not np.isfinite(rsi_value):
         return {"state": "NO TRADE", "quality": "UNKNOWN", "block": True, "reason": "Entry location could not be validated."}
 
-    if falling_knife and falling_knife.get("block"):
-        return {"state": falling_knife.get("state", "BLOCK FOR SESSION — FALLING KNIFE"), "quality":"WAIT", "block":True, "reason":falling_knife.get("reason", "Falling-knife conditions detected.")}
-
-    if extension_gate is not None:
-        if extension_gate.get("block"):
-            return {"state": extension_gate.get("state", "WAIT FOR ENTRY REPAIR"), "quality":"WAIT", "block":True, "reason":extension_gate.get("reason", "Entry is extended.")}
-    else:
-        # Backward-compatible fallback for callers that have not supplied the v10 classifier.
-        if direction == "LONG" and dist > EXTENSION_WAIT_EMA20_PCT:
-            return {"state":"WAIT FOR ENTRY REPAIR", "quality":"WAIT", "block":True, "reason":f"Extended: price is {dist:+.1f}% vs EMA20."}
-        if direction == "SHORT" and dist < -EXTENSION_WAIT_EMA20_PCT:
-            return {"state":"WAIT FOR ENTRY REPAIR", "quality":"WAIT", "block":True, "reason":f"Downside extension: price is {dist:+.1f}% vs EMA20."}
+    if direction == "LONG" and (dist > 8.0 or rsi_value >= 75):
+        return {
+            "state": "WAIT FOR PULLBACK", "quality": "WAIT", "block": True,
+            "reason": f"Extended: price is {dist:+.1f}% vs EMA20 and RSI is {rsi_value:.1f}. Do not chase.",
+        }
+    if direction == "SHORT" and (dist < -8.0 or rsi_value <= 25):
+        return {
+            "state": "WAIT FOR BOUNCE", "quality": "WAIT", "block": True,
+            "reason": f"Oversold: price is {dist:+.1f}% vs EMA20 and RSI is {rsi_value:.1f}. Do not chase weakness.",
+        }
 
     if np.isfinite(stop_value):
         if stop_value > 0.10:
@@ -4080,7 +3880,6 @@ def compute_record(symbol, company, sector, df):
         return None
 
     x = completed_session_frame(df)
-    x["EMA8"] = x["Close"].ewm(span=8, adjust=False).mean()
     x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
     x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
     x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
@@ -4557,11 +4356,6 @@ def build_ranked_master(df):
         (x["Close"] / x["EMA20"] - 1.0) * 100.0,
         np.nan,
     )
-    x["EMA20 Extension ATR"] = np.where(
-        x["ATR14"].gt(0),
-        (x["Close"] - x["EMA20"]) / x["ATR14"],
-        np.nan,
-    )
     x["20D High Distance %"] = np.where(
         x["High20"].gt(0),
         (x["Close"] / x["High20"] - 1.0) * 100.0,
@@ -4777,17 +4571,12 @@ def build_ranked_master(df):
                     structure_reason = "Bearish trend lacks negative RS Edge versus SPY."
             else:
                 structure_reason = "EMA trend structure is mixed; wait for directional structure."
-        ext_gate = shared_extension_gate(
-            direction, row.get("Close", np.nan), row.get("EMA8", row.get("EMA20", np.nan)),
-            row.get("EMA20", np.nan), row.get("ATR14", np.nan), row.get("RSI14", np.nan)
-        ) if direction else None
         entry_results.append(
             evaluate_entry_quality(
                 direction,
                 row.get("EMA20 Distance %", np.nan),
                 row.get("RSI14", np.nan),
                 structure_reason=structure_reason,
-                extension_gate=ext_gate,
             )
         )
     x["Price Entry State"] = [r["state"] for r in entry_results]
@@ -4920,7 +4709,6 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         return {"Data Valid": False, "Data Error": reason}
 
     x = completed_session_frame(df)
-    x["EMA8"] = x["Close"].ewm(span=8, adjust=False).mean()
     x["EMA20"] = x["Close"].ewm(span=20, adjust=False).mean()
     x["EMA50"] = x["Close"].ewm(span=50, adjust=False).mean()
     x["EMA200"] = x["Close"].ewm(span=200, adjust=False).mean()
@@ -4986,12 +4774,11 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         acceleration = "N/A"
 
     close = finite_or_nan(latest["Close"])
-    ema8 = finite_or_nan(latest["EMA8"])
     ema20 = finite_or_nan(latest["EMA20"])
     ema50 = finite_or_nan(latest["EMA50"])
     ema200 = finite_or_nan(latest["EMA200"])
 
-    if not all(np.isfinite(v) and v > 0 for v in [close, ema8, ema20, ema50, ema200]):
+    if not all(np.isfinite(v) and v > 0 for v in [close, ema20, ema50, ema200]):
         return {
             "Data Valid": False,
             "Data Error": "Latest price/trend values are incomplete, so no trading assessment was generated.",
@@ -5192,59 +4979,18 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         trade_state = "NO TRADE"
         trade_block_reason = "Momentum/trend alignment is mixed."
 
-    # v10 Shared Gate Architecture: extension severity and falling-knife state are
-    # independent veto/repair gates. Candidate score cannot average them away.
-    # Extension/location is a price-structure diagnostic and should remain measurable
-    # even when short-term momentum has not yet passed the entry-alignment gate.
-    # Use the candidate/trend direction as a fallback so PLTR-like WAIT cases do
-    # not misleadingly show Extension=UNKNOWN solely because momentum < +15.
-    gate_direction = "LONG" if long_bias else "SHORT" if short_bias else str(candidate_assessment.get("direction") or "")
-    extension_gate_v10 = shared_extension_gate(gate_direction, close, ema8, ema20, atr, rsi14) if gate_direction else {"severity":"UNKNOWN", "state":"WAIT FOR STRUCTURE", "block":True, "reason":"No directional candidate structure.", "ema20_pct":np.nan, "ema20_atr":np.nan}
-    falling_knife_v10 = falling_knife_gate(gate_direction, latest, ema8, ema20, atr, rs_score) if gate_direction else {"triggered":False, "state":"CLEAR", "block":False, "reason":""}
-    extension_severity = extension_gate_v10.get("severity", "UNKNOWN")
-    extension = (
-        "Extreme" if extension_severity == "E3" else
-        "Extended" if extension_severity == "E2" else
-        "Elevated" if extension_severity == "E1" else
-        "Normal" if extension_severity == "E0" else
-        "UNKNOWN"
+    # Shared Phase-1 entry gate is authoritative for extension, stop geometry and event risk.
+    gate_direction = "LONG" if long_bias else "SHORT" if short_bias else ""
+    entry_gate = evaluate_entry_quality(
+        gate_direction,
+        dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
+        rsi14,
+        stop_pct=stop_pct,
+        event_block=earnings_event_block,
+        event_reason=earnings_event_block_reason,
+        event_unknown=earnings_risk_state in {"UNKNOWN", "WINDOW"},
+        structure_reason=alignment_reason,
     )
-
-    # Shared Phase-1 entry gate is authoritative for actionability. Candidate/trend
-    # direction may still be used to *measure* extension while short-term confirmation
-    # is incomplete, but that fallback direction must never manufacture a READY state.
-    # Gate priority here is Event -> Directional confirmation -> Location/extension -> Stop.
-    if earnings_event_block:
-        entry_gate = evaluate_entry_quality(
-            gate_direction,
-            dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
-            rsi14,
-            stop_pct=stop_pct,
-            event_block=True,
-            event_reason=earnings_event_block_reason,
-            event_unknown=earnings_risk_state in {"UNKNOWN", "WINDOW"},
-            structure_reason=alignment_reason,
-            extension_gate=extension_gate_v10,
-            falling_knife=falling_knife_v10,
-        )
-    elif aligned_direction not in {"LONG", "SHORT"}:
-        entry_gate = {
-            "state": "WAIT FOR STRUCTURE", "quality": "WAIT", "block": True,
-            "reason": alignment_reason or "Trend, momentum and relative strength are not sufficiently aligned for entry confirmation.",
-        }
-    else:
-        entry_gate = evaluate_entry_quality(
-            aligned_direction,
-            dist_ema20 * 100.0 if np.isfinite(dist_ema20) else np.nan,
-            rsi14,
-            stop_pct=stop_pct,
-            event_block=False,
-            event_reason="",
-            event_unknown=False,
-            structure_reason=alignment_reason,
-            extension_gate=extension_gate_v10,
-            falling_knife=falling_knife_v10,
-        )
     # Preserve the independent price/risk geometry assessment even when candidate
     # quality later blocks actionability. This allows e.g. C Candidate + B+ entry
     # geometry to display honestly while still producing NO TRADE / WAIT FOR QUALITY.
@@ -5256,32 +5002,8 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     ) if gate_direction else []
     entry_geometry_quality = entry_geometry_grade(stop_pct, rr, entry_cautions) if entry_geometry_pass else "C — NOT READY"
 
-    # JISTS High-Edge Actionability: a valid trade plan is not automatically a
-    # capital-worthy ACTIONABLE trade. Grade stop geometry using both raw percent
-    # and ATR-normalized structural risk, then require a higher quality standard.
-    preliminary_r = trade_plan_r_metrics(
-        gate_direction, entry_low, entry_high, stop, target1, target2
-    )
-    stop_risk_atr = (
-        abs(entry_mid - stop) / atr
-        if all(np.isfinite(v) for v in [entry_mid, stop, atr]) and atr > 0
-        else np.nan
-    )
-    trade_plan_quality = assess_trade_plan_quality(
-        candidate_quality,
-        extension_gate_v10.get("severity", "UNKNOWN"),
-        stop_pct,
-        stop_risk_atr,
-        preliminary_r.get("t1", np.nan),
-        preliminary_r.get("t2", np.nan),
-    ) if entry_geometry_pass else {
-        "grade": "C — NOT READY", "state": "WAIT", "high_edge": False,
-        "reason": entry_gate.get("reason", "Entry gate has not passed."),
-    }
-
     # Canonical action gate priority:
-    # Event → Candidate Quality → Directional Structure → Location → hard stop gates
-    # → Trade Plan Quality → final ACTIONABLE/READY state.
+    # Event → Candidate Quality → Directional Structure → Location → Stop/R:R.
     if earnings_event_block:
         authoritative_gate = entry_gate
     elif candidate_quality not in MIN_ACTIONABLE_CANDIDATE_GRADES:
@@ -5301,20 +5023,9 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         bias = "WAIT"
         trade_state = authoritative_gate["state"]
         trade_block_reason = authoritative_gate["reason"]
-        # Do not publish trade-plan levels when any higher-level hard gate blocks.
+        # Do not publish actionable levels when any higher-level gate blocks.
         entry_low = entry_high = stop = target1 = target2 = np.nan
-        trade_plan_quality = {
-            "grade": "C — NOT READY", "state": trade_state, "high_edge": False,
-            "reason": trade_block_reason,
-        }
-    else:
-        # Hard gates have passed. READY preserves the valid plan for inspection,
-        # while ACTIONABLE is reserved for genuinely high-edge capital deployment.
-        trade_state = trade_plan_quality["state"]
-        trade_block_reason = "" if trade_state == "ACTIONABLE" else trade_plan_quality["reason"]
-        bias = gate_direction
-
-    entry_quality = "PASS" if trade_state in {"ACTIONABLE", "READY"} else "WAIT"
+    entry_quality = "PASS" if trade_state == "ACTIONABLE" else "WAIT"
 
     points = 0
     points += 2 if bull_stack else 1 if bull_mid else -2 if bear_stack else -1 if bear_mid else 0
@@ -5330,9 +5041,6 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         verdict = "A — ACTIONABLE SHORT" if points <= -5 else "B+ — SHORT WATCH" if points <= -3 else "B — CONDITIONAL SHORT" if points <= -1 else "C — WAIT"
     else:
         verdict = "C — WAIT / EVENT RISK" if trade_state == "WAIT — EVENT RISK" else "C — WAIT / MIXED"
-
-    if trade_state == "READY":
-        verdict = f"{candidate_quality} — READY / CAUTION"
 
     # Plain-English interpretation for the UI.
     if composite >= 70:
@@ -5362,19 +5070,9 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     elif aligned_direction == "SHORT":
         trade_comment = "Trend, momentum and relative weakness are constructive for shorts on completed daily bars."
     elif trend_side(trend) == "LONG":
-        if composite < 15 and np.isfinite(rs_score) and rs_score > 0:
-            trade_comment = "Price trend and relative strength remain bullish, but short-term momentum confirmation is incomplete."
-        elif composite >= 15 and (not np.isfinite(rs_score) or rs_score <= 0):
-            trade_comment = "Price trend and momentum are constructive, but relative-strength confirmation is incomplete."
-        else:
-            trade_comment = "Price trend is bullish, but short-term confirmation is not yet fully aligned."
+        trade_comment = "Price trend is bullish, but momentum and/or relative strength are not sufficiently aligned."
     elif trend_side(trend) == "SHORT":
-        if composite > -15 and np.isfinite(rs_score) and rs_score < 0:
-            trade_comment = "Price trend and relative weakness remain bearish, but short-term downside momentum confirmation is incomplete."
-        elif composite <= -15 and (not np.isfinite(rs_score) or rs_score >= 0):
-            trade_comment = "Price trend and downside momentum are constructive for shorts, but relative-weakness confirmation is incomplete."
-        else:
-            trade_comment = "Price trend is bearish, but short-term confirmation is not yet fully aligned."
+        trade_comment = "Price trend is bearish, but momentum and/or relative weakness are not sufficiently aligned."
     elif composite >= 15 and np.isfinite(rs_score) and rs_score > 0:
         trade_comment = "Momentum and relative strength are constructive, but EMA trend structure is not yet fully aligned."
     elif composite <= -15 and np.isfinite(rs_score) and rs_score < 0:
@@ -5388,13 +5086,10 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         else:
             trade_comment += " Price is stretched lower; do not chase weakness while the higher-priority gate remains unresolved."
 
-    if trade_state == "READY" and trade_block_reason:
-        trade_comment += f" Current plan is READY but not high-edge ACTIONABLE because: {trade_block_reason}"
-    elif trade_state != "ACTIONABLE" and trade_block_reason:
+    if trade_state != "ACTIONABLE" and trade_block_reason:
         trade_comment += f" Current action remains WAIT because: {trade_block_reason}"
 
-    # Transparent R multiples are calculated for both READY and ACTIONABLE plans.
-    # Hard-gate WAIT states have their levels cleared above and therefore return N/A.
+    # Transparent R multiples are calculated from published actionable levels only.
     r_metrics = trade_plan_r_metrics(bias, entry_low, entry_high, stop, target1, target2)
 
     return {
@@ -5413,10 +5108,6 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Previous Momentum Score": prev_momentum_score,
         "Trend": trend, "RSI14": rsi14,
         "Volume Ratio": vol_ratio, "Extension": extension,
-        "Extension Severity": extension_gate_v10.get("severity", "UNKNOWN"),
-        "EMA20 Extension ATR": extension_gate_v10.get("ema20_atr", np.nan),
-        "Falling Knife": falling_knife_v10.get("triggered", False),
-        "Price State": falling_knife_v10.get("state", "CLEAR"),
         "Distance EMA20": dist_ema20,
         "RS vs SPY": rs_text,
         "RS 1M vs SPY": rs_1m,
@@ -5445,10 +5136,6 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Entry Geometry Pass": entry_geometry_pass,
         "Entry Geometry Quality": entry_geometry_quality,
         "Entry Cautions": entry_cautions,
-        "Trade Plan Quality": trade_plan_quality.get("grade", "C — NOT READY"),
-        "Trade Plan High Edge": bool(trade_plan_quality.get("high_edge", False)),
-        "Trade Plan Reason": trade_plan_quality.get("reason", ""),
-        "Stop Risk ATR": stop_risk_atr,
         "Entry Low": entry_low, "Entry High": entry_high, "Stop": stop,
         "Target 1": target1, "Target 2": target2, "RR": rr,
         "RR Midpoint": r_metrics["mid"], "T1 R": r_metrics["t1"], "T2 R": r_metrics["t2"],
@@ -5456,7 +5143,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Trade State": trade_state,
         "Trade Block Reason": trade_block_reason,
         "Stop %": stop_pct,
-        "EMA8": ema8, "EMA20": ema20, "EMA50": ema50, "EMA200": ema200,
+        "EMA20": ema20, "EMA50": ema50, "EMA200": ema200,
         "ATR14": atr,
         "Latest High": float(latest["High"]) if pd.notna(latest["High"]) else np.nan,
         "Latest Low": float(latest["Low"]) if pd.notna(latest["Low"]) else np.nan,
@@ -5578,168 +5265,6 @@ st.markdown(
 )
 
 
-
-# ---------------------------
-# v10 Frozen Regression Harness
-# ---------------------------
-# These fixtures are intentionally independent of live ticker data. They encode
-# historical decision-time conditions so future code changes can be regression-
-# tested without the test itself drifting with today's price, EMA, ATR or event date.
-V10_REGRESSION_FIXTURES = {
-    "ABT-EXT-001": {
-        "label": "ABT — Extension E2 / WAIT",
-        "scope": "PHASE2",
-        "expected": "WAIT FOR ENTRY REPAIR",
-        "notes": "Strong momentum context, but +7% EMA20 / ~3.25 ATR / RSI 77.9 must remain E2; RSI alone is not the blocker.",
-    },
-    "CSCO-EVT-001": {
-        "label": "CSCO — Confirmed earnings ≤5 sessions / BLOCK",
-        "scope": "PHASE2",
-        "expected": "WAIT — EVENT RISK",
-        "notes": "Historical fixture: 07-Aug-2026 decision date; confirmed earnings 12-Aug-2026 after close (~3 XNYS sessions).",
-    },
-    "GLXY-EXT-001": {
-        "label": "GLXY — Extreme extension E3 / BLOCK",
-        "scope": "PHASE2",
-        "expected": "BLOCK — EXTREME EXTENSION",
-        "notes": "Historical momentum chase: roughly +22% vs EMA20 and ~2.8 ATR displacement.",
-    },
-    "SOFI-FK-001": {
-        "label": "SOFI — Falling knife / session block",
-        "scope": "PHASE2",
-        "expected": "BLOCK FOR SESSION — FALLING KNIFE",
-        "notes": "Historical 06-Nov-2025 downside expansion: ~2.1 ATR session, close near low, below EMA8/EMA20.",
-    },
-    "SCHW-PLAN-001": {
-        "label": "SCHW — B+ / E1 / 9% stop => READY",
-        "scope": "PHASE2",
-        "expected": "READY",
-        "notes": "Frozen 24-Aug-2026-style SCHW geometry: B+ candidate, E1, ~9.0% structural stop / ~5.4 ATR, T1 1.5R and T2 2.5R. Valid plan, but not high-edge ACTIONABLE.",
-    },
-    "JISTS-HE-001": {
-        "label": "JISTS — A candidate / compact plan => ACTIONABLE",
-        "scope": "PHASE2",
-        "expected": "ACTIONABLE",
-        "notes": "Positive control: A candidate, E0, 4.5% / 2.0 ATR stop geometry, T1 1.5R and T2 2.5R must still earn high-edge ACTIONABLE.",
-    },
-    "GEN-SIZE-001": {
-        "label": "GEN — Account sizing / Phase 3",
-        "scope": "PHASE3",
-        "expected": "DEFERRED",
-        "notes": "Position sizing/account compatibility belongs to Trade With Edge migration, not Regime-Aware Phase 2.",
-    },
-    "FUTU-FIT-001": {
-        "label": "FUTU — Account fit/friction / Phase 3",
-        "scope": "PHASE3",
-        "expected": "DEFERRED",
-        "notes": "Risk geometry + transaction-friction regression belongs to Trade With Edge migration.",
-    },
-    "GLW-DEF-001": {
-        "label": "GLW — In-trade defense / later phase",
-        "scope": "IN-TRADE",
-        "expected": "DEFERRED",
-        "notes": "MFE state transition / failed-breakout defense is intentionally outside the pre-trade Regime-Aware engine.",
-    },
-}
-
-
-def run_v10_regression_fixture(case_id):
-    """Run one frozen fixture through the same v10 gate functions used by live diagnostics."""
-    case_id = str(case_id)
-    if case_id == "ABT-EXT-001":
-        close = 116.64
-        ema20 = close / 1.07
-        atr = (close - ema20) / 3.25
-        gate = shared_extension_gate("LONG", close, 113.5, ema20, atr, 77.9)
-        actual = gate.get("state", "UNKNOWN")
-        return {
-            "case": case_id, "expected": "WAIT FOR ENTRY REPAIR", "actual": actual,
-            "pass": gate.get("severity") == "E2" and actual == "WAIT FOR ENTRY REPAIR",
-            "details": gate.get("reason", ""),
-        }
-
-    if case_id == "CSCO-EVT-001":
-        metadata = {
-            "next_earnings_date": pd.Timestamp("2026-08-12"),
-            "last_earnings_date": None,
-            "earnings_date": pd.Timestamp("2026-08-12"),
-            "earnings_source": "Frozen historical fixture — Cisco IR",
-            "earnings_certainty": "CONFIRMED",
-        }
-        event = evaluate_earnings_event(metadata, today=pd.Timestamp("2026-08-07"))
-        entry = evaluate_entry_quality(
-            "LONG", 0.0, 55.0, stop_pct=0.05,
-            event_block=event.get("block", False),
-            event_reason=event.get("block_reason", ""),
-            event_unknown=event.get("state") in {"UNKNOWN", "WINDOW"},
-            extension_gate={"severity":"E0","state":"NORMAL","block":False,"reason":"fixture normal"},
-            falling_knife={"triggered":False,"state":"CLEAR","block":False,"reason":""},
-        )
-        actual = entry.get("state", "UNKNOWN")
-        return {
-            "case": case_id, "expected": "WAIT — EVENT RISK", "actual": actual,
-            "pass": event.get("state") == "HIGH" and event.get("certainty") == "CONFIRMED" and actual == "WAIT — EVENT RISK",
-            "details": f"{event.get('text','')} | {event.get('block_reason','')}",
-        }
-
-    if case_id == "GLXY-EXT-001":
-        gate = shared_extension_gate("LONG", 33.15, 29.30, 27.20, 2.10, 80.0)
-        actual = gate.get("state", "UNKNOWN")
-        return {
-            "case": case_id, "expected": "BLOCK — EXTREME EXTENSION", "actual": actual,
-            "pass": gate.get("severity") == "E3" and actual == "BLOCK — EXTREME EXTENSION",
-            "details": gate.get("reason", ""),
-        }
-
-    if case_id == "SOFI-FK-001":
-        latest = {"Close":27.16, "High":30.85, "Low":27.13, "1D %":-0.0968}
-        gate = falling_knife_gate("LONG", latest, 29.75, 28.98, 1.78, rs_edge=-5.0)
-        actual = gate.get("state", "UNKNOWN")
-        return {
-            "case": case_id, "expected": "BLOCK FOR SESSION — FALLING KNIFE", "actual": actual,
-            "pass": bool(gate.get("triggered")) and actual == "BLOCK FOR SESSION — FALLING KNIFE",
-            "details": gate.get("reason", ""),
-        }
-
-    if case_id == "SCHW-PLAN-001":
-        plan = assess_trade_plan_quality(
-            "B+", "E1", stop_pct=0.09, stop_risk_atr=5.39, t1_r=1.50, t2_r=2.50
-        )
-        actual = plan.get("state", "UNKNOWN")
-        return {
-            "case": case_id, "expected": "READY", "actual": actual,
-            "pass": actual == "READY" and not bool(plan.get("high_edge")),
-            "details": f"{plan.get('grade','')} | {plan.get('reason','')}",
-        }
-
-    if case_id == "JISTS-HE-001":
-        plan = assess_trade_plan_quality(
-            "A", "E0", stop_pct=0.045, stop_risk_atr=2.00, t1_r=1.50, t2_r=2.50
-        )
-        actual = plan.get("state", "UNKNOWN")
-        return {
-            "case": case_id, "expected": "ACTIONABLE", "actual": actual,
-            "pass": actual == "ACTIONABLE" and bool(plan.get("high_edge")),
-            "details": f"{plan.get('grade','')} | {plan.get('reason','')}",
-        }
-
-    fixture = V10_REGRESSION_FIXTURES.get(case_id, {})
-    return {
-        "case": case_id,
-        "expected": fixture.get("expected", "DEFERRED"),
-        "actual": "DEFERRED — OUTSIDE PHASE 2",
-        "pass": None,
-        "details": fixture.get("notes", "This fixture is not executable in the Regime-Aware pre-trade engine."),
-    }
-
-
-def run_phase2_regression_suite():
-    executable = [
-        "ABT-EXT-001", "CSCO-EVT-001", "GLXY-EXT-001", "SOFI-FK-001",
-        "SCHW-PLAN-001", "JISTS-HE-001",
-    ]
-    return [run_v10_regression_fixture(case_id) for case_id in executable]
-
 # ---------------------------
 # Compact market-regime header
 # ---------------------------
@@ -5764,7 +5289,7 @@ with st.expander("Regime details", expanded=False):
 # ---------------------------
 # Tabs
 # ---------------------------
-ticker_tab, scanner_tab, regression_tab = st.tabs(["🔎 Ticker Search", "📊 Market Scanner", "🧪 v10 Regression"])
+ticker_tab, scanner_tab = st.tabs(["🔎 Ticker Search", "📊 Market Scanner"])
 
 # ---------------------------
 # Ticker autocomplete
@@ -5908,9 +5433,7 @@ with ticker_tab:
             if confidence["block"]:
                 headline_action = "DO NOT ACT / DATA ISSUE"
             elif diag["Trade State"] == "ACTIONABLE":
-                headline_action = f"{diag['Bias']} / ACTIONABLE — HIGH EDGE"
-            elif diag["Trade State"] == "READY":
-                headline_action = f"{diag['Bias']} / READY — CAUTION"
+                headline_action = f"{diag['Bias']} / ACTIONABLE"
             elif diag["Trade State"] == "WAIT — EVENT RISK":
                 headline_action = "WAIT / EVENT RISK"
             elif diag["Trade State"] == "WAIT — VERIFY EVENT":
@@ -5923,24 +5446,16 @@ with ticker_tab:
             if confidence["block"]:
                 entry_quality = "N/A — DATA ISSUE"
                 action_label = "DO NOT ACT"
-            elif diag["Trade State"] in {"ACTIONABLE", "READY"}:
+            elif diag["Trade State"] == "ACTIONABLE":
                 entry_quality = diag.get("Entry Geometry Quality", "B+")
 
                 if confidence["level"] == "MEDIUM":
                     base_grade = entry_quality.replace(" — CAUTION", "")
                     downgraded = {"A": "B+", "B+": "B", "B": "C"}.get(base_grade, base_grade)
                     entry_quality = downgraded + (" — CAUTION" if "CAUTION" in entry_quality else "")
-                    action_label = (
-                        f"{diag['Bias']} — REDUCED CONFIDENCE"
-                        if diag["Trade State"] == "ACTIONABLE"
-                        else "READY — REDUCED CONFIDENCE"
-                    )
+                    action_label = f"{diag['Bias']} — REDUCED CONFIDENCE"
                 else:
-                    action_label = (
-                        diag["Bias"] + " — HIGH EDGE"
-                        if diag["Trade State"] == "ACTIONABLE"
-                        else "READY — CAUTION"
-                    )
+                    action_label = diag["Bias"]
             elif diag["Trade State"] == "WAIT FOR QUALITY" and diag.get("Entry Geometry Pass", False):
                 # Candidate quality blocks the trade, but price/risk geometry is
                 # still reported independently rather than falsely marked bad.
@@ -5957,141 +5472,144 @@ with ticker_tab:
                 [
                     ("Candidate Quality", candidate_quality),
                     ("Entry Quality", entry_quality),
-                    ("Trade Plan Quality", diag.get("Trade Plan Quality", "N/A")),
                     ("Action", action_label),
                     ("Price Data Confidence", confidence["level"]),
                 ],
-                desktop_columns=5,
+                desktop_columns=4,
             )
-            st.caption(
-                "Quality Engine: **Candidate Quality** asks whether the stock is worth watching; "
-                "**Entry Quality** asks whether the latest completed-session location/risk is acceptable; "
-                "**Trade Plan Quality** asks whether the stop/ATR/reward geometry deserves capital; "
-                "**Action** distinguishes WAIT, READY and high-edge ACTIONABLE. A valid trade is not automatically a high-edge trade."
-            )
+            # Phase 2E.2 decision-first hierarchy: show the current action
+            # before formula-heavy technical evidence.
+            if confidence["block"]:
+                st.error(f"**Decision:** DO NOT ACT — {diag['Trade Comment']}")
+            elif diag["Trade State"] == "ACTIONABLE":
+                st.success(f"**Decision:** {action_label} — {diag['Trade Comment']}")
+            elif diag["Chase Risk"] == "Elevated":
+                st.warning(f"**Decision:** {action_label} — {diag['Trade Comment']}")
+            else:
+                st.info(f"**Decision:** {action_label} — {diag['Trade Comment']}")
+
+            with st.expander("How to read Candidate Quality, Entry Quality and Action", expanded=False):
+                st.caption(
+                    "**Candidate Quality** asks whether the stock is worth watching. "
+                    "**Entry Quality** asks whether the latest completed-session location/risk is acceptable. "
+                    "**Action** is the current decision. A strong candidate can correctly remain WAIT."
+                )
 
             signal_session = diag.get("Signal Session", pd.NaT)
-            signal_session_text = pd.Timestamp(signal_session).strftime("%d-%b-%Y") if pd.notna(signal_session) else "N/A"
-            session_note = f"Technical signals use completed US daily bars only. Signal session: **{signal_session_text}**."
+            signal_session_text = (
+                pd.Timestamp(signal_session).strftime("%d-%b-%Y")
+                if pd.notna(signal_session) else "N/A"
+            )
+            session_note = f"**Signal data:** completed-session bars only • session **{signal_session_text}**"
             if diag.get("In-Progress Session Excluded", False):
-                session_note += " The provider's in-progress same-day daily candle was excluded from scoring."
-            st.info(session_note)
+                session_note += " • in-progress same-day daily candle excluded"
+            st.caption(session_note)
 
-            render_responsive_metrics(
-                [
-                    ("Signal Close", fmt_price(diag["Close"])),
-                    ("Momentum Score", f"{diag['Momentum Score']:.1f}"),
-                    ("Trend", diag["Trend"]),
-                    ("RS vs SPY", diag["RS vs SPY"]),
-                ],
-                desktop_columns=4,
-            )
-
-            prev_mom = diag.get("Previous Momentum Score", np.nan)
-            mom_delta = diag.get("Acceleration Delta", np.nan)
-            if pd.notna(prev_mom) and pd.notna(mom_delta):
-                if diag["Acceleration"] == "Accelerating":
-                    st.success(
-                        f"Momentum: **Accelerating** — 5 trading days ago **{prev_mom:.1f}** "
-                        f"→ now **{diag['Momentum Score']:.1f}** "
-                        f"({mom_delta:+.1f} pts)."
-                    )
-                elif diag["Acceleration"] == "Decelerating":
-                    st.warning(
-                        f"Momentum: **Decelerating** — 5 trading days ago **{prev_mom:.1f}** "
-                        f"→ now **{diag['Momentum Score']:.1f}** "
-                        f"({mom_delta:+.1f} pts)."
-                    )
-                elif diag["Acceleration"] == "Direction Shift":
-                    st.warning(
-                        f"Momentum: **Direction Shift** — 5 trading days ago **{prev_mom:.1f}** "
-                        f"→ now **{diag['Momentum Score']:.1f}** "
-                        f"({mom_delta:+.1f} pts)."
-                    )
-                else:
-                    st.info(
-                        f"Momentum: **Stable** — 5 trading days ago **{prev_mom:.1f}** "
-                        f"→ now **{diag['Momentum Score']:.1f}** "
-                        f"({mom_delta:+.1f} pts)."
-                    )
-            else:
-                st.info("Momentum change comparison is unavailable.")
-
-            st.caption(
-                "Relative Strength = the stock's return minus SPY's return. "
-                "Positive = outperforming SPY; negative = underperforming."
-            )
-            render_responsive_metrics(
-                [
-                    ("RS 1M", "N/A" if pd.isna(diag["RS 1M vs SPY"]) else f"{diag['RS 1M vs SPY']:+.1f} pp"),
-                    ("RS 3M", "N/A" if pd.isna(diag["RS 3M vs SPY"]) else f"{diag['RS 3M vs SPY']:+.1f} pp"),
-                    ("RS 6M", "N/A" if pd.isna(diag["RS 6M vs SPY"]) else f"{diag['RS 6M vs SPY']:+.1f} pp"),
-                    ("RS Edge", "N/A" if pd.isna(diag["RS Edge"]) else f"{diag['RS Edge']:+.1f}"),
-                ],
-                desktop_columns=4,
-            )
-
-            st.caption(
-                "RS Edge = 20% × RS 1M + 35% × RS 3M + 45% × RS 6M. "
-                "Values are percentage points of outperformance/underperformance vs SPY."
-            )
-
-            # Explicit calculation note directly under headline metrics.
-            st.info(
-                "**Momentum Score range: -100 to +100.** Formula = 40% Daily + 35% Weekly + 25% Monthly. "
-                "Daily uses 1 trading day, Weekly 5 trading days, Monthly 20 trading days. "
-                "Each component is scaled/capped to a -100 to +100 score, so the final Momentum Score is a weighted momentum reading, not a % return."
-            )
-
-            render_responsive_metrics(
-                [
-                    ("Daily score", f"{diag['Daily']:.1f}"),
-                    ("Weekly score", f"{diag['Weekly']:.1f}"),
-                    ("Monthly score", f"{diag['Monthly']:.1f}"),
-                ],
-                desktop_columns=3,
-            )
-
-            accel_delta = diag["Acceleration Delta"]
-            st.caption(
-                f"Momentum quality: **{diag['Momentum Grade']}** • "
-                "Momentum state compares the absolute strength of the current completed-session Momentum Score with the score 5 trading days ago. "
-                "A ≥10-point increase in magnitude = Accelerating; a ≥10-point decrease in magnitude = Decelerating."
-            )
-
-            render_responsive_metrics(
-                [
-                    ("RSI(14)", f"{diag['RSI14']:.1f}"),
-                    ("Volume Ratio", f"{diag['Volume Ratio']:.2f}x" if pd.notna(diag["Volume Ratio"]) else "N/A"),
-                    ("Extension", (
-                        "UNKNOWN" if str(diag.get("Extension Severity", "UNKNOWN")) == "UNKNOWN"
-                        else f"{diag['Extension']} · {diag.get('Extension Severity','UNKNOWN')}"
-                    )),
-                    ("Sector", diag["Sector"]),
-                ],
-                desktop_columns=4,
-            )
-
-            ema20_dist = diag["Distance EMA20"]
-            ema20_atr = diag.get("EMA20 Extension ATR", np.nan)
-            if pd.notna(ema20_dist):
-                atr_txt = f" • EMA20 displacement: **{ema20_atr:+.2f} ATR**" if pd.notna(ema20_atr) else ""
-                extension_note = (
-                    f"Price vs EMA20: **{ema20_dist:+.1%}**{atr_txt} • RSI(14): **{diag['RSI14']:.1f}**. "
-                    "**v10 Shared Extension Gate:** E0 Normal; E1 Elevated; E2 WAIT/REPAIR; E3 Extreme/CHASE BLOCK. "
-                    "Classification combines EMA20 distance, ATR-normalized displacement and RSI; **RSI ≥75 alone is not a hard block**."
+            with st.expander("Technical evidence", expanded=False):
+                render_responsive_metrics(
+                    [
+                        ("Signal Close", fmt_price(diag["Close"])),
+                        ("Momentum Score", f"{diag['Momentum Score']:.1f}"),
+                        ("Trend", diag["Trend"]),
+                        ("RS vs SPY", diag["RS vs SPY"]),
+                    ],
+                    desktop_columns=4,
                 )
-            else:
-                extension_note = "v10 Shared Extension Gate: EMA20 distance + ATR-normalized displacement + RSI; E2 WAIT/REPAIR, E3 BLOCK."
-            st.caption(extension_note)
 
-            if diag["Industry"]:
-                st.caption(f"Industry: {diag['Industry']}")
+                prev_mom = diag.get("Previous Momentum Score", np.nan)
+                mom_delta = diag.get("Acceleration Delta", np.nan)
+                if pd.notna(prev_mom) and pd.notna(mom_delta):
+                    if diag["Acceleration"] == "Accelerating":
+                        st.success(
+                            f"Momentum: **Accelerating** — 5 trading days ago **{prev_mom:.1f}** "
+                            f"→ now **{diag['Momentum Score']:.1f}** "
+                            f"({mom_delta:+.1f} pts)."
+                        )
+                    elif diag["Acceleration"] == "Decelerating":
+                        st.warning(
+                            f"Momentum: **Decelerating** — 5 trading days ago **{prev_mom:.1f}** "
+                            f"→ now **{diag['Momentum Score']:.1f}** "
+                            f"({mom_delta:+.1f} pts)."
+                        )
+                    elif diag["Acceleration"] == "Direction Shift":
+                        st.warning(
+                            f"Momentum: **Direction Shift** — 5 trading days ago **{prev_mom:.1f}** "
+                            f"→ now **{diag['Momentum Score']:.1f}** "
+                            f"({mom_delta:+.1f} pts)."
+                        )
+                    else:
+                        st.info(
+                            f"Momentum: **Stable** — 5 trading days ago **{prev_mom:.1f}** "
+                            f"→ now **{diag['Momentum Score']:.1f}** "
+                            f"({mom_delta:+.1f} pts)."
+                        )
+                else:
+                    st.info("Momentum change comparison is unavailable.")
 
-            if diag["Chase Risk"] == "Elevated":
-                st.warning(f"⚠️ **Chase risk: Elevated.** {diag['Trade Comment']}")
-            else:
-                st.success(f"**Trade interpretation:** {diag['Trade Comment']}")
+                st.caption(
+                    "Relative Strength = the stock's return minus SPY's return. "
+                    "Positive = outperforming SPY; negative = underperforming."
+                )
+                render_responsive_metrics(
+                    [
+                        ("RS 1M", "N/A" if pd.isna(diag["RS 1M vs SPY"]) else f"{diag['RS 1M vs SPY']:+.1f} pp"),
+                        ("RS 3M", "N/A" if pd.isna(diag["RS 3M vs SPY"]) else f"{diag['RS 3M vs SPY']:+.1f} pp"),
+                        ("RS 6M", "N/A" if pd.isna(diag["RS 6M vs SPY"]) else f"{diag['RS 6M vs SPY']:+.1f} pp"),
+                        ("RS Edge", "N/A" if pd.isna(diag["RS Edge"]) else f"{diag['RS Edge']:+.1f}"),
+                    ],
+                    desktop_columns=4,
+                )
+
+                st.caption(
+                    "RS Edge = 20% × RS 1M + 35% × RS 3M + 45% × RS 6M. "
+                    "Values are percentage points of outperformance/underperformance vs SPY."
+                )
+
+                # Explicit calculation note directly under headline metrics.
+                st.info(
+                    "**Momentum Score range: -100 to +100.** Formula = 40% Daily + 35% Weekly + 25% Monthly. "
+                    "Daily uses 1 trading day, Weekly 5 trading days, Monthly 20 trading days. "
+                    "Each component is scaled/capped to a -100 to +100 score, so the final Momentum Score is a weighted momentum reading, not a % return."
+                )
+
+                render_responsive_metrics(
+                    [
+                        ("Daily score", f"{diag['Daily']:.1f}"),
+                        ("Weekly score", f"{diag['Weekly']:.1f}"),
+                        ("Monthly score", f"{diag['Monthly']:.1f}"),
+                    ],
+                    desktop_columns=3,
+                )
+
+                accel_delta = diag["Acceleration Delta"]
+                st.caption(
+                    f"Momentum quality: **{diag['Momentum Grade']}** • "
+                    "Momentum state compares the absolute strength of the current completed-session Momentum Score with the score 5 trading days ago. "
+                    "A ≥10-point increase in magnitude = Accelerating; a ≥10-point decrease in magnitude = Decelerating."
+                )
+
+                render_responsive_metrics(
+                    [
+                        ("RSI(14)", f"{diag['RSI14']:.1f}"),
+                        ("Volume Ratio", f"{diag['Volume Ratio']:.2f}x" if pd.notna(diag["Volume Ratio"]) else "N/A"),
+                        ("Extension", diag["Extension"]),
+                        ("Sector", diag["Sector"]),
+                    ],
+                    desktop_columns=4,
+                )
+
+                ema20_dist = diag["Distance EMA20"]
+                extension_note = (
+                    f"Price vs EMA20: **{ema20_dist:+.1%}** • RSI(14): **{diag['RSI14']:.1f}**. "
+                    "Rule: **Extended** if price is >8% above EMA20 OR RSI ≥75. "
+                    "**Oversold** if price is >8% below EMA20 OR RSI ≤25."
+                    if pd.notna(ema20_dist)
+                    else "Extension rule: Extended if >8% above EMA20 or RSI ≥75; Oversold if >8% below EMA20 or RSI ≤25."
+                )
+                st.caption(extension_note)
+
+                if diag["Industry"]:
+                    st.caption(f"Industry: {diag['Industry']}")
 
             # Explain unresolved metadata without misclassifying economically non-meaningful metrics as provider failures.
             field_status = diag.get("Fundamental Field Status", {}) or {}
@@ -6184,8 +5702,6 @@ with ticker_tab:
             with d2:
                 if diag["Trade State"] == "ACTIONABLE":
                     st.markdown("**Key risks / entry considerations**")
-                elif diag["Trade State"] == "READY":
-                    st.markdown("**Why READY is not yet HIGH-EDGE ACTIONABLE**")
                 else:
                     st.markdown("**Why to wait / key risks**")
                 risks = list(base_risks)
@@ -6200,19 +5716,16 @@ with ticker_tab:
                         )
                     else:
                         risks.append("Momentum is decelerating")
-                if (
-                    diag["Trade State"] in {"ACTIONABLE", "READY"}
+                if pd.notna(diag["Volume Ratio"]) and diag["Volume Ratio"] < 0.75:
+                    risks.append(f"Volume is weak: {diag['Volume Ratio']:.2f}x")
+                elif (
+                    diag["Trade State"] == "ACTIONABLE"
                     and pd.notna(diag["Volume Ratio"])
-                    and 0.75 <= diag["Volume Ratio"] < 1.0
+                    and diag["Volume Ratio"] < 1.0
                 ):
                     risks.append(
                         f"Volume participation is slightly below ideal: {diag['Volume Ratio']:.2f}x "
-                        "(≥1.0x preferred, ≥1.2x stronger)."
-                    )
-                if diag.get("Extension") == "UNKNOWN":
-                    risks.append(
-                        "Extension state is UNKNOWN because the required EMA20/ATR/RSI location inputs could not be fully validated. "
-                        "UNKNOWN is not treated as safe; rerun after the price-structure inputs are available."
+                        "(non-blocking; ≥1.0x preferred, ≥1.2x stronger)"
                     )
                 for caution in diag.get("Entry Cautions", []):
                     risks.append(caution)
@@ -6233,18 +5746,11 @@ with ticker_tab:
                     st.write("• No major blocking risk identified.")
 
             if diag["Trade State"] != "ACTIONABLE":
-                if diag["Trade State"] == "READY":
-                    st.markdown("### High-Edge Repair Map")
-                    st.caption(
-                        "This setup passes the hard gates and is technically READY, but it has **not** met the higher JISTS capital-deployment standard. "
-                        "The map below shows what must improve before promotion to HIGH-EDGE ACTIONABLE."
-                    )
-                else:
-                    st.markdown("### Setup Repair Map")
-                    st.caption(
-                        "The engine first identifies **why the entry is not ready**, then shows what repairs that defect. "
-                        "A repair threshold is **not an entry signal**. After repair, the setup must be recalculated and confirmed from the new structure."
-                    )
+                st.markdown("### Setup Repair Map")
+                st.caption(
+                    "The engine first identifies **why the entry is not ready**, then shows what repairs that defect. "
+                    "A repair threshold is **not an entry signal**. After repair, the setup must be recalculated and confirmed from the new structure."
+                )
 
                 ema20_now = diag.get("EMA20", np.nan)
                 ema50_now = diag.get("EMA50", np.nan)
@@ -6272,14 +5778,10 @@ with ticker_tab:
                     defects.append("RSI EXTENSION")
                 if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
                     defects.append("STOP GEOMETRY")
-                if diag["Trade State"] == "READY":
-                    defects.append("PLAN QUALITY")
-                    if pd.notna(stop_now) and stop_now > 0.065:
-                        defects.append("STOP GEOMETRY")
                 if diag["Acceleration"] == "Decelerating":
                     defects.append("MOMENTUM DECELERATION")
                 if pd.notna(vol_now) and vol_now < 1.0:
-                    defects.append("LIGHT VOLUME / CONFIRMATION CONTEXT")
+                    defects.append("WEAK VOLUME")
                 if candidate_quality not in MIN_ACTIONABLE_CANDIDATE_GRADES:
                     defects.append("CANDIDATE QUALITY")
                 if not bullish_candidate and not bearish_candidate:
@@ -6302,11 +5804,9 @@ with ticker_tab:
                     repair_mode = "PULLBACK / CONSOLIDATION" if bullish_candidate else "BOUNCE / CONSOLIDATION"
                 elif "STOP GEOMETRY" in defects:
                     repair_mode = "RISK GEOMETRY REPAIR"
-                elif "PLAN QUALITY" in defects:
-                    repair_mode = "HIGH-EDGE PLAN REPAIR"
                 elif "MOMENTUM DECELERATION" in defects:
                     repair_mode = "MOMENTUM STABILIZATION"
-                elif "LIGHT VOLUME / CONFIRMATION CONTEXT" in defects:
+                elif "WEAK VOLUME" in defects:
                     repair_mode = "PARTICIPATION CONFIRMATION"
                 else:
                     repair_mode = "MAINTAIN QUALITY"
@@ -6327,8 +5827,6 @@ with ticker_tab:
                     repair_items.append(
                         f"Candidate Quality is {candidate_quality}; improve to at least B+ before a new swing entry can become actionable."
                     )
-                if "PLAN QUALITY" in defects:
-                    repair_items.append(diag.get("Trade Plan Reason", "Improve trade-plan geometry before promotion to high-edge ACTIONABLE."))
                 if "DIRECTIONAL ALIGNMENT" in defects:
                     repair_items.extend(
                         directional_repair_requirements(
@@ -6354,23 +5852,15 @@ with ticker_tab:
                     preferred_high = max(raw_high, preferred_low)
                     repair_boundary = ema20_now * 1.08
 
-                    ext_sev = str(diag.get("Extension Severity", "UNKNOWN"))
-                    ext_atr = diag.get("EMA20 Extension ATR", np.nan)
-                    if ext_sev in {"E2", "E3"}:
-                        atr_txt = f", {ext_atr:+.2f} ATR from EMA20" if pd.notna(ext_atr) else ""
+                    if pd.notna(dist_now) and dist_now > 0.08:
                         repair_items.append(
-                            f"v10 Extension Gate is **{ext_sev}**: current price is {dist_now:+.1%} vs EMA20{atr_txt}, RSI {rsi_now:.1f}. "
-                            "The setup must be recalculated after pullback/base/EMA catch-up until the shared gate improves to **E0/E1**; "
-                            "RSI does not need to fall below 75 by itself if price/ATR location has repaired."
+                            f"Price extension must repair from {dist_now:+.1%} vs EMA20 to **≤ +8.0%**. "
+                            f"Current no-chase boundary: {fmt_price(repair_boundary)}."
                         )
+                    if pd.notna(rsi_now) and rsi_now >= 75:
+                        repair_items.append(f"RSI must cool from {rsi_now:.1f} to **below 75**.")
                     if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
-                        repair_items.append("Required stop distance must recalculate to **≤10%** just to clear the hard safety ceiling; high-edge promotion requires materially better geometry.")
-                    elif diag["Trade State"] == "READY" and pd.notna(stop_now):
-                        stop_atr_now = diag.get("Stop Risk ATR", np.nan)
-                        atr_text = f" ({stop_atr_now:.2f} ATR)" if pd.notna(stop_atr_now) else ""
-                        repair_items.append(
-                            f"Current structural stop is **{stop_now:.1%}**{atr_text}. Prefer **≤6.5%** or a clearly volatility-adjusted compact structure before high-edge promotion."
-                        )
+                        repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed entry.")
                     if diag["Acceleration"] == "Decelerating":
                         repair_items.append("Momentum must stabilize or re-accelerate; the dashboard will show the new 5-day comparison.")
                     if pd.notna(vol_now) and vol_now < 1.0:
@@ -6396,13 +5886,7 @@ with ticker_tab:
                     if pd.notna(rsi_now) and rsi_now <= 25:
                         repair_items.append(f"RSI must recover from {rsi_now:.1f} to **above 25**.")
                     if diag["Trade State"] == "WAIT FOR BETTER ENTRY":
-                        repair_items.append("Required stop distance must recalculate to **≤10%** just to clear the hard safety ceiling; high-edge promotion requires materially better geometry.")
-                    elif diag["Trade State"] == "READY" and pd.notna(stop_now):
-                        stop_atr_now = diag.get("Stop Risk ATR", np.nan)
-                        atr_text = f" ({stop_atr_now:.2f} ATR)" if pd.notna(stop_atr_now) else ""
-                        repair_items.append(
-                            f"Current structural stop is **{stop_now:.1%}**{atr_text}. Prefer **≤6.5%** or a clearly volatility-adjusted compact structure before high-edge promotion."
-                        )
+                        repair_items.append("Required stop distance must recalculate to **≤10%** from the new proposed short entry.")
                     if diag["Acceleration"] == "Decelerating":
                         repair_items.append("Bearish momentum must stabilize or re-accelerate before entry.")
                     if pd.notna(vol_now) and vol_now < 1.0:
@@ -6483,8 +5967,8 @@ with ticker_tab:
             else:
                 st.markdown("### Entry Considerations")
                 st.caption(
-                    "This setup has passed both the hard gates and the stricter **JISTS high-edge Trade Plan Quality gate**. "
-                    "Items below are secondary considerations rather than unresolved promotion defects."
+                    "This setup has already passed the entry-quality gate. Items below are **non-blocking considerations**, "
+                    "not repairs that must occur before entry."
                 )
                 considerations = []
 
@@ -6526,11 +6010,11 @@ with ticker_tab:
 
             st.markdown("### Trade Plan")
             st.caption(
-                "Trade plans are shown for **READY** and **ACTIONABLE** setups after the required safety/data gates pass. "
-                "The **10% stop is an emergency ceiling, not a quality target**. ACTIONABLE is reserved for JISTS high-edge capital deployment; READY remains valid but needs better plan quality."
+                "Trade plan is shown only when candidate quality and entry quality both pass the risk gates. "
+                "Hard stop-distance cap: **10%**. Extended/oversold names are blocked from actionable entries."
             )
 
-            if diag["Trade State"] not in {"ACTIONABLE", "READY"}:
+            if diag["Trade State"] != "ACTIONABLE":
                 st.warning(
                     f"**{diag['Trade State']}** — {diag.get('Trade Block Reason', '')}"
                 )
@@ -6542,48 +6026,36 @@ with ticker_tab:
                     )
                 elif candidate_quality in {"A+", "A", "B+"}:
                     st.info(
-                        "Candidate quality remains strong, but the entry-confirmation gate is not satisfied. "
-                        "Candidate quality, entry quality and trade-plan quality are intentionally separate."
+                        "Candidate quality remains high, but the current entry/actionability gate is not acceptable. "
+                        "Candidate quality and entry quality are intentionally scored separately."
                     )
                 elif candidate_quality == "B":
                     st.info(
-                        "The stock remains a watchlist candidate, but current quality/alignment is not strong enough for a valid swing entry."
+                        "The stock remains a watchlist candidate, but current quality/alignment is not strong enough for an actionable swing entry."
                     )
                 else:
                     st.info(
-                        "Candidate quality and entry quality are currently insufficient for a valid swing setup. "
+                        "Candidate quality and entry quality are currently insufficient for an actionable swing setup. "
                         "Reassess only after the identified defects repair."
                     )
             else:
-                if diag["Trade State"] == "READY":
-                    st.warning(
-                        "🟡 **READY — VALID BUT NOT HIGH-EDGE ACTIONABLE.** "
-                        + str(diag.get("Trade Plan Reason", "Improve risk geometry before capital deployment."))
-                    )
-                else:
-                    st.success(
-                        "🟢 **ACTIONABLE — HIGH EDGE.** Hard gates and the stricter JISTS trade-plan quality gate both pass."
-                    )
-
                 render_responsive_metrics(
                     [
                         ("Bias", diag["Bias"]),
                         ("Entry Zone", f"{fmt_price(diag['Entry Low'])} – {fmt_price(diag['Entry High'])}"),
                         ("Stop", fmt_price(diag["Stop"])),
                         ("Stop Distance", "N/A" if pd.isna(diag["Stop %"]) else f"{diag['Stop %']:.1%}"),
-                        ("Stop Risk / ATR", "N/A" if pd.isna(diag.get("Stop Risk ATR", np.nan)) else f"{diag['Stop Risk ATR']:.2f} ATR"),
+                        ("R:R @ midpoint", fmt_ratio(diag.get("RR Midpoint", diag["RR"]))),
                     ],
                     desktop_columns=5,
                 )
 
                 render_responsive_metrics(
                     [
-                        ("Trade Plan Quality", diag.get("Trade Plan Quality", "N/A")),
-                        ("R:R @ midpoint", fmt_ratio(diag.get("RR Midpoint", diag["RR"]))),
                         ("Target 1", fmt_price(diag["Target 1"])),
                         ("Target 2", fmt_price(diag["Target 2"])),
                     ],
-                    desktop_columns=4,
+                    desktop_columns=2,
                 )
 
                 zone_min = diag.get("RR Zone Min", np.nan)
@@ -6604,15 +6076,15 @@ with ticker_tab:
                 if diag.get("Entry Cautions"):
                     for caution in diag["Entry Cautions"]:
                         st.warning(caution)
-
-                if diag["Trade State"] == "READY":
-                    st.info(
-                        "JISTS distinction: **Hard-gate PASS does not automatically mean READY, and READY does not automatically mean HIGH-EDGE ACTIONABLE.** "
-                        "Do not size this as a premium setup until the repair map improves the plan geometry and the ticker is recalculated."
+                elif pd.notna(diag["Stop %"]) and diag["Stop %"] > 0.08:
+                    st.warning(
+                        "Stop distance is above 8%. This is still inside the 10% hard cap, "
+                        "but risk is on the wide side for a typical swing trade."
                     )
-                elif pd.notna(diag.get("RR", np.nan)) and diag["RR"] >= 2:
-                    st.success("Entry quality, structural risk and high-edge trade-plan quality all pass.")
-
+                elif diag["RR"] >= 2:
+                    st.success("Entry quality and risk/reward both pass the current swing-trade gate.")
+                elif pd.notna(diag["RR"]):
+                    st.warning("Risk/reward is below 2R. Entry quality may need improvement.")
 
             with st.expander("How each signal is calculated", expanded=False):
                 rows = [
@@ -6622,8 +6094,8 @@ with ticker_tab:
                     ("Trend", "Price/EMA20/EMA50/EMA200 stacking"),
                     ("RS vs SPY", "1M / 3M / 6M excess return vs SPY; RS Edge weights 20% / 35% / 45%"),
                     ("Volume Ratio", "Current volume ÷ 20-day average volume"),
-                    ("Extension", "v10 shared extension severity: EMA20 distance + ATR-normalized displacement + RSI; E2 WAIT, E3 BLOCK"),
-                    ("Trade Plan", "Hard gates establish validity; Trade Plan Quality then uses raw stop %, stop/ATR geometry and reward structure to separate READY from HIGH-EDGE ACTIONABLE"),
+                    ("Extension", ">8% above EMA20 or RSI≥75 = Extended; >8% below EMA20 or RSI≤25 = Oversold"),
+                    ("Trade Plan", "Requires candidate-quality gate + entry-quality gate; R:R uses midpoint entry and also shows T1/T2 plus the full entry-zone T2 range"),
                 ]
                 st.dataframe(pd.DataFrame(rows, columns=["Signal", "Rule"]), hide_index=True, use_container_width=True)
 
@@ -7418,63 +6890,3 @@ st.caption(
     "Research / decision-support tool only. Yahoo Finance data is accessed through yfinance. "
     "Constituent lists are cached to reduce network load and improve responsiveness."
 )
-
-
-# ---------------------------
-# v10 Regression Harness UI
-# ---------------------------
-with regression_tab:
-    st.subheader("JISTS / v10 — Frozen Regression Harness")
-    st.caption(
-        "Regression fixtures use frozen historical decision-time inputs. They do not use today's ticker price, EMA, ATR or earnings date. "
-        "This keeps software tests stable while Live Ticker Search remains a separate current-state diagnostic. "
-        "The suite now also freezes the READY vs HIGH-EDGE ACTIONABLE distinction discovered in SCHW."
-    )
-
-    suite = run_phase2_regression_suite()
-    pass_count = sum(1 for r in suite if r.get("pass") is True)
-    fail_count = sum(1 for r in suite if r.get("pass") is False)
-    render_responsive_metrics(
-        [
-            ("Phase 2 executable fixtures", str(len(suite))),
-            ("PASS", str(pass_count)),
-            ("FAIL", str(fail_count)),
-            ("Status", "PASS" if fail_count == 0 and pass_count == len(suite) else "REVIEW"),
-        ],
-        desktop_columns=4,
-    )
-
-    rows = []
-    for result in suite:
-        fixture = V10_REGRESSION_FIXTURES[result["case"]]
-        rows.append({
-            "Case": result["case"],
-            "Fixture": fixture["label"],
-            "Expected": result["expected"],
-            "Actual": result["actual"],
-            "Result": "PASS ✅" if result.get("pass") else "FAIL ❌",
-        })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-    selected_case = st.selectbox(
-        "Inspect frozen fixture",
-        list(V10_REGRESSION_FIXTURES.keys()),
-        format_func=lambda cid: f"{cid} — {V10_REGRESSION_FIXTURES[cid]['label']}",
-    )
-    selected = run_v10_regression_fixture(selected_case)
-    fixture = V10_REGRESSION_FIXTURES[selected_case]
-    st.write(f"**Scope:** {fixture['scope']}")
-    st.write(f"**Expected:** {selected['expected']}")
-    st.write(f"**Actual:** {selected['actual']}")
-    if selected.get("pass") is True:
-        st.success("PASS — frozen regression output matches the expected v10 gate behavior.")
-    elif selected.get("pass") is False:
-        st.error("FAIL — gate behavior has regressed from the frozen specification.")
-    else:
-        st.info("DEFERRED — this regression belongs to a later engine/phase and is shown here only as a cross-system anchor.")
-    st.caption(selected.get("details", ""))
-
-    st.markdown("### Live vs Frozen — do not mix them")
-    st.write("• **Ticker Search** = current live/completed-session analysis; results are allowed to change with market data.")
-    st.write("• **v10 Regression** = frozen historical fixtures; expected outputs must not drift when current market conditions change.")
-    st.write("• A live ticker can be correctly WAIT today without proving that its historical regression gate is working.")
