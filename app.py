@@ -1,4 +1,4 @@
-# Quality Engine v7.8.0 — Phase 2E.2 (Decision-First UX / Mobile Polish)
+# Quality Engine v7.8.1 — Retrieval Recovery Hotfix (VRT reliability)
 
 import base64
 import hashlib
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.8.0-P2E2-DECISION-FIRST-UX"
+APP_BUILD_VERSION = "v7.8.1-RETRIEVAL-RECOVERY-HOTFIX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -3631,11 +3631,13 @@ def stooq_symbol(symbol):
 
 
 @st.cache_data(ttl=5 * 60, show_spinner=False)
-def download_stooq(symbol, period="1y"):
-    """Independent fallback provider for individual US equities."""
+def _download_stooq_cached(symbol, period="1y"):
+    """Cached Stooq request. Empty failures are evicted by download_stooq()."""
     mapped = stooq_symbol(symbol)
     if not mapped:
-        return pd.DataFrame()
+        empty = pd.DataFrame()
+        empty.attrs["retrieval_note"] = "Stooq: symbol mapping unavailable"
+        return empty
 
     try:
         start_date = period_start_date(period)
@@ -3654,16 +3656,35 @@ def download_stooq(symbol, period="1y"):
         response.raise_for_status()
         raw = response.text.strip()
         if not raw or raw.lower().startswith("no data"):
-            return pd.DataFrame()
+            empty = pd.DataFrame()
+            empty.attrs["retrieval_note"] = "Stooq: no data returned"
+            return empty
 
         df = pd.read_csv(io.StringIO(raw))
         clean = normalize_single_history(df)
         if not clean.empty:
             clean.attrs["download_route"] = "Stooq fallback"
             clean.attrs["provider"] = "Stooq"
-        return clean
-    except Exception:
-        return pd.DataFrame()
+            return clean
+
+        empty = pd.DataFrame()
+        empty.attrs["retrieval_note"] = "Stooq: returned rows were not usable OHLCV"
+        return empty
+    except Exception as exc:
+        empty = pd.DataFrame()
+        empty.attrs["retrieval_note"] = f"Stooq: {type(exc).__name__}"
+        return empty
+
+
+def download_stooq(symbol, period="1y"):
+    """Independent fallback; transient empty results are never allowed to stick in cache."""
+    result = _download_stooq_cached(symbol, period)
+    if result is None or result.empty:
+        try:
+            _download_stooq_cached.clear(symbol, period)
+        except Exception:
+            pass
+    return result if result is not None else pd.DataFrame()
 
 
 def choose_freshest_history(candidates):
@@ -3695,16 +3716,24 @@ def choose_freshest_history(candidates):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def download_one(symbol, period="1y"):
+def _download_one_cached(symbol, period="1y"):
     """
-    Individual download with continuity repair:
-    Yahoo primary, Stooq fallback, then date-by-date merge when Yahoo is stale
-    or has recent session gaps.
+    Individual download with continuity repair.
+
+    Recovery order:
+      1) Yahoo yf.download primary
+      2) Yahoo Ticker.history recovery when the primary route is empty/unusable
+      3) Independent Stooq fallback / gap fill
+
+    A wrapper below evicts empty final results so a transient provider failure is
+    retried on the next Streamlit rerun instead of being replayed from cache.
     """
+    attempts = []
     yahoo = pd.DataFrame()
+
     y_start = time.perf_counter()
     try:
-        yahoo = yf.download(
+        raw_yahoo = yf.download(
             symbol,
             period=period,
             interval="1d",
@@ -3713,22 +3742,60 @@ def download_one(symbol, period="1y"):
             threads=False,
             timeout=12,
         )
+        raw_empty = raw_yahoo is None or getattr(raw_yahoo, "empty", True)
         _record_provider_transport_event(
             "Yahoo / yfinance", True, (time.perf_counter() - y_start) * 1000.0,
             status_code="OK", route="individual price download",
-            note="empty frame" if yahoo is None or getattr(yahoo, "empty", True) else "",
+            note="empty frame" if raw_empty else "",
         )
-        yahoo = normalize_single_history(yahoo)
+        yahoo = normalize_single_history(raw_yahoo)
         if not yahoo.empty:
             yahoo.attrs["provider"] = "Yahoo"
             yahoo.attrs["download_route"] = "Yahoo / yfinance"
+            attempts.append("Yahoo primary: OK")
+        else:
+            attempts.append("Yahoo primary: empty/unusable")
     except Exception as exc:
         _record_provider_transport_event(
             "Yahoo / yfinance", False, (time.perf_counter() - y_start) * 1000.0,
             status_code="", route="individual price download",
             error=f"{type(exc).__name__}: {exc}",
         )
+        attempts.append(f"Yahoo primary: {type(exc).__name__}")
         yahoo = pd.DataFrame()
+
+    # A symbol-specific Yahoo recovery route is valuable when yf.download returns
+    # an empty frame even though Yahoo still has valid history for the ticker.
+    if yahoo.empty:
+        y2_start = time.perf_counter()
+        try:
+            raw_history = yf.Ticker(symbol).history(
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                timeout=12,
+            )
+            raw_history_empty = raw_history is None or getattr(raw_history, "empty", True)
+            _record_provider_transport_event(
+                "Yahoo / yfinance", True, (time.perf_counter() - y2_start) * 1000.0,
+                status_code="OK", route="individual Ticker.history recovery",
+                note="empty frame" if raw_history_empty else "",
+            )
+            recovered = normalize_single_history(raw_history)
+            if not recovered.empty:
+                recovered.attrs["provider"] = "Yahoo"
+                recovered.attrs["download_route"] = "Yahoo / yfinance Ticker.history recovery"
+                yahoo = recovered
+                attempts.append("Yahoo history recovery: OK")
+            else:
+                attempts.append("Yahoo history recovery: empty/unusable")
+        except Exception as exc:
+            _record_provider_transport_event(
+                "Yahoo / yfinance", False, (time.perf_counter() - y2_start) * 1000.0,
+                status_code="", route="individual Ticker.history recovery",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            attempts.append(f"Yahoo history recovery: {type(exc).__name__}")
 
     yahoo_fresh = False
     yahoo_continuous = False
@@ -3736,18 +3803,46 @@ def download_one(symbol, period="1y"):
         yahoo_fresh, _, _, _ = market_data_freshness(yahoo)
         yahoo_continuous, _, _ = continuity_status(yahoo, lookback_days=14)
 
-    # If Yahoo is both current and continuous, avoid extra network load.
+    # If Yahoo is both current and continuous, avoid extra fallback network load.
     if yahoo_fresh and yahoo_continuous:
+        yahoo.attrs["retrieval_attempts"] = " → ".join(attempts)
         return yahoo
 
     stooq = download_stooq(symbol, period)
+    if stooq is not None and not stooq.empty:
+        attempts.append("Stooq fallback: OK")
+    else:
+        stooq_note = str(getattr(stooq, "attrs", {}).get("retrieval_note", "")).strip()
+        attempts.append(stooq_note or "Stooq fallback: empty/unusable")
 
     # Merge by date to fill specific missing sessions.
     merged = merge_price_sources(yahoo, stooq)
     if not merged.empty:
+        merged.attrs["retrieval_attempts"] = " → ".join(attempts)
         return merged
 
-    return yahoo if not yahoo.empty else stooq
+    final = yahoo if not yahoo.empty else stooq
+    if final is not None and not final.empty:
+        final = final.copy()
+        final.attrs["retrieval_attempts"] = " → ".join(attempts)
+        return final
+
+    failed = pd.DataFrame()
+    failed.attrs["provider"] = "Unavailable"
+    failed.attrs["download_route"] = "Yahoo primary → Yahoo history recovery → Stooq fallback"
+    failed.attrs["retrieval_failure_path"] = " → ".join(attempts)
+    return failed
+
+
+def download_one(symbol, period="1y"):
+    """Cached individual retrieval, except that empty failures are immediately evicted."""
+    result = _download_one_cached(symbol, period)
+    if result is None or result.empty:
+        try:
+            _download_one_cached.clear(symbol, period)
+        except Exception:
+            pass
+    return result if result is not None else pd.DataFrame()
 
 
 @st.cache_data(ttl=SCAN_CACHE_TTL, show_spinner=False)
@@ -5396,7 +5491,13 @@ with ticker_tab:
                 f"⚠️ **Market data unavailable for {selected_ticker}.** {reason} "
                 "No Momentum Score, Relative Strength, grade, or Trade Plan will be generated from invalid data."
             )
-            st.info("Yahoo primary and an independent Stooq fallback are used for individual tickers. Retry shortly if both are unavailable.")
+            failure_path = str(getattr(df, "attrs", {}).get("retrieval_failure_path", "")).strip()
+            if failure_path:
+                st.caption(f"Retrieval attempts: {failure_path}")
+            st.info(
+                "Recovery order: Yahoo primary → Yahoo history recovery → independent Stooq fallback. "
+                "Empty failures are not retained in the individual-ticker cache, so a retry performs a fresh recovery attempt."
+            )
         else:
             confidence = data_confidence(df, recent_lookback=14)
             download_route = df.attrs.get("download_route", "validated market-data route")
