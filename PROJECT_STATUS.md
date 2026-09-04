@@ -28,16 +28,18 @@ The project has largely completed the **reliable scanner** stage and is advanced
 |---|---|---|
 | Core scanner | Mature | Large-universe scanner working |
 | Market regime | Implemented | Regime-first architecture |
-| Candidate Quality | Implemented | Structural stock quality |
-| Entry Quality | Implemented | Tactical entry quality |
-| Actionability | Implemented | LONG / WAIT / blocked logic |
+| Candidate Quality | Implemented | Decision-layer separation implemented; feature-level separation remains a P1 research item |
+| Entry Quality | Implemented | Full ticker-level decision engine; scanner-level entry readiness is intentionally partial |
+| Actionability | Implemented | Full ticker-level LONG / WAIT / blocked logic |
+| Scanner actionability | Partial by design | Price-ready scanner rows require **VERIFY EVENT + STOP** before full actionability |
 | Trade Plan | Implemented | Entry, stop, targets, R multiples |
-| Completed-session protection | Strong | No in-progress daily bars |
-| Price Data Confidence | Strong | Fail-closed design |
+| Completed-session protection | Strong | XNYS calendar normally used; documented fallback exists if calendar resolution is unavailable |
+| Price Data Confidence | Strong | User-visible decision is fail-closed |
+| Diagnostic encapsulation | Architecture seam | `compute_search_diagnostic()` is not itself fully data-confidence-gated; UI applies final confidence block |
 | Fundamental/Event Confidence | Good | UNKNOWN distinct from safe |
 | Provider health | Implemented | CORE / RECOVERY / UNIVERSE / ANCILLARY |
 | Circuit breakers | Implemented | Route-scoped containment |
-| Durable recovery | Implemented | GitHub last-good snapshots |
+| Durable recovery | Implemented | GitHub last-good **scanner snapshot** recovery |
 | Responsive UX | Completed | Phase 2E.1 |
 | Decision-first ticker UX | Completed | Phase 2E.2 |
 | Final scanner UX | **NEXT** | Phase 2E.3 |
@@ -45,6 +47,7 @@ The project has largely completed the **reliable scanner** stage and is advanced
 | Alpaca shadow benchmark | Planned | External connection tested |
 | IBKR portfolio/execution layer | Planned | External connection tested |
 | Historical validation | Major work remaining | Phase 2G |
+| Automated regression suite | Not yet present | Add during Phase 2G / production hardening |
 | Calibration | Planned | Phase 2H |
 | Portfolio risk | Planned | Phase 2I |
 | Workflow automation | Planned | Phase 2J |
@@ -58,64 +61,89 @@ The project has largely completed the **reliable scanner** stage and is advanced
 - Earnings hard block: 3 days
 - Earnings caution: 14 days
 - Stop hard cap: 10%
-- Completed XNYS sessions only
+- Completed-session signals are the operating rule
+- XNYS calendar is the normal session source
 - 120-minute post-close publication buffer
 - Scan reuse up to 15 minutes
 - Stale/in-progress/ambiguous price data fails closed
 
+### Session-control implementation seam
+
+The normal implementation uses `exchange_calendars` / XNYS. If the calendar library is unavailable or errors, current code contains a weekday / approximately 18:00 ET fallback. This is a **resilience fallback**, not the preferred signal-source rule.
+
+Before v3.0, explicitly decide whether production should validate/retain this fallback or fail closed when XNYS calendar resolution is unavailable.
+
 ## Reliability architecture
 
-Current price-history chain:
+### Individual ticker fresh OHLCV recovery
 
 1. Yahoo/yfinance primary
 2. Yahoo `Ticker.history` recovery
-3. Stooq individual-ticker fallback
-4. GitHub durable last-good recovery
-5. Fail closed if reliable OHLCV cannot be obtained
+3. Stooq individual-ticker fallback / repair
+4. Fail closed if reliable fresh ticker history cannot be obtained
 
-The VRT retrieval failure led directly to the `v7.8.1` recovery hotfix.
+### System-level scanner recovery
 
-## Event/fundamental reliability
+GitHub durable storage is **not an arbitrary individual-ticker OHLCV fallback**.
 
-The engine separates **Price Data Confidence** from **Fundamental/Event Data Confidence**. A missing earnings date must never be treated as `Earnings Risk=False`; use **UNKNOWN** when timing cannot be verified.
+Its role is:
 
-## Scoring semantics
+> **LAST-GOOD SCANNER SNAPSHOT RECOVERY**
 
-### Momentum Score
-- 40% Daily (1 trading day)
-- 35% Weekly (5 trading days)
-- 25% Monthly (20 trading days)
-- each component capped at -100…+100
+It preserves/restores durable scanner-universe state when a fresh scan is unusable or the Streamlit container is replaced.
 
-### RS Edge
-- 20% RS1M
-- 35% RS3M
-- 45% RS6M
+Failed/empty fresh scans must never overwrite good durable scanner state.
 
-### Trade-plan R:R transparency
-Retain midpoint-based R:R, but also show:
-- R:R at midpoint
-- R:R across full entry zone
-- T1 R
-- T2 R
+## Candidate / Entry / Action scope clarification
 
-## Current research hypotheses
+### Ticker decision engine
 
-These are **not production scoring changes**:
+The ticker workflow performs the fullest current decision sequence:
 
-1. Relative Strength Quality = RS Level + RS Direction + Stress Resilience
-2. Contextual Volume Quality
-3. Candidate vs Entry Feature Separation
-4. Absolute vs Relative Momentum Separation
-5. Data Provider Reliability + Volume Data Confidence
+> Event → Candidate Quality → Directional Structure → Location → Stop/R:R → Data Confidence override
 
-## External connections
+### Scanner
 
-### Alpaca
-Free paper account available. Historical stock access tested successfully. Initial approved role: **SHADOW / VALIDATION**, not primary. Not yet integrated into `app.py`.
+The universe scanner intentionally avoids expensive full event/stop verification for every ticker.
 
-### IBKR
-Connectivity tested successfully. Preferred long-term role: **Portfolio + Risk + Execution**. Not yet integrated into `app.py`.
+A scanner row that is price-ready may therefore show:
+
+> **VERIFY EVENT + STOP**
+
+This means:
+
+> **price-ready candidate, not yet fully ACTIONABLE**
+
+Phase 2E.3 must make this distinction visually explicit.
+
+## Data-confidence encapsulation seam
+
+Current user-visible ticker behavior is correctly fail-closed: low data confidence suppresses actionable entry/stop/targets.
+
+However, the final data-confidence override is applied outside `compute_search_diagnostic()` in the UI flow.
+
+Future Phase 2F lifecycle, APIs, backtests or automation must not reuse the diagnostic function without reproducing or centralizing this block.
+
+## Candidate vs Entry feature-separation seam
+
+The decision/UI architecture already distinguishes Candidate Quality from Entry Quality.
+
+However, the frozen Candidate scoring still contains some tactical features such as entry location, volume, short-term momentum/acceleration, ATR/risk and regime fit.
+
+Therefore:
+
+> **Decision-layer separation = implemented**  
+> **Feature-level separation = not yet complete**
+
+Feature migration/reweighting remains a **P1 research hypothesis** and must not be changed before Phase 2G evidence.
+
+## Cold-start continuity audit — PASS
+
+On 2026-09-04, a fresh ChatGPT session with no prior project context reconstructed the project using only the GitHub repository documentation and code.
+
+It correctly identified the frozen baseline, compatibility key, Candidate/Entry/Action architecture, current provider roles, Alpaca and IBKR roles, exact NEXT phase, roadmap through v3.0, and the distinction between a frozen baseline and validated edge.
+
+**Continuity status: PASS / FREEZE.**
 
 ## Immediate sequence
 

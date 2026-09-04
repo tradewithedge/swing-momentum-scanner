@@ -5,183 +5,154 @@
 
 ## 1. Architectural objective
 
-The system is a layered decision engine, not a simple indicator dashboard:
-
 > **Data Reliability → Market Regime → Candidate Quality → Entry Quality → Actionability → Trade Plan → Lifecycle → Portfolio Risk → Execution**
 
 ## 2. Decision layers
 
-### Market Regime
-Assessed before individual stocks to contextualize momentum and opportunity.
-
 ### Candidate Quality
 Question: **Is this a high-quality swing candidate?**
 
-Persistent traits should dominate:
-- structural trend
-- leadership
-- resilience/durability
-- liquidity
-- longer-horizon quality
+Persistent traits should dominate.
 
 ### Entry Quality
 Question: **Is this a good place to enter now?**
 
-Tactical factors:
-- current momentum
-- momentum change
-- setup maturity
-- contextual volume
-- extension
-- stop geometry
-- R:R
-- trigger quality
+Tactical factors include setup maturity, contextual volume, extension, stop geometry and R:R.
 
 ### Actionability
 Question: **Should the system act now?**
 
-A strong candidate can still be WAIT, NOT READY, event-blocked, extended or poor-R:R.
+A strong candidate can still be WAIT.
+
+### Current feature-separation status
+
+The **decision layer** already separates Candidate Quality, Entry Quality and Actionability.
+
+The **feature layer** is not yet perfectly separated. Current frozen Candidate scoring still includes some tactical inputs such as entry location, volume, short-term momentum/acceleration, ATR/risk and regime fit.
+
+This remains:
+
+> **P1 — Candidate vs Entry Feature Separation**
+
+Do not move or reweight these features before Phase 2G validation.
 
 ## 3. Price-data architecture
 
-### Current
+### Individual ticker fresh history
+
 - Yahoo/yfinance — PRIMARY
 - Yahoo `Ticker.history` — RECOVERY
-- Stooq — RECOVERY
-- GitHub durable snapshots — LAST-GOOD RECOVERY
+- Stooq — individual-ticker RECOVERY / repair
+- fail closed if reliable fresh OHLCV is unavailable
+
+### Scanner durable recovery
+
+- GitHub durable snapshots — **LAST-GOOD SCANNER SNAPSHOT RECOVERY**
+
+GitHub durable recovery restores persisted scanner-universe snapshots. It is not a fourth arbitrary per-ticker historical-data API.
 
 ### Future candidate
+
 - Alpaca historical SIP — SHADOW / VALIDATION first
 
 ## 4. Session integrity
 
-- XNYS calendar
-- completed-session only
+Normal path:
+
+- XNYS calendar via `exchange_calendars`
+- completed-session signal selection
 - 120-minute post-close publication buffer
 - stale/in-progress daily bars rejected
 - ambiguous timestamps fail closed
 
-This protects close, RSI, ATR, moving averages, momentum, volume ratio and RS from partial-session contamination.
+### Resilience fallback seam
 
-## 5. Provider health
+Current code includes a weekday / approximately 18:00 ET fallback if the XNYS calendar library is unavailable or errors.
 
-Roles:
-- CORE
-- RECOVERY
-- UNIVERSE
-- ANCILLARY
+Treat this as:
 
-States:
-- HEALTHY
-- DEGRADED
-- FAILED
+> **resilience behavior, not exact exchange-calendar equivalence**
 
-Rules:
-- latency alone must not force FAILED
-- ancillary failures must not automatically poison price confidence
-- recovery failure may reduce repair capacity without invalidating already-good data
+Before v3.0, explicitly decide whether to validate/retain this fallback or replace it with a strict fail-closed policy.
 
-## 6. Fundamental / Event architecture
+## 5. Trade Plan and data-confidence enforcement
 
-Price confidence and event/fundamental confidence are separate.
+A fully actionable ticker trade plan requires:
 
-Required behavior:
-- negative EPS → P/E N/M
-- missing earnings date ≠ safe
-- earnings may be confirmed, estimated, conflicted or unknown
-- UNKNOWN must be handled explicitly
-
-Current windows:
-- hard block: 3 days
-- caution: 14 days
-
-## 7. Core indicator semantics
-
-### Momentum Score
-- 40% Daily
-- 35% Weekly
-- 25% Monthly
-
-Daily = 1 trading day, Weekly = 5, Monthly = 20. Components capped -100…+100.
-
-### RS Edge
-- 20% RS1M
-- 35% RS3M
-- 45% RS6M
-- benchmark: SPY
-
-### Extension
-- Extended if >8% above EMA20 or RSI >=75
-- Oversold if >8% below EMA20 or RSI <=25
-
-## 8. Trade Plan
-
-Generated only when:
 1. Candidate gate passes
 2. Entry gate passes
-3. Data confidence acceptable
-4. Event risk acceptable
-
-Communicate:
-- entry zone
-- stop
-- stop %
-- T1/T2
-- R:R at midpoint
-- R:R across entry zone
-- T1 R
-- T2 R
+3. Event risk acceptable
+4. Stop/R:R acceptable
+5. Price Data Confidence acceptable
 
 Stop hard cap: **10%**.
 
-## 9. Planned lifecycle architecture
+### Current encapsulation seam
 
-> `DISCOVERED → WATCH → DEVELOPING → READY → TRIGGER → ACTIVE / INVALIDATED`
+`compute_search_diagnostic()` can compute structural/actionable geometry before the final UI-level Price Data Confidence override.
 
-State transitions must use completed-session data.
+The UI currently corrects this safely by converting low-confidence results into a data issue and clearing actionable levels.
 
-## 10. Future RS Quality
+Therefore:
 
-Research model:
+> **Current user-visible behavior = fail closed**  
+> **Diagnostic function alone = not yet self-contained fail closed**
+
+Before reuse in Phase 2F lifecycle, APIs, automation or backtesting, centralize the confidence gate.
+
+## 6. Scanner vs ticker actionability
+
+### Ticker workflow
+Performs the fullest current verification, including event and stop/R:R checks.
+
+### Scanner workflow
+Performs price/candidate readiness without full expensive per-ticker event and stop verification.
+
+Therefore:
+
+> **VERIFY EVENT + STOP = PRICE READY, not yet fully ACTIONABLE**
+
+Phase 2E.3 must preserve this distinction.
+
+## 7. Future RS Quality
 
 > **RS Quality = RS Level + RS Direction + Stress Resilience**
 
-Stress metrics may include Beat Rate, Downside Capture, relative drawdown and tail resilience.
+Research only until validated.
 
-## 11. Future Contextual Volume
-
-Research model:
+## 8. Future Contextual Volume
 
 > **Volume Quality = f(Setup Type, Price Structure, Volume Behavior)**
 
-| Setup | Constructive behavior |
-|---|---|
-| Breakout | Expansion |
-| Pullback | Contraction can be positive |
-| Tight consolidation | Dry-up can be positive |
-| Reversal / repair | Expansion preferred |
-| Breakdown | Expansion can confirm distribution |
+Research only until validated.
 
-## 12. Future provider architecture
+## 9. Future provider architecture
 
 If Alpaca benchmark passes:
 
 > Alpaca SIP Historical = Primary EOD OHLCV  
 > Yahoo = Secondary / corroboration  
 > Stooq = Tertiary recovery  
-> GitHub = Last-good recovery
+> GitHub = Last-good scanner snapshot recovery
 
 IBKR remains:
 
 > **Portfolio + Risk + Execution**
 
-## 13. Security
+## 10. Validation / regression architecture gap
 
-Never commit or paste into public files:
-- Alpaca key/secret
-- IBKR credentials
-- GitHub PAT
+The repository does not yet contain a formal automated historical-validation engine or comprehensive regression test suite.
 
-Use **Streamlit Secrets**.
+Before v3.0, add repeatable regression tests around at least:
 
-Initial Alpaca integration is read-only market data. No order execution during benchmarking.
+- completed-session resolution
+- Price Data Confidence
+- event UNKNOWN handling
+- extension/no-chase gates
+- stop hard cap
+- scanner/ticker actionability semantics
+- recovery-state behavior
+
+## 11. Security
+
+Never commit Alpaca secrets, IBKR credentials or GitHub PATs. Use **Streamlit Secrets**.
