@@ -1,4 +1,4 @@
-# Quality Engine v7.8.1 — Retrieval Recovery Hotfix (VRT reliability)
+# Quality Engine v7.9.0 — Phase 2E.3 Final Scanner Decision UX
 
 import base64
 import hashlib
@@ -41,7 +41,7 @@ st.set_page_config(
 st.title("Regime-Aware Swing Momentum Scanner")
 st.caption(
     "Fast ticker lookup + cached market-universe scanning. "
-    "Market regime is assessed first, then candidates are ranked by momentum, trend, RSI and volume."
+    "Market regime comes first; the scanner then surfaces Candidate Quality, Entry Status, Action and Main Reason before technical evidence."
 )
 
 YAHOO_BATCH_SIZE = 120
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.8.1-RETRIEVAL-RECOVERY-HOTFIX"
+APP_BUILD_VERSION = "v7.9.0-P2E3-FINAL-SCANNER-UX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -4702,6 +4702,57 @@ def build_ranked_master(df):
         ),
     )
 
+    # Phase 2E.3 decision-first scanner fields.
+    # Presentation only: these fields summarize existing frozen candidate/entry/action
+    # gates and do not alter scoring, thresholds, ranking, provider roles or actionability.
+    def scanner_candidate_quality_label(setup_value):
+        setup_text = str(setup_value or "")
+        if setup_text.startswith("A+ "):
+            return "A+"
+        if setup_text.startswith("A "):
+            return "A"
+        if setup_text.startswith("B+ "):
+            return "B+"
+        if setup_text in {"Long Watch", "Short Watch"}:
+            return "WATCH"
+        if setup_text == "Neutral":
+            return "NEUTRAL"
+        return "AVOID"
+
+    x["Candidate Quality"] = x["Setup"].map(scanner_candidate_quality_label)
+    x["Entry Status"] = np.where(
+        price_data_block,
+        "N/A — DATA ISSUE",
+        np.where(raw_entry_pass, "PRICE READY", x["Price Entry State"]),
+    )
+    x["Action"] = x["Scanner Action"]
+
+    def scanner_main_reason(row):
+        action = str(row.get("Scanner Action", "") or "")
+        if action == "DATA BLOCK":
+            return "Price data confidence block"
+        if action == "WAIT FOR QUALITY":
+            gate_note = str(row.get("Gate Note", "") or "").strip()
+            if not bool(row.get("Tradeable", False)) and gate_note:
+                return "Tradeability gate — " + gate_note
+            return "Candidate quality below B+ gate"
+        if action == "VERIFY EVENT + STOP":
+            return "Price ready — verify event + stop"
+        if action == "WAIT FOR PULLBACK":
+            return "Extended / chase risk"
+        if action == "WAIT FOR BOUNCE":
+            return "Oversold / chase risk"
+        if action == "WAIT FOR BETTER ENTRY":
+            return "Stop / entry geometry not ready"
+        if action == "WAIT FOR STRUCTURE":
+            return "Directional structure not ready"
+        if action == "NO TRADE":
+            return "No validated entry"
+        detail = str(row.get("Entry Block Reason", "") or "").strip()
+        return detail or action or "Review setup"
+
+    x["Main Reason"] = x.apply(scanner_main_reason, axis=1)
+
     # Explainability columns.
     x["Trend Check"] = np.where(long_trend | short_trend, "✅", "❌")
     x["Momentum Check"] = np.where(
@@ -6726,10 +6777,12 @@ with scanner_tab:
 
     scan_df = st.session_state.scan_df
     if not scan_df.empty:
+        required_p2e3_columns = {"Candidate Quality", "Entry Status", "Action", "Main Reason"}
         needs_rank_rebuild = (
             st.session_state.scan_ranked_df.empty
             or st.session_state.scan_ranked_regime_label != regime["label"]
             or st.session_state.scan_ranked_engine_version != ENGINE_VERSION
+            or not required_p2e3_columns.issubset(set(st.session_state.scan_ranked_df.columns))
         )
         if needs_rank_rebuild:
             with st.spinner("Building ranked master scan..."):
@@ -6790,11 +6843,11 @@ with scanner_tab:
                 )
 
                 aplus_cols = [
-                    "Ticker", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
-                    "Entry Quality", "Scanner Action", "Price Data Confidence",
-                    "RS Rating", "RS Edge", "Momentum Score", "RSI14",
+                    "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
+                    "Company", "Sector", "Setup", "Setup Type", "Quality Score",
+                    "Price Data Confidence", "RS Rating", "RS Edge", "Momentum Score", "RSI14",
                     "Volume Ratio", "ATR %", "EMA20 Distance %", "20D High Distance %",
-                    "Avg Dollar Volume 20", "Setup Note",
+                    "Avg Dollar Volume 20", "Entry Block Reason", "Setup Note",
                 ]
                 aplus_cols = [c for c in aplus_cols if c in aplus.columns]
 
@@ -6859,13 +6912,23 @@ with scanner_tab:
                     d["EMA50"] = d["Close"].ewm(span=50, adjust=False).mean()
                     d["EMA200"] = d["Close"].ewm(span=200, adjust=False).mean()
 
-                    c1, c2, c3, c4, c5, c6 = st.columns(6)
-                    c1.metric("Candidate Grade", selected_row["Setup"])
-                    c2.metric("Quality Score", f"{selected_row['Quality Score']:.0f}/100")
-                    c3.metric("Entry Quality", selected_row.get("Entry Quality", "N/A"))
-                    c4.metric("Scanner Action", selected_row.get("Scanner Action", "N/A"))
-                    c5.metric("RS Rating", f"{int(selected_row['RS Rating'])}" if pd.notna(selected_row.get("RS Rating")) else "N/A")
-                    c6.metric("Momentum Score", f"{selected_row['Momentum Score']:.1f}")
+                    render_responsive_metrics(
+                        [
+                            ("Candidate Quality", selected_row.get("Candidate Quality", "N/A")),
+                            ("Entry Status", selected_row.get("Entry Status", "N/A")),
+                            ("Action", selected_row.get("Action", selected_row.get("Scanner Action", "N/A"))),
+                            ("Quality Score", f"{selected_row['Quality Score']:.0f}/100"),
+                        ],
+                        desktop_columns=4,
+                    )
+                    st.info(f"**Main Reason:** {selected_row.get('Main Reason', 'Review setup')}")
+                    render_responsive_metrics(
+                        [
+                            ("RS Rating", f"{int(selected_row['RS Rating'])}" if pd.notna(selected_row.get("RS Rating")) else "N/A"),
+                            ("Momentum Score", f"{selected_row['Momentum Score']:.1f}"),
+                        ],
+                        desktop_columns=2,
+                    )
 
                     st.caption(selected_row.get("Setup Note", ""))
                     st.markdown(
@@ -6935,15 +6998,22 @@ with scanner_tab:
         top_n = st.slider("Rows to display", 10, 100, 30, 10)
         shown = shown.head(top_n)
 
+        # Phase 2E.3 hierarchy: decision fields first, evidence second.
         display_cols = [
-            "Rank", "Ticker", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
-            "Entry Quality", "Scanner Action", "Price Entry Gate Pass", "Price Data Confidence",
-            "Tradeable", "Regime Aligned", "RS Rating", "RS Edge",
-            "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
+            "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
+            "Rank", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
+            "Price Data Confidence", "Price Entry Gate Pass", "Tradeable", "Regime Aligned",
+            "RS Rating", "RS Edge", "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
             "EMA20 Distance %", "20D High Distance %", "Avg Dollar Volume 20",
-            "Setup Note", "Filter Reasons",
+            "Entry Block Reason", "Setup Note", "Filter Reasons",
         ]
         existing_cols = [c for c in display_cols if c in shown.columns]
+
+        st.caption(
+            "**Decision-first scanner:** `VERIFY EVENT + STOP` means the price setup is ready for final "
+            "ticker-level verification — it is **not yet fully ACTIONABLE**. Confirm earnings/event timing "
+            "and stop/R:R geometry in Ticker Search before acting."
+        )
 
         st.dataframe(
             shown[existing_cols],
