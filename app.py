@@ -1,4 +1,4 @@
-# Quality Engine v7.9.1 — Phase 2E.3 Empty-State UX Hotfix
+# Quality Engine v7.9.2 — Phase 2E.3 Scanner Filter Semantics Hotfix
 
 import base64
 import hashlib
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.9.1-P2E3-UX-HOTFIX"
+APP_BUILD_VERSION = "v7.9.2-P2E3-FILTER-SEMANTICS-HOTFIX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -4818,32 +4818,50 @@ def build_ranked_master(df):
 
 
 def apply_scanner_filters(ranked_df, min_composite, min_volume, rsi_low, rsi_high):
-    """Cheap UI-only filter layer applied to the cached/session-ranked master scan."""
+    """UI-only post-scan filters applied to the cached/session-ranked master scan.
+
+    Passing Filters means: hard Tradeable gate + the three user sliders.
+    Regime alignment is intentionally separate and is NOT a hidden requirement.
+    """
     if ranked_df.empty:
         return ranked_df
     x = ranked_df.copy()
 
-    def reasons(row):
+    def user_reasons(row):
         out = []
-        if not bool(row.get("Tradeable", False)):
-            out.append(row.get("Gate Note") or "tradeability gate failed")
-        if pd.isna(row.get("Volume Ratio")) or row["Volume Ratio"] < min_volume:
+        if pd.isna(row.get("Momentum Score")):
+            out.append("Momentum unavailable")
+        elif regime["label"] in {"RISK-OFF", "BEARISH"}:
+            if row["Momentum Score"] > -abs(min_composite):
+                out.append(f"Momentum>{-abs(min_composite):.0f}")
+        elif row["Momentum Score"] < min_composite:
+            out.append(f"Momentum<{min_composite:.0f}")
+
+        if pd.isna(row.get("Volume Ratio")):
+            out.append("Volume ratio unavailable")
+        elif row["Volume Ratio"] < min_volume:
             out.append(f"Vol<{min_volume:.1f}x")
+
         if pd.isna(row.get("RSI14")):
             out.append("RSI unavailable")
         elif row["RSI14"] < rsi_low or row["RSI14"] > rsi_high:
             out.append(f"RSI outside {rsi_low}-{rsi_high}")
-        if regime["label"] in {"RISK-OFF", "BEARISH"}:
-            if pd.notna(row.get("Momentum Score")) and row["Momentum Score"] > -abs(min_composite):
-                out.append("short momentum below user threshold")
-        else:
-            if pd.notna(row.get("Momentum Score")) and row["Momentum Score"] < min_composite:
-                out.append("momentum below user threshold")
-        if not row.get("Regime Aligned", False):
-            out.append("not regime-aligned")
+
+        return "; ".join(dict.fromkeys(out))
+
+    x["User Filter Reasons"] = x.apply(user_reasons, axis=1)
+    x["Passes User Filters"] = x["User Filter Reasons"].eq("")
+
+    def all_filter_reasons(row):
+        out = []
+        if not bool(row.get("Tradeable", False)):
+            out.append(row.get("Gate Note") or "tradeability gate failed")
+        user_reason = str(row.get("User Filter Reasons", "") or "").strip()
+        if user_reason:
+            out.append(user_reason)
         return "; ".join(dict.fromkeys([v for v in out if v]))
 
-    x["Filter Reasons"] = x.apply(reasons, axis=1)
+    x["Filter Reasons"] = x.apply(all_filter_reasons, axis=1)
     x["Passes Filters"] = x["Filter Reasons"].eq("")
     return x
 
@@ -6415,6 +6433,12 @@ with scanner_tab:
             min_volume = st.slider("Min volume ratio", 0.0, 3.0, 0.8, 0.1)
         with f3:
             rsi_low, rsi_high = st.slider("RSI range", 0, 100, (30, 80), 1)
+        st.caption(
+            "These are **post-scan user filters** and update the cached ranked scan immediately — "
+            "you do **not** need to rerun market data after moving a slider. "
+            "**Passing Filters = hard Tradeable gate + these 3 sliders.** "
+            "Regime alignment is shown separately and is not a hidden filter requirement."
+        )
 
     run_col, clear_col = st.columns([2, 1])
     with run_col:
@@ -6806,6 +6830,16 @@ with scanner_tab:
         a_plus_count = int(a_plus_mask.sum())
         quality_mask = ranked["Setup"].isin(["A+ Long","A Long","B+ Long","A+ Short","A Short","B+ Short"])
         price_ready_mask = quality_mask & ranked["Price Entry Gate Pass"].fillna(False)
+        filter_match_count = int(ranked["Passes Filters"].fillna(False).sum())
+        if regime["label"] in {"RISK-OFF", "BEARISH"}:
+            momentum_filter_text = f"Momentum ≤ {-abs(min_composite):.0f}"
+        else:
+            momentum_filter_text = f"Momentum ≥ {min_composite:.0f}"
+        st.caption(
+            f"**Active user filters:** {momentum_filter_text} • Volume ≥ {min_volume:.1f}x • "
+            f"RSI {rsi_low}–{rsi_high} • **{filter_match_count}/{len(ranked)}** stocks pass "
+            "the hard Tradeable gate + these sliders. Other views remain independent of these user filters."
+        )
         st.caption(
             "A+ = candidate Quality Score ≥90 after tradeability/data gates. "
             "A+ can correctly remain WAIT when current price location is poor; scanner price-readiness still requires event/stop verification."
@@ -6999,14 +7033,27 @@ with scanner_tab:
         shown = shown.head(top_n)
 
         # Phase 2E.3 hierarchy: decision fields first, evidence second.
-        display_cols = [
-            "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
-            "Rank", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
-            "Price Data Confidence", "Price Entry Gate Pass", "Tradeable", "Regime Aligned",
-            "RS Rating", "RS Edge", "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
-            "EMA20 Distance %", "20D High Distance %", "Avg Dollar Volume 20",
-            "Entry Block Reason", "Setup Note", "Filter Reasons",
-        ]
+        # In Passing Filters, surface the 3 user-filter evidence fields immediately
+        # so a match can be audited without horizontal scrolling.
+        if view_mode == "Passing Filters":
+            display_cols = [
+                "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
+                "Momentum Score", "Volume Ratio", "RSI14",
+                "Rank", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
+                "Tradeable", "Regime Aligned", "Price Data Confidence", "Price Entry Gate Pass",
+                "RS Rating", "RS Edge", "ATR %", "EMA20 Distance %", "20D High Distance %",
+                "Avg Dollar Volume 20", "User Filter Reasons", "Filter Reasons",
+                "Entry Block Reason", "Setup Note",
+            ]
+        else:
+            display_cols = [
+                "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
+                "Rank", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
+                "Price Data Confidence", "Price Entry Gate Pass", "Tradeable", "Regime Aligned",
+                "RS Rating", "RS Edge", "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
+                "EMA20 Distance %", "20D High Distance %", "Avg Dollar Volume 20",
+                "Entry Block Reason", "Setup Note", "Filter Reasons",
+            ]
         existing_cols = [c for c in display_cols if c in shown.columns]
 
         st.caption(
@@ -7026,9 +7073,9 @@ with scanner_tab:
                     "Use Quality Candidates to inspect strong names that may still need entry repair."
                 ),
                 "Passing Filters": (
-                    "No stocks currently pass all active scanner filters. "
+                    "No stocks currently pass the hard Tradeable gate plus all 3 active user filters. "
                     "This is a valid NO TRADE / no-match state, not a scanner error. "
-                    "Review the active filters or inspect Quality Candidates / Price-Ready Candidates for near-matches."
+                    "Adjust the user filters or inspect Quality Candidates / Price-Ready Candidates for near-matches."
                 ),
                 "Regime-Aligned": (
                     "No stocks in the current view are regime-aligned. "
