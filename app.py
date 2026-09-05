@@ -1,4 +1,4 @@
-# Quality Engine v7.9.2 — Phase 2E.3 Scanner Filter Semantics Hotfix
+# Quality Engine v7.10.0 — Phase 2F.1 Candidate Lifecycle Foundation
 
 import base64
 import hashlib
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.9.2-P2E3-FILTER-SEMANTICS-HOTFIX"
+APP_BUILD_VERSION = "v7.10.0-P2F1-CANDIDATE-LIFECYCLE"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -165,6 +165,15 @@ DURABLE_DEFAULT_SOURCE_BRANCH = "main"
 DURABLE_DEFAULT_PREFIX = "scanner_snapshots"
 DURABLE_REQUEST_TIMEOUT = 15
 
+# Phase 2F.1 candidate-lifecycle persistence.
+# Lifecycle state is a decision-history layer only; it does not change scanner
+# scoring, thresholds, provider roles or the frozen ENGINE_VERSION.
+LIFECYCLE_SCHEMA = 1
+LIFECYCLE_HISTORY_LIMIT = 40
+LIFECYCLE_DURABLE_SUBDIR = "candidate_lifecycle"
+LIFECYCLE_ACTIVE_STATES = {"WATCH", "DEVELOPING", "READY", "TRIGGER", "ACTIVE"}
+LIFECYCLE_DISPLAY_STATES = LIFECYCLE_ACTIVE_STATES | {"INVALIDATED"}
+
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
@@ -231,6 +240,10 @@ if "provider_transport_events" not in st.session_state:
     st.session_state.provider_transport_events = []
 if "provider_circuit_breakers" not in st.session_state:
     st.session_state.provider_circuit_breakers = {}
+if "candidate_lifecycle_cache" not in st.session_state:
+    st.session_state.candidate_lifecycle_cache = {}
+if "candidate_lifecycle_message" not in st.session_state:
+    st.session_state.candidate_lifecycle_message = ""
 
 # ---------------------------
 # Helpers
@@ -1183,6 +1196,17 @@ def _state_db_connect():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS candidate_lifecycle (
+            universe_name TEXT PRIMARY KEY,
+            updated_at TEXT NOT NULL,
+            signal_session TEXT,
+            schema_version INTEGER NOT NULL,
+            data_json TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     return conn
 
@@ -1357,6 +1381,503 @@ def recent_scan_runs(universe_name, limit=5):
         )
     except Exception:
         return pd.DataFrame()
+
+
+def _lifecycle_slug(universe_name):
+    slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in str(universe_name)).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    digest = hashlib.sha1(str(universe_name).encode("utf-8")).hexdigest()[:8]
+    return slug, digest
+
+
+def _lifecycle_durable_path(universe_name, cfg=None):
+    cfg = cfg or durable_store_config()
+    slug, digest = _lifecycle_slug(universe_name)
+    return f"{cfg['path_prefix']}/{LIFECYCLE_DURABLE_SUBDIR}/{slug}-{digest}.json"
+
+
+def _empty_lifecycle_store(universe_name):
+    return {
+        "schema": LIFECYCLE_SCHEMA,
+        "universe_name": str(universe_name),
+        "updated_at": "",
+        "last_processed_session": None,
+        "records": {},
+    }
+
+
+def _normalize_lifecycle_store(store, universe_name):
+    if not isinstance(store, dict):
+        return _empty_lifecycle_store(universe_name)
+    if int(store.get("schema", -1)) != LIFECYCLE_SCHEMA:
+        return _empty_lifecycle_store(universe_name)
+    if str(store.get("universe_name", "")) != str(universe_name):
+        return _empty_lifecycle_store(universe_name)
+    records = store.get("records")
+    if not isinstance(records, dict):
+        records = {}
+    return {
+        "schema": LIFECYCLE_SCHEMA,
+        "universe_name": str(universe_name),
+        "updated_at": str(store.get("updated_at", "") or ""),
+        "last_processed_session": store.get("last_processed_session"),
+        "records": records,
+    }
+
+
+def _lifecycle_session_value(value):
+    if value is None or value == "":
+        return pd.NaT
+    try:
+        return pd.Timestamp(value).tz_localize(None).normalize()
+    except Exception:
+        return pd.NaT
+
+
+def save_local_candidate_lifecycle(universe_name, store):
+    try:
+        normalized = _normalize_lifecycle_store(store, universe_name)
+        with _state_db_connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO candidate_lifecycle (
+                    universe_name, updated_at, signal_session, schema_version, data_json
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(universe_name) DO UPDATE SET
+                    updated_at=excluded.updated_at,
+                    signal_session=excluded.signal_session,
+                    schema_version=excluded.schema_version,
+                    data_json=excluded.data_json
+                """,
+                (
+                    universe_name,
+                    str(normalized.get("updated_at", "") or datetime.now().isoformat(timespec="seconds")),
+                    str(normalized.get("last_processed_session") or ""),
+                    LIFECYCLE_SCHEMA,
+                    json.dumps(normalized, default=_json_default, separators=(",", ":")),
+                ),
+            )
+            conn.commit()
+        return True, "Saved candidate lifecycle to local SQLite."
+    except Exception as exc:
+        return False, f"Local lifecycle save failed: {type(exc).__name__}: {exc}"
+
+
+def load_local_candidate_lifecycle(universe_name):
+    try:
+        with _state_db_connect() as conn:
+            row = conn.execute(
+                """
+                SELECT schema_version, data_json
+                FROM candidate_lifecycle
+                WHERE universe_name = ?
+                """,
+                (universe_name,),
+            ).fetchone()
+        if not row:
+            return None
+        schema_version, data_json = row
+        if int(schema_version) != LIFECYCLE_SCHEMA or not data_json:
+            return None
+        return _normalize_lifecycle_store(json.loads(data_json), universe_name)
+    except Exception:
+        return None
+
+
+def _github_read_lifecycle_file(cfg, universe_name):
+    branch_ok, branch_message = _github_ensure_state_branch(cfg)
+    if not branch_ok:
+        return None, None, branch_message
+    base = _github_api_base(cfg)
+    path = _lifecycle_durable_path(universe_name, cfg)
+    encoded_path = requests.utils.quote(path, safe="/")
+    resp = http_get(
+        "GitHub", f"{base}/contents/{encoded_path}",
+        headers=_github_headers(cfg["token"]), params={"ref": cfg["branch"]},
+        timeout=DURABLE_REQUEST_TIMEOUT, expected_statuses={200, 404},
+        route="candidate lifecycle read",
+    )
+    if resp.status_code == 404:
+        return None, None, "No durable lifecycle record exists for this universe yet."
+    if resp.status_code != 200:
+        return None, None, f"GitHub lifecycle read failed ({resp.status_code})."
+    payload = resp.json()
+    content = str(payload.get("content", "")).replace("\n", "")
+    if not content:
+        return None, payload.get("sha"), "GitHub lifecycle content was empty."
+    try:
+        decoded = base64.b64decode(content).decode("utf-8")
+        return _normalize_lifecycle_store(json.loads(decoded), universe_name), payload.get("sha"), ""
+    except Exception as exc:
+        return None, payload.get("sha"), f"GitHub lifecycle decode failed: {type(exc).__name__}."
+
+
+def load_durable_candidate_lifecycle(universe_name):
+    cfg = durable_store_config()
+    if not cfg["configured"]:
+        return None, "Durable recovery is not configured."
+    allowed, reason = _durable_universe_allowed(universe_name)
+    if not allowed:
+        return None, reason
+    try:
+        store, _, message = _github_read_lifecycle_file(cfg, universe_name)
+        if store is None:
+            return None, message
+        return store, "Loaded durable candidate lifecycle from GitHub."
+    except Exception as exc:
+        return None, f"Durable lifecycle load failed: {type(exc).__name__}: {exc}"
+
+
+def save_durable_candidate_lifecycle(universe_name, store):
+    cfg = durable_store_config()
+    if not cfg["configured"]:
+        return False, "Durable lifecycle not configured; local lifecycle only."
+    allowed, reason = _durable_universe_allowed(universe_name)
+    if not allowed:
+        return False, reason
+
+    normalized = _normalize_lifecycle_store(store, universe_name)
+    try:
+        branch_ok, branch_message = _github_ensure_state_branch(cfg)
+        if not branch_ok:
+            return False, branch_message
+
+        existing, existing_sha, _ = _github_read_lifecycle_file(cfg, universe_name)
+        if existing is not None:
+            existing_text = json.dumps(existing, default=_json_default, sort_keys=True, separators=(",", ":"))
+            new_text_sorted = json.dumps(normalized, default=_json_default, sort_keys=True, separators=(",", ":"))
+            if existing_text == new_text_sorted:
+                return True, "Durable candidate lifecycle already matches; no commit was needed."
+
+        text_json = json.dumps(normalized, default=_json_default, separators=(",", ":"))
+        body = {
+            "message": f"Update candidate lifecycle: {universe_name}",
+            "content": base64.b64encode(text_json.encode("utf-8")).decode("ascii"),
+            "branch": cfg["branch"],
+        }
+        if existing_sha:
+            body["sha"] = existing_sha
+
+        base = _github_api_base(cfg)
+        path = _lifecycle_durable_path(universe_name, cfg)
+        encoded_path = requests.utils.quote(path, safe="/")
+        resp = http_request(
+            "GitHub", "PUT", f"{base}/contents/{encoded_path}",
+            headers=_github_headers(cfg["token"]), json=body,
+            timeout=DURABLE_REQUEST_TIMEOUT, max_retries=0,
+            expected_statuses={200, 201, 409}, route="candidate lifecycle write",
+        )
+        if resp.status_code in {200, 201}:
+            return True, "Saved durable candidate lifecycle to GitHub."
+        if resp.status_code == 409:
+            latest, latest_sha, _ = _github_read_lifecycle_file(cfg, universe_name)
+            if latest is not None:
+                latest_text = json.dumps(latest, default=_json_default, sort_keys=True, separators=(",", ":"))
+                new_text_sorted = json.dumps(normalized, default=_json_default, sort_keys=True, separators=(",", ":"))
+                if latest_text == new_text_sorted:
+                    return True, "Durable candidate lifecycle was concurrently updated to the same state."
+            if latest_sha:
+                body["sha"] = latest_sha
+                retry = http_request(
+                    "GitHub", "PUT", f"{base}/contents/{encoded_path}",
+                    headers=_github_headers(cfg["token"]), json=body,
+                    timeout=DURABLE_REQUEST_TIMEOUT, max_retries=0,
+                    expected_statuses={200, 201}, route="candidate lifecycle conflict retry",
+                )
+                if retry.status_code in {200, 201}:
+                    return True, "Saved durable candidate lifecycle after retry."
+                return False, f"Durable lifecycle retry failed ({retry.status_code})."
+        return False, f"Durable lifecycle save failed ({resp.status_code})."
+    except Exception as exc:
+        return False, f"Durable lifecycle save failed: {type(exc).__name__}: {exc}"
+
+
+def load_best_candidate_lifecycle(universe_name):
+    cached = st.session_state.candidate_lifecycle_cache.get(universe_name)
+    if isinstance(cached, dict):
+        return _normalize_lifecycle_store(cached, universe_name), "session cache"
+
+    local = load_local_candidate_lifecycle(universe_name)
+    durable, durable_message = load_durable_candidate_lifecycle(universe_name)
+
+    candidates = []
+    if local is not None:
+        candidates.append(("local SQLite", local))
+    if durable is not None:
+        candidates.append(("GitHub durable store", durable))
+
+    if not candidates:
+        store = _empty_lifecycle_store(universe_name)
+        st.session_state.candidate_lifecycle_cache[universe_name] = store
+        return store, durable_message or "new lifecycle store"
+
+    def sort_key(item):
+        session = _lifecycle_session_value(item[1].get("last_processed_session"))
+        if pd.isna(session):
+            return pd.Timestamp.min
+        return session
+
+    source, store = max(candidates, key=sort_key)
+    store = _normalize_lifecycle_store(store, universe_name)
+    st.session_state.candidate_lifecycle_cache[universe_name] = store
+    return store, source
+
+
+def persist_candidate_lifecycle(universe_name, store):
+    normalized = _normalize_lifecycle_store(store, universe_name)
+    st.session_state.candidate_lifecycle_cache[universe_name] = normalized
+
+    local_ok, local_message = save_local_candidate_lifecycle(universe_name, normalized)
+    durable_ok, durable_message = save_durable_candidate_lifecycle(universe_name, normalized)
+
+    if durable_ok:
+        message = durable_message
+    elif local_ok:
+        message = f"{local_message} Durable copy unavailable: {durable_message}"
+    else:
+        message = f"{local_message} {durable_message}"
+    st.session_state.candidate_lifecycle_message = message
+    return local_ok or durable_ok, message
+
+
+def _scanner_lifecycle_direction(row):
+    setup = str(row.get("Setup", "") or "")
+    if "Long" in setup:
+        return "LONG"
+    if "Short" in setup:
+        return "SHORT"
+    return ""
+
+
+def _scanner_lifecycle_target(row, prior_record=None):
+    """Return (target_state, direction, note, update_allowed).
+
+    DATA HOLD never invalidates a prior setup. Missing/unreliable price data must
+    preserve the previous lifecycle state until reliable completed-session data returns.
+    """
+    prior_record = prior_record or {}
+    prior_state = str(prior_record.get("state", "") or "")
+    prior_direction = str(prior_record.get("direction", "") or "")
+
+    if bool(row.get("Price Data Block", False)):
+        preserved = prior_state if prior_state in LIFECYCLE_DISPLAY_STATES else "UNTRACKED"
+        return preserved, prior_direction, "DATA HOLD — lifecycle not advanced on low-confidence price data.", False
+
+    direction = _scanner_lifecycle_direction(row)
+    setup = str(row.get("Setup", "") or "")
+    trackable = setup in {
+        "A+ Long", "A Long", "B+ Long", "Long Watch",
+        "A+ Short", "A Short", "B+ Short", "Short Watch",
+    }
+
+    if prior_state in LIFECYCLE_ACTIVE_STATES and prior_direction and direction and direction != prior_direction:
+        return "INVALIDATED", direction, f"Direction changed from {prior_direction} to {direction}.", True
+
+    if not trackable:
+        if prior_state in LIFECYCLE_ACTIVE_STATES:
+            return "INVALIDATED", prior_direction or direction, "Directional candidate structure/quality no longer qualifies.", True
+        return "UNTRACKED", direction, "Not currently in the tracked candidate lifecycle.", False
+
+    candidate_gate = bool(row.get("Candidate Quality Gate Pass", False))
+    price_ready = bool(row.get("Price Entry Gate Pass", False))
+
+    if candidate_gate and price_ready:
+        return "READY", direction, "Price-ready candidate — still VERIFY EVENT + STOP before full actionability.", True
+    if candidate_gate:
+        return "DEVELOPING", direction, str(row.get("Main Reason", "") or "High-quality candidate; entry still developing."), True
+    return "WATCH", direction, "Directional watch candidate below the B+ actionability gate.", True
+
+
+def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provider_health):
+    """Attach persistent lifecycle state without changing scanner scores or actionability.
+
+    DISCOVERED is recorded as an event when a ticker first enters the lifecycle.
+    Current state is immediately classified as WATCH / DEVELOPING / READY so a newly
+    found price-ready candidate is not artificially delayed for one session.
+
+    TRIGGER and ACTIVE are reserved for later Phase 2F layers with full ticker-level
+    trigger verification and portfolio/position evidence.
+    """
+    if ranked_df is None or ranked_df.empty:
+        return ranked_df, {"status": "EMPTY", "message": "No ranked rows for lifecycle tracking.", "transitions": 0}
+
+    x = ranked_df.copy()
+    store, source = load_best_candidate_lifecycle(universe_name)
+    records = dict(store.get("records") or {})
+
+    current_session = _lifecycle_session_value(signal_session)
+    stored_session = _lifecycle_session_value(store.get("last_processed_session"))
+    health_status = str((provider_health or {}).get("status", "UNKNOWN") or "UNKNOWN").upper()
+
+    can_advance = (
+        pd.notna(current_session)
+        and health_status == "HEALTHY"
+        and (pd.isna(stored_session) or current_session > stored_session)
+    )
+
+    transition_count = 0
+    discovered_count = 0
+
+    if can_advance:
+        session_text = current_session.strftime("%Y-%m-%d")
+        for _, row in x.iterrows():
+            ticker = str(row.get("Ticker", "") or "").strip().upper()
+            if not ticker:
+                continue
+
+            prior = dict(records.get(ticker) or {})
+            prior_state = str(prior.get("state", "") or "")
+            target_state, direction, note, update_allowed = _scanner_lifecycle_target(row, prior)
+
+            if not update_allowed and target_state == "UNTRACKED":
+                continue
+
+            if not update_allowed:
+                # Reliable state is unknown; preserve prior record unchanged.
+                continue
+
+            history = list(prior.get("history") or [])
+            is_new = not prior
+            rediscovered = prior_state == "INVALIDATED" and target_state in LIFECYCLE_ACTIVE_STATES
+            state_changed = prior_state != target_state
+
+            first_seen = str(prior.get("first_seen_session", "") or session_text)
+            cycle_started = str(prior.get("cycle_started_session", "") or session_text)
+            if rediscovered:
+                cycle_started = session_text
+
+            if is_new:
+                event_label = "DISCOVERED"
+                discovered_count += 1
+            elif rediscovered:
+                event_label = f"REDISCOVERED → {target_state}"
+            elif state_changed:
+                event_label = f"{prior_state} → {target_state}"
+            else:
+                event_label = "—"
+
+            state_since = str(prior.get("state_since_session", "") or session_text)
+            if state_changed or is_new:
+                state_since = session_text
+
+            if is_new or state_changed:
+                history.append(
+                    {
+                        "session": session_text,
+                        "event": "DISCOVERED" if is_new else ("REDISCOVERED" if rediscovered else "TRANSITION"),
+                        "from": "NEW" if is_new else prior_state,
+                        "to": target_state,
+                        "direction": direction,
+                        "candidate_quality": str(row.get("Candidate Quality", "") or ""),
+                        "entry_status": str(row.get("Entry Status", "") or ""),
+                        "action": str(row.get("Action", "") or ""),
+                        "reason": str(row.get("Main Reason", "") or note),
+                    }
+                )
+                history = history[-LIFECYCLE_HISTORY_LIMIT:]
+                transition_count += 1
+
+            records[ticker] = {
+                "ticker": ticker,
+                "direction": direction or str(prior.get("direction", "") or ""),
+                "state": target_state,
+                "previous_state": prior_state or "NEW",
+                "first_seen_session": first_seen,
+                "cycle_started_session": cycle_started,
+                "state_since_session": state_since,
+                "last_seen_session": session_text,
+                "last_event": event_label,
+                "candidate_quality": str(row.get("Candidate Quality", "") or ""),
+                "entry_status": str(row.get("Entry Status", "") or ""),
+                "action": str(row.get("Action", "") or ""),
+                "main_reason": str(row.get("Main Reason", "") or note),
+                "quality_score": float(row.get("Quality Score")) if pd.notna(row.get("Quality Score")) else None,
+                "rank": int(row.get("Rank")) if pd.notna(row.get("Rank")) else None,
+                "setup": str(row.get("Setup", "") or ""),
+                "setup_type": str(row.get("Setup Type", "") or ""),
+                "history": history,
+            }
+
+        store = {
+            "schema": LIFECYCLE_SCHEMA,
+            "universe_name": str(universe_name),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "last_processed_session": current_session.isoformat(),
+            "records": records,
+        }
+        _, persist_message = persist_candidate_lifecycle(universe_name, store)
+        source = "updated"
+    else:
+        persist_message = ""
+        st.session_state.candidate_lifecycle_cache[universe_name] = store
+
+    lifecycle_states = []
+    lifecycle_events = []
+    lifecycle_previous = []
+    lifecycle_since = []
+    lifecycle_first_seen = []
+    lifecycle_notes = []
+
+    for _, row in x.iterrows():
+        ticker = str(row.get("Ticker", "") or "").strip().upper()
+        record = dict(records.get(ticker) or {})
+        target_state, _, target_note, update_allowed = _scanner_lifecycle_target(row, record)
+
+        if record:
+            state = str(record.get("state", "") or target_state or "UNTRACKED")
+            event = str(record.get("last_event", "—") or "—")
+            previous = str(record.get("previous_state", "") or "—")
+            since = str(record.get("state_since_session", "") or "—")
+            first_seen = str(record.get("first_seen_session", "") or "—")
+            note = target_note if not update_allowed and "DATA HOLD" in target_note else str(record.get("main_reason", "") or target_note)
+        else:
+            state = target_state if target_state != "UNTRACKED" else "UNTRACKED"
+            event = "NOT RECORDED" if state != "UNTRACKED" else "—"
+            previous = "—"
+            since = "—"
+            first_seen = "—"
+            note = target_note
+
+        lifecycle_states.append(state)
+        lifecycle_events.append(event)
+        lifecycle_previous.append(previous)
+        lifecycle_since.append(since)
+        lifecycle_first_seen.append(first_seen)
+        lifecycle_notes.append(note)
+
+    x["Lifecycle State"] = lifecycle_states
+    x["Lifecycle Event"] = lifecycle_events
+    x["Lifecycle Previous"] = lifecycle_previous
+    x["Lifecycle Since"] = lifecycle_since
+    x["Lifecycle First Seen"] = lifecycle_first_seen
+    x["Lifecycle Note"] = lifecycle_notes
+
+    if can_advance:
+        message = (
+            f"Lifecycle advanced for completed session {current_session:%d-%b-%Y}: "
+            f"{transition_count} discovery/transition event(s), including {discovered_count} newly discovered."
+        )
+        if persist_message:
+            message += " " + persist_message
+        status = "UPDATED"
+    elif health_status != "HEALTHY":
+        message = (
+            f"Lifecycle loaded from {source}; state was not advanced because Scan Data Health is {health_status}. "
+            "Recovered/degraded data never invalidates or advances lifecycle state."
+        )
+        status = "HOLD"
+    elif pd.notna(current_session) and pd.notna(stored_session) and current_session <= stored_session:
+        message = f"Lifecycle already processed through {stored_session:%d-%b-%Y}; no duplicate transition was recorded."
+        status = "CURRENT"
+    else:
+        message = f"Lifecycle loaded from {source}; waiting for a reliable completed-session scan."
+        status = "HOLD"
+
+    st.session_state.candidate_lifecycle_message = message
+    return x, {"status": status, "message": message, "transitions": transition_count}
+
+
 
 
 def apply_snapshot_to_session(universe_name, snapshot, recovered=False, preserve_provider_health=False):
@@ -4866,6 +5387,39 @@ def apply_scanner_filters(ranked_df, min_composite, min_volume, rsi_low, rsi_hig
     return x
 
 
+def enforce_diagnostic_price_confidence(diag, df):
+    """Make Price Data Confidence a self-contained hard gate for all callers.
+
+    This closes the pre-2F architecture seam where the Streamlit UI applied the
+    final LOW-confidence block after compute_search_diagnostic() returned.
+    """
+    result = dict(diag or {})
+    confidence = data_confidence(df, recent_lookback=14)
+    result["Price Data Confidence"] = confidence.get("level", "LOW")
+    result["Price Data Confidence Score"] = confidence.get("score", np.nan)
+    result["Price Data Confidence Message"] = confidence.get("message", "")
+    result["Price Data Block"] = bool(confidence.get("block", True))
+
+    if result["Price Data Block"]:
+        result["Trade State"] = "DATA ISSUE"
+        result["Trade Block Reason"] = confidence.get("message", "LOW price-data confidence")
+        result["Bias"] = "WAIT"
+        result["Verdict"] = "C — DATA ISSUE / DO NOT ACT"
+        result["Entry Quality"] = "N/A — DATA ISSUE"
+        result["Entry Geometry Pass"] = False
+        result["Entry Geometry Quality"] = "N/A — DATA ISSUE"
+
+        for key in [
+            "Entry Low", "Entry High", "Stop", "Target 1", "Target 2", "RR",
+            "Stop %", "RR Midpoint", "T1 R", "T2 R", "RR Zone Min", "RR Zone Max",
+        ]:
+            result[key] = np.nan
+
+    return result
+
+
+
+
 def compute_search_diagnostic(symbol, company, df, metadata):
     """Decision-oriented swing diagnostic from validated daily price history."""
     valid, reason = price_data_status(df, min_rows=126)
@@ -5256,7 +5810,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
     # Transparent R multiples are calculated from published actionable levels only.
     r_metrics = trade_plan_r_metrics(bias, entry_low, entry_high, stop, target1, target2)
 
-    return {
+    result = {
         "Data Valid": True,
         "Data Error": "",
         "Signal Session": pd.Timestamp(latest["Date"]).normalize() if "Date" in latest.index and pd.notna(latest["Date"]) else pd.NaT,
@@ -5316,6 +5870,7 @@ def compute_search_diagnostic(symbol, company, df, metadata):
         "Trailing PE": metadata.get("trailing_pe", np.nan),
         "Forward PE": metadata.get("forward_pe", np.nan),
     }
+    return enforce_diagnostic_price_confidence(result, df)
 
 
 def fmt_price(value):
@@ -5568,7 +6123,12 @@ with ticker_tab:
                 "Empty failures are not retained in the individual-ticker cache, so a retry performs a fresh recovery attempt."
             )
         else:
-            confidence = data_confidence(df, recent_lookback=14)
+            confidence = {
+                "level": diag.get("Price Data Confidence", "LOW"),
+                "score": diag.get("Price Data Confidence Score", np.nan),
+                "message": diag.get("Price Data Confidence Message", ""),
+                "block": bool(diag.get("Price Data Block", True)),
+            }
             download_route = df.attrs.get("download_route", "validated market-data route")
             data_provider = df.attrs.get("provider", "Yahoo")
 
@@ -5587,13 +6147,6 @@ with ticker_tab:
                     f"🔴 **Price Data Confidence: LOW — DO NOT ACT.** {confidence['message']} "
                     f"Provider: **{data_provider}** • Retrieval: **{download_route}**."
                 )
-                diag["Trade State"] = "DATA ISSUE"
-                diag["Trade Block Reason"] = confidence["message"]
-                diag["Bias"] = "WAIT"
-                diag["Verdict"] = "C — DATA ISSUE / DO NOT ACT"
-                diag["Entry Low"] = diag["Entry High"] = diag["Stop"] = np.nan
-                diag["Target 1"] = diag["Target 2"] = diag["RR"] = np.nan
-                diag["Stop %"] = np.nan
 
             st.markdown(f"### {selected_ticker} — {selected_company}")
 
@@ -6814,8 +7367,18 @@ with scanner_tab:
                 st.session_state.scan_ranked_regime_label = regime["label"]
                 st.session_state.scan_ranked_engine_version = ENGINE_VERSION
 
-        ranked = apply_scanner_filters(
+        lifecycle_ranked, lifecycle_meta = attach_candidate_lifecycle(
             st.session_state.scan_ranked_df,
+            st.session_state.scan_universe_name,
+            st.session_state.scan_signal_session,
+            st.session_state.provider_health,
+        )
+        # Cache lifecycle columns for the rest of this rerun. This remains a
+        # presentation/history layer and does not alter Adjusted Score or Rank.
+        st.session_state.scan_ranked_df = lifecycle_ranked
+
+        ranked = apply_scanner_filters(
+            lifecycle_ranked,
             min_composite, min_volume, rsi_low, rsi_high,
         )
 
@@ -6844,6 +7407,22 @@ with scanner_tab:
             "A+ = candidate Quality Score ≥90 after tradeability/data gates. "
             "A+ can correctly remain WAIT when current price location is poor; scanner price-readiness still requires event/stop verification."
         )
+
+        lifecycle_tracked_mask = ranked["Lifecycle State"].isin(LIFECYCLE_DISPLAY_STATES)
+        lifecycle_ready_count = int(ranked["Lifecycle State"].eq("READY").sum())
+        lifecycle_developing_count = int(ranked["Lifecycle State"].eq("DEVELOPING").sum())
+        lifecycle_watch_count = int(ranked["Lifecycle State"].eq("WATCH").sum())
+        lifecycle_invalidated_count = int(ranked["Lifecycle State"].eq("INVALIDATED").sum())
+        st.caption(
+            f"**Candidate lifecycle:** READY {lifecycle_ready_count} • DEVELOPING {lifecycle_developing_count} • "
+            f"WATCH {lifecycle_watch_count} • INVALIDATED {lifecycle_invalidated_count}. "
+            "DISCOVERED is recorded as an event; READY still means **VERIFY EVENT + STOP**, not fully ACTIONABLE. "
+            "TRIGGER and ACTIVE are reserved for later Phase 2F verification/portfolio layers."
+        )
+        if lifecycle_meta.get("status") == "HOLD":
+            st.warning(lifecycle_meta.get("message", "Lifecycle is on hold."))
+        else:
+            st.caption(lifecycle_meta.get("message", ""))
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Stocks analyzed", f"{len(ranked):,}")
         k2.metric("Quality candidates", f"{int(quality_mask.sum()):,}")
@@ -6878,6 +7457,7 @@ with scanner_tab:
 
                 aplus_cols = [
                     "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
+                    "Lifecycle State", "Lifecycle Event", "Lifecycle Since",
                     "Company", "Sector", "Setup", "Setup Type", "Quality Score",
                     "Price Data Confidence", "RS Rating", "RS Edge", "Momentum Score", "RSI14",
                     "Volume Ratio", "ATR %", "EMA20 Distance %", "20D High Distance %",
@@ -7013,13 +7593,15 @@ with scanner_tab:
 
         view_mode = st.segmented_control(
             "View",
-            ["Quality Candidates", "Price-Ready Candidates", "Passing Filters", "Regime-Aligned", "All"],
+            ["Quality Candidates", "Price-Ready Candidates", "Lifecycle", "Passing Filters", "Regime-Aligned", "All"],
             default="Quality Candidates",
         )
         if view_mode == "Quality Candidates":
             shown = ranked[quality_mask].copy()
         elif view_mode == "Price-Ready Candidates":
             shown = ranked[price_ready_mask].copy()
+        elif view_mode == "Lifecycle":
+            shown = ranked[lifecycle_tracked_mask].copy()
         elif view_mode == "Passing Filters":
             shown = ranked[ranked["Passes Filters"]].copy()
         elif view_mode == "Regime-Aligned":
@@ -7038,6 +7620,7 @@ with scanner_tab:
         if view_mode == "Passing Filters":
             display_cols = [
                 "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
+                "Lifecycle State", "Lifecycle Event", "Lifecycle Since",
                 "Momentum Score", "Volume Ratio", "RSI14",
                 "Rank", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
                 "Tradeable", "Regime Aligned", "Price Data Confidence", "Price Entry Gate Pass",
@@ -7048,6 +7631,7 @@ with scanner_tab:
         else:
             display_cols = [
                 "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
+                "Lifecycle State", "Lifecycle Event", "Lifecycle Since",
                 "Rank", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
                 "Price Data Confidence", "Price Entry Gate Pass", "Tradeable", "Regime Aligned",
                 "RS Rating", "RS Edge", "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
@@ -7071,6 +7655,10 @@ with scanner_tab:
                 "Price-Ready Candidates": (
                     "No stocks are currently price-ready. "
                     "Use Quality Candidates to inspect strong names that may still need entry repair."
+                ),
+                "Lifecycle": (
+                    "No candidates are currently in a tracked lifecycle state. "
+                    "A reliable completed-session scan must first produce WATCH / DEVELOPING / READY candidates."
                 ),
                 "Passing Filters": (
                     "No stocks currently pass the hard Tradeable gate plus all 3 active user filters. "
