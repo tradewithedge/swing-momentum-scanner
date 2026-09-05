@@ -1,4 +1,4 @@
-# Quality Engine v7.9.0 — Phase 2E.3 Final Scanner Decision UX
+# Quality Engine v7.9.1 — Phase 2E.3 Empty-State UX Hotfix
 
 import base64
 import hashlib
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.9.0-P2E3-FINAL-SCANNER-UX"
+APP_BUILD_VERSION = "v7.9.1-P2E3-UX-HOTFIX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -7015,27 +7015,50 @@ with scanner_tab:
             "and stop/R:R geometry in Ticker Search before acting."
         )
 
-        st.dataframe(
-            shown[existing_cols],
-            hide_index=True,
-            use_container_width=True,
-            height=520,
-            column_config={
-                "Quality Score": st.column_config.NumberColumn(format="%.0f"),
-                "RS Rating": st.column_config.NumberColumn(format="%d"),
-                "RS Edge": st.column_config.NumberColumn(format="%+.1f"),
-                "Momentum Score": st.column_config.NumberColumn(format="%.1f"),
-                "ATR %": st.column_config.NumberColumn(format="%.1f%%"),
-                "EMA20 Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
-                "20D High Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
-                "Avg Dollar Volume 20": st.column_config.NumberColumn(format="$%.0f"),
-                "RSI14": st.column_config.NumberColumn(format="%.1f"),
-                "Volume Ratio": st.column_config.NumberColumn(format="%.2fx"),
-                "1D %": st.column_config.NumberColumn(format="%.2%"),
-                "1W %": st.column_config.NumberColumn(format="%.2%"),
-                "1M %": st.column_config.NumberColumn(format="%.2%"),
-            },
-        )
+        if shown.empty:
+            empty_view_messages = {
+                "Quality Candidates": (
+                    "No stocks currently meet the Candidate Quality gate. "
+                    "This is a valid no-match state; do not lower quality standards to force a candidate."
+                ),
+                "Price-Ready Candidates": (
+                    "No stocks are currently price-ready. "
+                    "Use Quality Candidates to inspect strong names that may still need entry repair."
+                ),
+                "Passing Filters": (
+                    "No stocks currently pass all active scanner filters. "
+                    "This is a valid NO TRADE / no-match state, not a scanner error. "
+                    "Review the active filters or inspect Quality Candidates / Price-Ready Candidates for near-matches."
+                ),
+                "Regime-Aligned": (
+                    "No stocks in the current view are regime-aligned. "
+                    "This is a valid no-match state; wait for better alignment rather than forcing a trade."
+                ),
+                "All": "No analyzed stocks are available for the current scan.",
+            }
+            st.info(empty_view_messages.get(view_mode, "No stocks match the current view."))
+        else:
+            st.dataframe(
+                shown[existing_cols],
+                hide_index=True,
+                use_container_width=True,
+                height=520,
+                column_config={
+                    "Quality Score": st.column_config.NumberColumn(format="%.0f"),
+                    "RS Rating": st.column_config.NumberColumn(format="%d"),
+                    "RS Edge": st.column_config.NumberColumn(format="%+.1f"),
+                    "Momentum Score": st.column_config.NumberColumn(format="%.1f"),
+                    "ATR %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "EMA20 Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
+                    "20D High Distance %": st.column_config.NumberColumn(format="%+.1f%%"),
+                    "Avg Dollar Volume 20": st.column_config.NumberColumn(format="$%.0f"),
+                    "RSI14": st.column_config.NumberColumn(format="%.1f"),
+                    "Volume Ratio": st.column_config.NumberColumn(format="%.2fx"),
+                    "1D %": st.column_config.NumberColumn(format="%.2%"),
+                    "1W %": st.column_config.NumberColumn(format="%.2%"),
+                    "1M %": st.column_config.NumberColumn(format="%.2%"),
+                },
+            )
 
         csv = ranked.to_csv(index=False).encode("utf-8")
         st.download_button(
