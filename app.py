@@ -1,4 +1,4 @@
-# Quality Engine v7.10.0 — Phase 2F.1 Candidate Lifecycle Foundation
+# Quality Engine v7.10.1 — Phase 2F.1 Insufficient-History UX Hotfix
 
 import base64
 import hashlib
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.10.0-P2F1-CANDIDATE-LIFECYCLE"
+APP_BUILD_VERSION = "v7.10.1-P2F1-INSUFFICIENT-HISTORY-UX-HOTFIX"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -1917,22 +1917,54 @@ def apply_snapshot_to_session(universe_name, snapshot, recovered=False, preserve
 
 
 def scanner_frame_diagnostic(df):
-    """Compact final-state diagnostic for one scanner frame."""
+    """Compact final-state diagnostic for one scanner frame.
+
+    A current, structurally valid price series with fewer than 126 completed
+    trading sessions is an eligibility limitation, not a provider failure.
+    """
     valid, reason = price_data_status(df, min_rows=126)
     x = completed_session_frame(df)
     latest = pd.NaT
     if not x.empty and "Date" in x.columns:
         latest = pd.to_datetime(x["Date"], errors="coerce").max()
+
     if not valid:
+        insufficient_history = 0 < len(x) < 126
+        latest_ohlc_valid = False
+        if insufficient_history:
+            latest_row = x.iloc[-1]
+            latest_ohlc_valid = all(
+                pd.notna(latest_row.get(col))
+                and np.isfinite(latest_row.get(col))
+                and float(latest_row.get(col)) > 0
+                for col in ["Open", "High", "Low", "Close"]
+            )
+        fresh = False
+        if insufficient_history and latest_ohlc_valid:
+            fresh, _, _, _ = market_data_freshness(x)
+
+        if insufficient_history and latest_ohlc_valid and fresh:
+            return {
+                "usable": False,
+                "status": "INELIGIBLE",
+                "confidence": "N/A",
+                "latest_session": "" if pd.isna(latest) else pd.Timestamp(latest).strftime("%Y-%m-%d"),
+                "note": "INELIGIBLE — insufficient trading history (<126 days).",
+            }
+
         return {
             "usable": False,
+            "status": "UNRESOLVED",
             "confidence": "LOW",
             "latest_session": "" if pd.isna(latest) else pd.Timestamp(latest).strftime("%Y-%m-%d"),
             "note": reason,
         }
+
     conf = data_confidence(x, recent_lookback=14)
+    usable = not bool(conf.get("block", True))
     return {
-        "usable": not bool(conf.get("block", True)),
+        "usable": usable,
+        "status": "USABLE" if usable else "UNRESOLVED",
         "confidence": conf.get("level", "LOW"),
         "latest_session": "" if pd.isna(latest) else pd.Timestamp(latest).strftime("%Y-%m-%d"),
         "note": conf.get("message", ""),
@@ -4715,6 +4747,7 @@ def run_market_scan(universe_df, progress_bar, status_box):
         for symbol in batch:
             df = frames[symbol]
             meta = metadata.get(symbol, {})
+            final_diag = scanner_frame_diagnostic(df)
             rec = compute_record(
                 symbol,
                 str(meta.get("Company", symbol)),
@@ -4723,6 +4756,10 @@ def run_market_scan(universe_df, progress_bar, status_box):
             )
             if rec is not None:
                 records.append(rec)
+            elif final_diag.get("status") == "INELIGIBLE":
+                item = diag_touch(symbol, batch_no, final_diag.get("note", "INELIGIBLE — insufficient trading history (<126 days)."))
+                if "Eligibility gate" not in item["Recovery Path"]:
+                    item["Recovery Path"].append("Eligibility gate")
             else:
                 failures.append(symbol)
                 item = diag_touch(symbol, batch_no, "Scanner record could not be built from the final price frame.")
@@ -4730,9 +4767,8 @@ def run_market_scan(universe_df, progress_bar, status_box):
                     item["Recovery Path"].append("Record computation failed")
 
             if symbol in symbol_diagnostics:
-                final_diag = scanner_frame_diagnostic(df)
                 item = symbol_diagnostics[symbol]
-                item["Final State"] = "USABLE" if final_diag.get("usable") and rec is not None else "UNRESOLVED"
+                item["Final State"] = final_diag.get("status", "UNRESOLVED")
                 item["Confidence"] = final_diag.get("confidence", "")
                 item["Latest Session"] = final_diag.get("latest_session", "")
                 item["Final Note"] = final_diag.get("note", "")
