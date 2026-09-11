@@ -1,4 +1,4 @@
-# Quality Engine v7.10.1 — Phase 2F.1 Insufficient-History UX Hotfix
+# Quality Engine v7.11.0 — Phase 2F.2 Trigger State Foundation
 
 import base64
 import hashlib
@@ -53,7 +53,7 @@ DIRECTORY_CACHE_TTL = 24 * 60 * 60
 # Phase 2D.1 changes transport/observability only, so it deliberately remains at the
 # Phase 2C freeze value to preserve compatible durable snapshots.
 ENGINE_VERSION = "v7.4.5-P2C-FREEZE"
-APP_BUILD_VERSION = "v7.10.1-P2F1-INSUFFICIENT-HISTORY-UX-HOTFIX"
+APP_BUILD_VERSION = "v7.11.0-P2F2-TRIGGER-FOUNDATION"
 # Known scanner snapshots whose scoring/data schema is compatible with the current scanner.
 # Phase 2C changed ticker-level event/fundamental reliability, not scanner record/scoring semantics.
 COMPATIBLE_SCAN_SNAPSHOT_VERSIONS = {ENGINE_VERSION, "v7.3-P2B.2-WORKING"}
@@ -173,6 +173,7 @@ LIFECYCLE_HISTORY_LIMIT = 40
 LIFECYCLE_DURABLE_SUBDIR = "candidate_lifecycle"
 LIFECYCLE_ACTIVE_STATES = {"WATCH", "DEVELOPING", "READY", "TRIGGER", "ACTIVE"}
 LIFECYCLE_DISPLAY_STATES = LIFECYCLE_ACTIVE_STATES | {"INVALIDATED"}
+LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN = 1.50
 
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
@@ -1650,6 +1651,87 @@ def _scanner_lifecycle_direction(row):
     return ""
 
 
+def _scanner_trigger_reference_level(row, direction):
+    """Return the completed-session 20D breakout/breakdown reference for one READY row."""
+    field = "High20" if direction == "LONG" else "Low20" if direction == "SHORT" else ""
+    if not field:
+        return None
+    value = row.get(field, np.nan)
+    try:
+        value = float(value)
+    except Exception:
+        return None
+    return value if np.isfinite(value) and value > 0 else None
+
+
+def _scanner_trigger_evaluation(row, prior_record, direction):
+    """Evaluate READY -> TRIGGER using the prior READY session's frozen 20D level.
+
+    TRIGGER is intentionally price/volume confirmation only. It does not bypass the
+    ticker-level earnings/event and stop/R:R verification gate.
+    """
+    prior_record = prior_record or {}
+    reference = prior_record.get("trigger_reference_level")
+    reference_session = str(prior_record.get("trigger_reference_session", "") or "")
+    reference_direction = str(
+        prior_record.get("trigger_reference_direction", "")
+        or prior_record.get("direction", "")
+        or ""
+    )
+
+    try:
+        reference = float(reference)
+    except Exception:
+        reference = np.nan
+
+    if not np.isfinite(reference) or reference <= 0 or reference_direction != direction:
+        return False, (
+            "READY — trigger reference will be established from this completed session; "
+            f"future confirmation requires Volume Ratio ≥ {LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN:.2f}x."
+        )
+
+    close = row.get("Close", np.nan)
+    volume_ratio = row.get("Volume Ratio", np.nan)
+    try:
+        close = float(close)
+    except Exception:
+        close = np.nan
+    try:
+        volume_ratio = float(volume_ratio)
+    except Exception:
+        volume_ratio = np.nan
+
+    if not np.isfinite(close):
+        return False, "READY — current close is unavailable for trigger confirmation."
+
+    price_break = close > reference if direction == "LONG" else close < reference
+    volume_confirmed = np.isfinite(volume_ratio) and volume_ratio >= LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN
+    level_label = "above" if direction == "LONG" else "below"
+    ref_text = f"${reference:,.2f}"
+    session_text = f" from {reference_session}" if reference_session else ""
+
+    if price_break and volume_confirmed:
+        return True, (
+            f"TRIGGER confirmed — close ${close:,.2f} {level_label} prior READY 20D level {ref_text}{session_text} "
+            f"with Volume Ratio {volume_ratio:.2f}x ≥ {LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN:.2f}x. "
+            "Still VERIFY EVENT + STOP before action."
+        )
+
+    if price_break:
+        volume_text = "N/A" if not np.isfinite(volume_ratio) else f"{volume_ratio:.2f}x"
+        return False, (
+            f"READY — price crossed prior READY 20D level {ref_text}{session_text}, but Volume Ratio "
+            f"{volume_text} is below {LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN:.2f}x; trigger not confirmed."
+        )
+
+    condition = "close above" if direction == "LONG" else "close below"
+    volume_text = "N/A" if not np.isfinite(volume_ratio) else f"{volume_ratio:.2f}x"
+    return False, (
+        f"READY — awaiting {condition} prior READY 20D level {ref_text}{session_text} "
+        f"with Volume Ratio ≥ {LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN:.2f}x (current {volume_text})."
+    )
+
+
 def _scanner_lifecycle_target(row, prior_record=None):
     """Return (target_state, direction, note, update_allowed).
 
@@ -1682,8 +1764,32 @@ def _scanner_lifecycle_target(row, prior_record=None):
     candidate_gate = bool(row.get("Candidate Quality Gate Pass", False))
     price_ready = bool(row.get("Price Entry Gate Pass", False))
 
+    # Phase 2F.2: a TRIGGER can occur only from a prior READY state using the
+    # prior completed READY session's frozen 20D level plus strong volume confirmation.
+    if prior_state == "READY" and candidate_gate and price_ready:
+        triggered, trigger_note = _scanner_trigger_evaluation(row, prior_record, direction)
+        if triggered:
+            return "TRIGGER", direction, trigger_note, True
+        return "READY", direction, trigger_note, True
+
+    # Once confirmed, keep TRIGGER while the candidate remains price-ready. ACTIVE
+    # remains reserved for a later portfolio/position-verification layer.
+    if prior_state == "TRIGGER" and candidate_gate and price_ready:
+        return (
+            "TRIGGER",
+            direction,
+            "TRIGGER remains confirmed — still VERIFY EVENT + STOP; ACTIVE is reserved for later portfolio verification.",
+            True,
+        )
+
     if candidate_gate and price_ready:
-        return "READY", direction, "Price-ready candidate — still VERIFY EVENT + STOP before full actionability.", True
+        return (
+            "READY",
+            direction,
+            f"Price-ready candidate — trigger requires next completed-session close beyond the stored READY 20D level "
+            f"with Volume Ratio ≥ {LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN:.2f}x; still VERIFY EVENT + STOP before full actionability.",
+            True,
+        )
     if candidate_gate:
         return "DEVELOPING", direction, str(row.get("Main Reason", "") or "High-quality candidate; entry still developing."), True
     return "WATCH", direction, "Directional watch candidate below the B+ actionability gate.", True
@@ -1696,8 +1802,10 @@ def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provide
     Current state is immediately classified as WATCH / DEVELOPING / READY so a newly
     found price-ready candidate is not artificially delayed for one session.
 
-    TRIGGER and ACTIVE are reserved for later Phase 2F layers with full ticker-level
-    trigger verification and portfolio/position evidence.
+    Phase 2F.2 adds TRIGGER only after a prior READY session has frozen its 20D
+    breakout/breakdown level and a later completed session closes beyond that level
+    with Volume Ratio >= 1.50x. TRIGGER still requires VERIFY EVENT + STOP. ACTIVE
+    remains reserved for later portfolio/position evidence.
     """
     if ranked_df is None or ranked_df.empty:
         return ranked_df, {"status": "EMPTY", "message": "No ranked rows for lifecycle tracking.", "transitions": 0}
@@ -1761,20 +1869,54 @@ def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provide
             if state_changed or is_new:
                 state_since = session_text
 
+            # Trigger reference is frozen from each completed READY session. A later
+            # session may confirm TRIGGER against this stored level; the current bar
+            # is never allowed to define and trigger against the same level.
+            trigger_reference_level = prior.get("trigger_reference_level")
+            trigger_reference_session = str(prior.get("trigger_reference_session", "") or "")
+            trigger_reference_direction = str(prior.get("trigger_reference_direction", "") or "")
+            trigger_confirmed_session = str(prior.get("trigger_confirmed_session", "") or "")
+            trigger_confirmed_close = prior.get("trigger_confirmed_close")
+            trigger_confirmed_volume_ratio = prior.get("trigger_confirmed_volume_ratio")
+
+            if target_state == "READY":
+                fresh_reference = _scanner_trigger_reference_level(row, direction)
+                if fresh_reference is not None:
+                    trigger_reference_level = fresh_reference
+                    trigger_reference_session = session_text
+                    trigger_reference_direction = direction
+            elif target_state == "TRIGGER" and prior_state == "READY":
+                trigger_confirmed_session = session_text
+                trigger_confirmed_close = float(row.get("Close")) if pd.notna(row.get("Close")) else None
+                trigger_confirmed_volume_ratio = float(row.get("Volume Ratio")) if pd.notna(row.get("Volume Ratio")) else None
+            elif target_state in {"WATCH", "DEVELOPING", "INVALIDATED"}:
+                trigger_reference_level = None
+                trigger_reference_session = ""
+                trigger_reference_direction = ""
+
             if is_new or state_changed:
-                history.append(
-                    {
-                        "session": session_text,
-                        "event": "DISCOVERED" if is_new else ("REDISCOVERED" if rediscovered else "TRANSITION"),
-                        "from": "NEW" if is_new else prior_state,
-                        "to": target_state,
-                        "direction": direction,
-                        "candidate_quality": str(row.get("Candidate Quality", "") or ""),
-                        "entry_status": str(row.get("Entry Status", "") or ""),
-                        "action": str(row.get("Action", "") or ""),
-                        "reason": str(row.get("Main Reason", "") or note),
-                    }
-                )
+                history_event = {
+                    "session": session_text,
+                    "event": "DISCOVERED" if is_new else ("REDISCOVERED" if rediscovered else "TRANSITION"),
+                    "from": "NEW" if is_new else prior_state,
+                    "to": target_state,
+                    "direction": direction,
+                    "candidate_quality": str(row.get("Candidate Quality", "") or ""),
+                    "entry_status": str(row.get("Entry Status", "") or ""),
+                    "action": str(row.get("Action", "") or ""),
+                    "reason": str(note or row.get("Main Reason", "") or ""),
+                }
+                if target_state == "TRIGGER":
+                    history_event.update(
+                        {
+                            "trigger_reference_level": trigger_reference_level,
+                            "trigger_reference_session": trigger_reference_session,
+                            "trigger_close": trigger_confirmed_close,
+                            "trigger_volume_ratio": trigger_confirmed_volume_ratio,
+                            "trigger_volume_threshold": LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN,
+                        }
+                    )
+                history.append(history_event)
                 history = history[-LIFECYCLE_HISTORY_LIMIT:]
                 transition_count += 1
 
@@ -1791,11 +1933,17 @@ def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provide
                 "candidate_quality": str(row.get("Candidate Quality", "") or ""),
                 "entry_status": str(row.get("Entry Status", "") or ""),
                 "action": str(row.get("Action", "") or ""),
-                "main_reason": str(row.get("Main Reason", "") or note),
+                "main_reason": str(note or row.get("Main Reason", "") or ""),
                 "quality_score": float(row.get("Quality Score")) if pd.notna(row.get("Quality Score")) else None,
                 "rank": int(row.get("Rank")) if pd.notna(row.get("Rank")) else None,
                 "setup": str(row.get("Setup", "") or ""),
                 "setup_type": str(row.get("Setup Type", "") or ""),
+                "trigger_reference_level": trigger_reference_level,
+                "trigger_reference_session": trigger_reference_session,
+                "trigger_reference_direction": trigger_reference_direction,
+                "trigger_confirmed_session": trigger_confirmed_session,
+                "trigger_confirmed_close": trigger_confirmed_close,
+                "trigger_confirmed_volume_ratio": trigger_confirmed_volume_ratio,
                 "history": history,
             }
 
@@ -1817,6 +1965,10 @@ def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provide
     lifecycle_previous = []
     lifecycle_since = []
     lifecycle_first_seen = []
+    lifecycle_trigger_levels = []
+    lifecycle_trigger_reference_sessions = []
+    lifecycle_trigger_confirmed_sessions = []
+    lifecycle_trigger_confirmed_volumes = []
     lifecycle_notes = []
 
     for _, row in x.iterrows():
@@ -1830,6 +1982,10 @@ def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provide
             previous = str(record.get("previous_state", "") or "—")
             since = str(record.get("state_since_session", "") or "—")
             first_seen = str(record.get("first_seen_session", "") or "—")
+            trigger_level = record.get("trigger_reference_level")
+            trigger_reference_session = str(record.get("trigger_reference_session", "") or "—")
+            trigger_confirmed_session = str(record.get("trigger_confirmed_session", "") or "—")
+            trigger_confirmed_volume = record.get("trigger_confirmed_volume_ratio")
             note = target_note if not update_allowed and "DATA HOLD" in target_note else str(record.get("main_reason", "") or target_note)
         else:
             state = target_state if target_state != "UNTRACKED" else "UNTRACKED"
@@ -1837,6 +1993,10 @@ def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provide
             previous = "—"
             since = "—"
             first_seen = "—"
+            trigger_level = None
+            trigger_reference_session = "—"
+            trigger_confirmed_session = "—"
+            trigger_confirmed_volume = None
             note = target_note
 
         lifecycle_states.append(state)
@@ -1844,6 +2004,10 @@ def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provide
         lifecycle_previous.append(previous)
         lifecycle_since.append(since)
         lifecycle_first_seen.append(first_seen)
+        lifecycle_trigger_levels.append(trigger_level)
+        lifecycle_trigger_reference_sessions.append(trigger_reference_session)
+        lifecycle_trigger_confirmed_sessions.append(trigger_confirmed_session)
+        lifecycle_trigger_confirmed_volumes.append(trigger_confirmed_volume)
         lifecycle_notes.append(note)
 
     x["Lifecycle State"] = lifecycle_states
@@ -1851,6 +2015,10 @@ def attach_candidate_lifecycle(ranked_df, universe_name, signal_session, provide
     x["Lifecycle Previous"] = lifecycle_previous
     x["Lifecycle Since"] = lifecycle_since
     x["Lifecycle First Seen"] = lifecycle_first_seen
+    x["Lifecycle Trigger Level"] = pd.to_numeric(pd.Series(lifecycle_trigger_levels, index=x.index), errors="coerce")
+    x["Lifecycle Trigger Ref Session"] = lifecycle_trigger_reference_sessions
+    x["Lifecycle Trigger Confirmed"] = lifecycle_trigger_confirmed_sessions
+    x["Lifecycle Trigger Volume"] = pd.to_numeric(pd.Series(lifecycle_trigger_confirmed_volumes, index=x.index), errors="coerce")
     x["Lifecycle Note"] = lifecycle_notes
 
     if can_advance:
@@ -7445,15 +7613,17 @@ with scanner_tab:
         )
 
         lifecycle_tracked_mask = ranked["Lifecycle State"].isin(LIFECYCLE_DISPLAY_STATES)
+        lifecycle_trigger_count = int(ranked["Lifecycle State"].eq("TRIGGER").sum())
         lifecycle_ready_count = int(ranked["Lifecycle State"].eq("READY").sum())
         lifecycle_developing_count = int(ranked["Lifecycle State"].eq("DEVELOPING").sum())
         lifecycle_watch_count = int(ranked["Lifecycle State"].eq("WATCH").sum())
         lifecycle_invalidated_count = int(ranked["Lifecycle State"].eq("INVALIDATED").sum())
         st.caption(
-            f"**Candidate lifecycle:** READY {lifecycle_ready_count} • DEVELOPING {lifecycle_developing_count} • "
-            f"WATCH {lifecycle_watch_count} • INVALIDATED {lifecycle_invalidated_count}. "
-            "DISCOVERED is recorded as an event; READY still means **VERIFY EVENT + STOP**, not fully ACTIONABLE. "
-            "TRIGGER and ACTIVE are reserved for later Phase 2F verification/portfolio layers."
+            f"**Candidate lifecycle:** TRIGGER {lifecycle_trigger_count} • READY {lifecycle_ready_count} • "
+            f"DEVELOPING {lifecycle_developing_count} • WATCH {lifecycle_watch_count} • INVALIDATED {lifecycle_invalidated_count}. "
+            f"TRIGGER requires a completed-session close beyond the prior READY 20D level with Volume Ratio ≥ "
+            f"{LIFECYCLE_TRIGGER_VOLUME_RATIO_MIN:.2f}x. TRIGGER still means **VERIFY EVENT + STOP**, not fully ACTIONABLE; "
+            "ACTIVE remains reserved for later portfolio verification."
         )
         if lifecycle_meta.get("status") == "HOLD":
             st.warning(lifecycle_meta.get("message", "Lifecycle is on hold."))
@@ -7657,6 +7827,7 @@ with scanner_tab:
             display_cols = [
                 "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
                 "Lifecycle State", "Lifecycle Event", "Lifecycle Since",
+                "Lifecycle Trigger Level", "Lifecycle Trigger Ref Session", "Lifecycle Trigger Confirmed", "Lifecycle Trigger Volume",
                 "Momentum Score", "Volume Ratio", "RSI14",
                 "Rank", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
                 "Tradeable", "Regime Aligned", "Price Data Confidence", "Price Entry Gate Pass",
@@ -7668,6 +7839,7 @@ with scanner_tab:
             display_cols = [
                 "Ticker", "Candidate Quality", "Entry Status", "Action", "Main Reason",
                 "Lifecycle State", "Lifecycle Event", "Lifecycle Since",
+                "Lifecycle Trigger Level", "Lifecycle Trigger Ref Session", "Lifecycle Trigger Confirmed", "Lifecycle Trigger Volume",
                 "Rank", "Company", "Sector", "Setup", "Setup Type", "Quality Score",
                 "Price Data Confidence", "Price Entry Gate Pass", "Tradeable", "Regime Aligned",
                 "RS Rating", "RS Edge", "Momentum Score", "RSI14", "Volume Ratio", "ATR %",
@@ -7694,7 +7866,7 @@ with scanner_tab:
                 ),
                 "Lifecycle": (
                     "No candidates are currently in a tracked lifecycle state. "
-                    "A reliable completed-session scan must first produce WATCH / DEVELOPING / READY candidates."
+                    "A reliable completed-session scan must first produce WATCH / DEVELOPING / READY candidates before TRIGGER can occur."
                 ),
                 "Passing Filters": (
                     "No stocks currently pass the hard Tradeable gate plus all 3 active user filters. "
@@ -7725,6 +7897,8 @@ with scanner_tab:
                     "Avg Dollar Volume 20": st.column_config.NumberColumn(format="$%.0f"),
                     "RSI14": st.column_config.NumberColumn(format="%.1f"),
                     "Volume Ratio": st.column_config.NumberColumn(format="%.2fx"),
+                    "Lifecycle Trigger Level": st.column_config.NumberColumn(format="$%.2f"),
+                    "Lifecycle Trigger Volume": st.column_config.NumberColumn(format="%.2fx"),
                     "1D %": st.column_config.NumberColumn(format="%.2%"),
                     "1W %": st.column_config.NumberColumn(format="%.2%"),
                     "1M %": st.column_config.NumberColumn(format="%.2%"),
